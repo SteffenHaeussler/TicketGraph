@@ -1,3 +1,5 @@
+import pytest
+
 from ticketflow import db
 
 
@@ -28,11 +30,17 @@ class FakeConnectionContext:
 
 
 class FakePool:
-    def __init__(self) -> None:
+    def __init__(self, *, opened: bool = False) -> None:
         self.connection_obj = FakeConnection()
+        self.opened = opened
         self.closed = False
 
+    def open(self) -> None:
+        self.opened = True
+
     def connection(self) -> FakeConnectionContext:
+        if not self.opened:
+            raise AssertionError("connection() called before open()")
         return FakeConnectionContext(self.connection_obj)
 
     def close(self) -> None:
@@ -62,7 +70,7 @@ def test_make_pool_uses_database_url_from_config(monkeypatch):
 
 
 def test_bootstrap_creates_idempotent_migration_marker():
-    pool = FakePool()
+    pool = FakePool(opened=True)
 
     db.bootstrap(pool=pool)
     db.bootstrap(pool=pool)
@@ -72,13 +80,44 @@ def test_bootstrap_creates_idempotent_migration_marker():
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
     assert pool.connection_obj.params == [("000_bootstrap",), ("000_bootstrap",)]
+    # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
 
 
-def test_bootstrap_closes_owned_pool(monkeypatch):
+def test_bootstrap_leaves_injected_pool_unopened_to_caller():
+    # An injected pool is assumed already open; bootstrap must not re-open it.
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    assert pool.closed is False
+
+
+def test_bootstrap_opens_and_closes_owned_pool(monkeypatch):
     pool = FakePool()
     monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
 
     db.bootstrap(database_url="postgresql://example/tickets")
 
+    assert pool.opened is True
     assert pool.closed is True
+
+
+@pytest.mark.integration
+def test_bootstrap_is_idempotent_against_real_postgres():
+    db.bootstrap()
+    db.bootstrap()
+
+    pool = db.make_pool()
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            row = conn.execute(
+                "SELECT count(*) FROM schema_migrations WHERE version = %s",
+                (db.BOOTSTRAP_MIGRATION,),
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert row is not None
+    assert row[0] == 1

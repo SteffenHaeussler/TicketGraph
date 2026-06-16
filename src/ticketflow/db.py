@@ -26,6 +26,8 @@ class _ConnectionContext(Protocol):
 class _Pool(Protocol):
     def connection(self) -> _ConnectionContext: ...
 
+    def open(self) -> None: ...
+
     def close(self) -> None: ...
 
 
@@ -44,10 +46,16 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
 
     Later milestones add the task queue, workflow run, and read model tables.
     This function is intentionally idempotent so startup can call it safely.
+
+    When no ``pool`` is supplied this owns the pool's lifecycle: it opens it
+    before use and closes it afterwards. An injected ``pool`` is assumed to be
+    already open and is left open for the caller to manage.
     """
     owned_pool = pool is None
     active_pool = pool or make_pool(database_url)
     try:
+        if owned_pool:
+            active_pool.open()
         with active_pool.connection() as conn:
             conn.execute(
                 """
