@@ -1,0 +1,12 @@
+.git
+.venv
+.context
+__pycache__
+*.pyc
+*.db
+docs
+tests
+scripts
+.pre-commit-config.yaml
+Makefile
+README.md
