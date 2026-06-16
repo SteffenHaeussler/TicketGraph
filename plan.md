@@ -57,7 +57,7 @@ and self-contained — pick one up at a time. Check it off when its **Done** con
 - [x] **1.1 Schema.** `task_queue(id, queue_name, task_type, workflow_id, payload jsonb,
   idempotency_key UNIQUE, status, attempts, max_attempts, available_at, enqueued_at, lease_owner,
   lease_expires_at, result jsonb, error, permanent)`. _Done:_ created by `bootstrap()`.
-- [ ] **1.2 `enqueue()`** with idempotency key (`ON CONFLICT (idempotency_key) DO NOTHING`).
+- [x] **1.2 `enqueue()`** with idempotency key (`ON CONFLICT (idempotency_key) DO NOTHING`).
   _Done:_ enqueuing the same key twice yields one row.
 - [x] **1.3 `dequeue(queue_name, worker_id)`** via the `FOR UPDATE SKIP LOCKED` + lease update
   (see SQL below). _Done:_ returns a leased task or `None`.

@@ -115,6 +115,13 @@ def test_bootstrap_creates_idempotent_migration_marker():
     assert len(pool.connection_obj.sql) == 10
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
+    assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
+    assert "idempotency_key text        NOT NULL UNIQUE" in pool.connection_obj.sql[2]
+    assert "payload         jsonb       NOT NULL" in pool.connection_obj.sql[2]
+    assert (
+        "CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch"
+        in pool.connection_obj.sql[3]
+    )
     assert pool.connection_obj.params == [
         ("000_bootstrap",),
         ("001_task_queue",),
