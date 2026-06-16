@@ -1,4 +1,4 @@
-"""SQLite read model: final ticket results that outlive Temporal retention."""
+"""SQLite read model for final ticket results."""
 
 import sqlite3
 from pathlib import Path

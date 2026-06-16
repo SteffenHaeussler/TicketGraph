@@ -40,15 +40,15 @@ and self-contained — pick one up at a time. Check it off when its **Done** con
 ## Milestone 0 — Infra & scaffolding
 *Get Postgres and dependencies in place; nothing orchestrates yet.*
 
-- [ ] **0.1 Compose: Postgres in, Temporal out.** Replace `temporal` + `temporal-init` services
+- [x] **0.1 Compose: Postgres in, Temporal out.** Replace `temporal` + `temporal-init` services
   with a `postgres` service (volume, healthcheck). Keep API/worker service stubs (commands updated
   later). _Done:_ `docker compose up postgres` is healthy.
-- [ ] **0.2 Dependencies.** Remove `temporalio`; add `langgraph`, `langgraph-checkpoint-postgres`,
+- [x] **0.2 Dependencies.** Remove `temporalio`; add `langgraph`, `langgraph-checkpoint-postgres`,
   `psycopg[binary,pool]`. _Done:_ `make install` resolves; `import langgraph` works.
-- [ ] **0.3 Config.** `config.py`: add `DATABASE_URL`; keep queue names + rate-limit knobs
+- [x] **0.3 Config.** `config.py`: add `DATABASE_URL`; keep queue names + rate-limit knobs
   (`AGENT_MAX_PER_SECOND`, `AGENT_MAX_CONCURRENT`, `AGENT_SCHEDULE_TO_START_S`); drop `TEMPORAL_*`.
   _Done:_ `test_config.py` updated and green.
-- [ ] **0.4 DB module.** New `db.py`: psycopg connection pool + a `bootstrap()`/migration runner
+- [x] **0.4 DB module.** New `db.py`: psycopg connection pool + a `bootstrap()`/migration runner
   that creates tables. _Done:_ `bootstrap()` is idempotent (safe to run twice).
 
 ## Milestone 1 — The durable task queue (the core artifact)

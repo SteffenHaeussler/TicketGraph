@@ -1,4 +1,4 @@
-"""Diagnose whether the local Ticketflow stack is ready for demo commands."""
+"""Diagnose whether the local Ticketflow Milestone 0 stack is ready."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ class CheckResult:
 
 
 async def check_stack(client: httpx.AsyncClient) -> CheckResult:
-    """Check API, Temporal, and worker readiness through the HTTP API."""
+    """Check API and Milestone 0 readiness through the HTTP API."""
     try:
         health = await client.get("/health")
     except httpx.HTTPError:
@@ -27,8 +27,8 @@ async def check_stack(client: httpx.AsyncClient) -> CheckResult:
             exit_code=1,
             lines=[
                 "api: unavailable (run `make api`)",
-                "temporal: unknown",
-                "worker: unknown",
+                "database: unknown",
+                "orchestration: unknown",
             ],
         )
 
@@ -37,8 +37,8 @@ async def check_stack(client: httpx.AsyncClient) -> CheckResult:
             exit_code=1,
             lines=[
                 f"api: unavailable (HTTP {health.status_code}; run `make api`)",
-                "temporal: unknown",
-                "worker: unknown",
+                "database: unknown",
+                "orchestration: unknown",
             ],
         )
 
@@ -47,76 +47,26 @@ async def check_stack(client: httpx.AsyncClient) -> CheckResult:
         ready = await client.get("/ready")
         body = ready.json()
     except (httpx.HTTPError, ValueError):
-        lines.extend(
-            [
-                "temporal: unknown",
-                "worker: unknown",
-            ]
-        )
+        lines.extend(["database: unknown", "orchestration: unknown"])
         return CheckResult(exit_code=1, lines=lines)
 
     config = body.get("config", {})
-    temporal = body.get("temporal", {})
-    worker = body.get("worker", {})
-    llm_worker = body.get("llm_worker", {})
-    temporal_status = str(temporal.get("status", "unknown"))
-    worker_status = str(worker.get("status", "unknown"))
-    llm_worker_status = str(llm_worker.get("status", "unknown"))
-    address = _config_value(config, "address")
-    namespace = _config_value(config, "namespace")
+    database = body.get("database", {})
+    orchestration = body.get("orchestration", {})
+    database_status = str(database.get("status", "unknown"))
+    orchestration_status = str(orchestration.get("status", "unknown"))
 
-    lines.append(f"temporal: {temporal_status} ({address}, namespace {namespace})")
-    lines.append(_worker_line(worker, config))
-    lines.append(_llm_worker_line(llm_worker, config))
-
-    if worker_status == "degraded":
-        lines.append("worker: no pollers found; run `make worker`")
-    if llm_worker_status == "degraded":
-        lines.append("llm-worker: no pollers found; run `make llm-worker`")
-
-    exit_code = (
-        1
-        if (
-            ready.status_code >= 500
-            or temporal_status != "healthy"
-            or worker_status != "healthy"
-            or llm_worker_status != "healthy"
-        )
-        else 0
+    lines.append(
+        f"database: {database_status} ({_config_value(config, 'database_url')})"
     )
+    lines.append(f"orchestration: {orchestration_status}")
+
+    message = orchestration.get("message")
+    if isinstance(message, str) and message:
+        lines.append(f"orchestration: {message}")
+
+    exit_code = 0 if ready.status_code < 500 and body.get("status") == "healthy" else 1
     return CheckResult(exit_code=exit_code, lines=lines)
-
-
-def _worker_line(worker: dict[str, Any], config: dict[str, Any]) -> str:
-    worker_status = str(worker.get("status", "unknown"))
-    if worker_status == "unknown":
-        return "worker: unknown"
-    return (
-        f"worker: {worker_status} ({_config_value(config, 'task_queue')}; "
-        f"workflow pollers={worker.get('workflow_pollers', 'unknown')}, "
-        f"activity pollers={worker.get('activity_pollers', 'unknown')})"
-    )
-
-
-def _llm_worker_line(llm_worker: dict[str, Any], config: dict[str, Any]) -> str:
-    llm_worker_status = str(llm_worker.get("status", "unknown"))
-    if llm_worker_status == "unknown":
-        return "llm-worker: unknown"
-    primary_queue = str(
-        llm_worker.get("primary_task_queue", _config_value(config, "agent_task_queue"))
-    )
-    fallback_queue = str(
-        llm_worker.get(
-            "fallback_task_queue", _config_value(config, "fallback_task_queue")
-        )
-    )
-    return (
-        f"llm-worker: {llm_worker_status} "
-        f"(primary={primary_queue} "
-        f"pollers={llm_worker.get('primary_activity_pollers', 'unknown')}, "
-        f"fallback={fallback_queue} "
-        f"pollers={llm_worker.get('fallback_activity_pollers', 'unknown')})"
-    )
 
 
 def _config_value(config: dict[str, Any], key: str) -> str:
@@ -139,10 +89,7 @@ async def run(*, base_url: str) -> CheckResult:
 def parse_args() -> argparse.Namespace:
     """Parse doctor command-line arguments."""
     parser = argparse.ArgumentParser(
-        description=(
-            "Check whether the local Ticketflow API, Temporal server, "
-            "and worker are ready."
-        )
+        description="Check whether the local Ticketflow API is ready."
     )
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument(
