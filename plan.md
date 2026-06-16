@@ -40,7 +40,7 @@ and self-contained — pick one up at a time. Check it off when its **Done** con
 ## Milestone 0 — Infra & scaffolding
 *Get Postgres and dependencies in place; nothing orchestrates yet.*
 
-- [ ] **0.1 Compose: Postgres in, Temporal out.** Replace `temporal` + `temporal-init` services
+- [x] **0.1 Compose: Postgres in, Temporal out.** Replace `temporal` + `temporal-init` services
   with a `postgres` service (volume, healthcheck). Keep API/worker service stubs (commands updated
   later). _Done:_ `docker compose up postgres` is healthy.
 - [ ] **0.2 Dependencies.** Remove `temporalio`; add `langgraph`, `langgraph-checkpoint-postgres`,

@@ -2,56 +2,39 @@
 # work against it unchanged.
 #
 # How many services does a deploy actually need? The irreducible minimum is
-# three: temporal (the durable coordinator), api (the edge), and one worker
-# process — a single Python process can host every task queue (llm_worker.py
-# already runs two Workers in one asyncio.gather). We deploy four because the
-# LLM tier is the scarce, rate-limited dependency: a separate worker lets it
-# saturate, crash, and scale independently while tickets keep progressing.
-# temporal-init is a one-shot setup step, and jaeger is opt-in via the
+# three: postgres (the single store — queue + LangGraph checkpointer + read
+# model), api (the edge), and one worker process — a single Python process can
+# host every task queue (llm_worker.py already runs two Workers in one
+# asyncio.gather). We deploy four because the LLM tier is the scarce,
+# rate-limited dependency: a separate worker lets it saturate, crash, and scale
+# independently while tickets keep progressing. jaeger is opt-in via the
 # `tracing` profile.
 services:
-  temporal:
-    image: temporalio/temporal:latest
-    # --db-filename persists workflow state to the volume so the stack
-    # survives restarts; the plain `start-dev` default is in-memory. The
-    # volume mounts at the runtime user's home because the image runs as
-    # uid 1000 and cannot write a root-owned mountpoint.
-    command: server start-dev --ip 0.0.0.0 --db-filename /home/temporal/temporal.db
+  # Single durable store for the hand-built task queue, the LangGraph
+  # checkpointer, and the read model. Replaces Temporal: enqueue + workflow
+  # state commit atomically in one transaction (the outbox pattern), which a
+  # separate broker couldn't give us.
+  postgres:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: ticketflow
+      POSTGRES_PASSWORD: ticketflow
+      POSTGRES_DB: ticketflow
     ports:
-      - "7233:7233"   # gRPC (SDK clients)
-      - "8233:8233"   # Web UI
+      - "5432:5432"   # host access for local dev + tests
     volumes:
-      - temporal-data:/home/temporal
+      - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "temporal", "operator", "cluster", "health"]
+      test: ["CMD-SHELL", "pg_isready -U ticketflow -d ticketflow"]
       interval: 2s
       timeout: 5s
       retries: 30
-
-  # One-shot setup: registers the TicketStatus search attribute that the
-  # approval inbox and batch script query (replaces the manual
-  # `make search-attributes` step). Idempotent: "already exists" is success.
-  temporal-init:
-    image: temporalio/temporal:latest
-    entrypoint: ["/bin/sh", "-c"]
-    command:
-      - >
-        temporal operator search-attribute create
-        --address temporal:7233 --namespace default
-        --name TicketStatus --type Keyword
-        || temporal operator search-attribute list
-        --address temporal:7233 --namespace default
-        | grep -q TicketStatus
-    depends_on:
-      temporal:
-        condition: service_healthy
-    restart: "no"
 
   worker:
     build: .
     command: python -m ticketflow.worker
     environment:
-      TEMPORAL_ADDRESS: temporal:7233
+      DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
       # The SQLite read model is shared state between worker (writes terminal
       # results + the refund ledger) and api (reads them when the live
       # workflow query can't answer) — hence the shared volume.
@@ -61,20 +44,20 @@ services:
     volumes:
       - ticketflow-data:/data
     depends_on:
-      temporal-init:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   llm-worker:
     build: .
     command: python -m ticketflow.llm_worker
     environment:
-      TEMPORAL_ADDRESS: temporal:7233
+      DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
       MOCK_AGENT_LATENCY_MAX_S: "3"
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     depends_on:
-      temporal-init:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   api:
     build: .
@@ -82,15 +65,15 @@ services:
     ports:
       - "8000:8000"
     environment:
-      TEMPORAL_ADDRESS: temporal:7233
+      DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
       TICKETFLOW_DB_PATH: /data/ticketflow.db
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     volumes:
       - ticketflow-data:/data
     depends_on:
-      temporal-init:
-        condition: service_completed_successfully
+      postgres:
+        condition: service_healthy
 
   jaeger:
     image: jaegertracing/jaeger:2.2.0
@@ -100,5 +83,5 @@ services:
       - "4318:4318"   # OTLP over HTTP
 
 volumes:
-  temporal-data:
+  postgres-data:
   ticketflow-data:
