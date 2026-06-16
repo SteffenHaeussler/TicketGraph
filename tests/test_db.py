@@ -76,9 +76,16 @@ def test_bootstrap_creates_idempotent_migration_marker():
     db.bootstrap(pool=pool)
 
     assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 4
+    assert len(pool.connection_obj.sql) == 8
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
+    assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
+    assert "idempotency_key text NOT NULL UNIQUE" in pool.connection_obj.sql[2]
+    assert "payload jsonb NOT NULL" in pool.connection_obj.sql[2]
+    assert (
+        "CREATE INDEX IF NOT EXISTS idx_task_queue_pending"
+        in pool.connection_obj.sql[3]
+    )
     assert pool.connection_obj.params == [("000_bootstrap",), ("000_bootstrap",)]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False

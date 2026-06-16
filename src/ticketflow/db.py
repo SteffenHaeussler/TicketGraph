@@ -73,6 +73,39 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 """,
                 (BOOTSTRAP_MIGRATION,),
             )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS task_queue (
+                    id bigserial PRIMARY KEY,
+                    queue_name text NOT NULL,
+                    task_type text NOT NULL,
+                    workflow_id text NOT NULL,
+                    payload jsonb NOT NULL,
+                    idempotency_key text NOT NULL UNIQUE,
+                    status text NOT NULL DEFAULT 'pending',
+                    attempts integer NOT NULL DEFAULT 0,
+                    max_attempts integer NOT NULL DEFAULT 3,
+                    available_at timestamptz NOT NULL DEFAULT now(),
+                    enqueued_at timestamptz NOT NULL DEFAULT now(),
+                    lease_owner text,
+                    lease_expires_at timestamptz,
+                    result jsonb,
+                    error text,
+                    permanent boolean NOT NULL DEFAULT false,
+                    CONSTRAINT task_queue_status_check
+                        CHECK (status IN ('pending', 'leased', 'done', 'failed')),
+                    CONSTRAINT task_queue_attempts_check
+                        CHECK (attempts >= 0 AND max_attempts > 0)
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_task_queue_pending
+                ON task_queue (queue_name, available_at, id)
+                WHERE status = 'pending'
+                """
+            )
             conn.commit()
     finally:
         if owned_pool:
