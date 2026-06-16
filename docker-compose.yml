@@ -1,21 +1,8 @@
-# Full Ticketflow stack. `make stack` brings up everything; `make ticket` etc.
-# work against it unchanged.
-#
-# How many services does a deploy actually need? The irreducible minimum is
-# three: postgres (the single store — queue + LangGraph checkpointer + read
-# model), api (the edge), and one worker process — a single Python process can
-# host every task queue (llm_worker.py already runs two Workers in one
-# asyncio.gather). We deploy four because the LLM tier is the scarce,
-# rate-limited dependency: a separate worker lets it saturate, crash, and scale
-# independently while tickets keep progressing. jaeger is opt-in via the
-# `tracing` profile.
+# Milestone 0 stack: Postgres is present, orchestration workers are placeholders,
+# and Jaeger is opt-in via the `tracing` profile.
 services:
-  # Single durable store for the hand-built task queue, the LangGraph
-  # checkpointer, and the read model. Replaces Temporal: enqueue + workflow
-  # state commit atomically in one transaction (the outbox pattern), which a
-  # separate broker couldn't give us.
   postgres:
-    image: postgres:16
+    image: postgres:17-alpine
     environment:
       POSTGRES_USER: ticketflow
       POSTGRES_PASSWORD: ticketflow
@@ -35,9 +22,6 @@ services:
     command: python -m ticketflow.worker
     environment:
       DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
-      # The SQLite read model is shared state between worker (writes terminal
-      # results + the refund ledger) and api (reads them when the live
-      # workflow query can't answer) — hence the shared volume.
       TICKETFLOW_DB_PATH: /data/ticketflow.db
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
@@ -79,8 +63,8 @@ services:
     image: jaegertracing/jaeger:2.2.0
     profiles: ["tracing"]
     ports:
-      - "16686:16686" # Web UI
-      - "4318:4318"   # OTLP over HTTP
+      - "16686:16686"
+      - "4318:4318"
 
 volumes:
   postgres-data:

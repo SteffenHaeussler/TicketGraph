@@ -1,9 +1,8 @@
-.PHONY: install install-hooks lint format-check format typecheck check test coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger search-attributes worker llm-worker api doctor ticket status approve reject batch reset
+.PHONY: install install-hooks lint format-check format typecheck check test coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger worker llm-worker api doctor ticket status approve reject batch reset
 
 N ?= 100
 API_URL ?= http://localhost:8000
 JAEGER_URL ?= http://localhost:16686
-TEMPORAL_NAMESPACE ?= default
 
 install:
 	uv sync
@@ -45,19 +44,16 @@ test-docker: up
 
 test-docker-tracing:
 	TICKETFLOW_TRACE_EXPORTER=otlp COMPOSE_PROFILES=tracing docker compose up --build -d
-	API_URL=$(API_URL) uv run pytest tests/test_smoke_stack.py -o addopts=
 	API_URL=$(API_URL) JAEGER_URL=$(JAEGER_URL) uv run pytest tests/test_tracing_stack.py -o addopts=
 	COMPOSE_PROFILES=tracing docker compose down
 
-## --- run the stack (one target per terminal) ---
+## --- run the Milestone 0 stack ---
 
 server:
-	temporal server start-dev
+	docker compose up postgres
 
 server-docker:
-	docker compose up temporal temporal-init jaeger
-
-## --- full stack in docker (server, workers, api in one command) ---
+	docker compose up postgres jaeger
 
 up:
 	docker compose up --build -d
@@ -74,9 +70,6 @@ stack-reset:
 jaeger:
 	docker compose up jaeger
 
-search-attributes:
-	temporal operator search-attribute create --namespace $(TEMPORAL_NAMESPACE) --name TicketStatus --type Keyword
-
 worker:
 	uv run python -m ticketflow.worker
 
@@ -89,7 +82,7 @@ api:
 doctor:
 	uv run python scripts/doctor.py
 
-## --- drive a ticket through (usage: make ticket / make status ID=abc123) ---
+## --- demo commands; orchestration is intentionally unavailable in Milestone 0 ---
 
 ticket:
 	@uv run python scripts/doctor.py --quiet --base-url $(API_URL)

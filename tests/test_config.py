@@ -3,9 +3,8 @@ import importlib
 from ticketflow import config
 
 
-def test_config_reads_temporal_settings_from_environment(monkeypatch):
-    monkeypatch.setenv("TEMPORAL_ADDRESS", "temporal.example:7233")
-    monkeypatch.setenv("TEMPORAL_NAMESPACE", "prod")
+def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
+    monkeypatch.setenv("DATABASE_URL", "postgresql://user:pass@db.example/tickets")
     monkeypatch.setenv("TICKETFLOW_TASK_QUEUE", "tickets-prod")
     monkeypatch.setenv("TICKETFLOW_AGENT_TASK_QUEUE", "agents-prod")
     monkeypatch.setenv("TICKETFLOW_FALLBACK_TASK_QUEUE", "agents-fallback-prod")
@@ -21,8 +20,7 @@ def test_config_reads_temporal_settings_from_environment(monkeypatch):
 
     reloaded = importlib.reload(config)
 
-    assert reloaded.TEMPORAL_ADDRESS == "temporal.example:7233"
-    assert reloaded.TEMPORAL_NAMESPACE == "prod"
+    assert reloaded.DATABASE_URL == "postgresql://user:pass@db.example/tickets"
     assert reloaded.TASK_QUEUE == "tickets-prod"
     assert reloaded.AGENT_TASK_QUEUE == "agents-prod"
     assert reloaded.FALLBACK_TASK_QUEUE == "agents-fallback-prod"
@@ -36,8 +34,7 @@ def test_config_reads_temporal_settings_from_environment(monkeypatch):
     assert reloaded.TRACE_EXPORTER == "otlp"
     assert reloaded.OTLP_ENDPOINT == "http://otel.example:4318/v1/traces"
 
-    monkeypatch.delenv("TEMPORAL_ADDRESS")
-    monkeypatch.delenv("TEMPORAL_NAMESPACE")
+    monkeypatch.delenv("DATABASE_URL")
     monkeypatch.delenv("TICKETFLOW_TASK_QUEUE")
     monkeypatch.delenv("TICKETFLOW_AGENT_TASK_QUEUE")
     monkeypatch.delenv("TICKETFLOW_FALLBACK_TASK_QUEUE")
@@ -58,6 +55,13 @@ def test_config_trace_settings_default_to_disabled():
     assert config.OTLP_ENDPOINT == "http://localhost:4318/v1/traces"
 
 
+def test_config_database_url_defaults_to_local_postgres():
+    assert (
+        config.DATABASE_URL
+        == "postgresql://ticketflow:ticketflow@localhost:5432/ticketflow"
+    )
+
+
 def test_config_agent_settings_default_to_local_demo_values():
     assert config.AGENT_TASK_QUEUE == "ticketflow-agent"
     assert config.FALLBACK_TASK_QUEUE == "ticketflow-agent-fallback"
@@ -67,13 +71,12 @@ def test_config_agent_settings_default_to_local_demo_values():
     assert config.MOCK_AGENT_LATENCY_MAX_S == 0.0
 
 
-def test_config_reads_temporal_settings_from_dotenv(tmp_path, monkeypatch):
+def test_config_reads_postgres_settings_from_dotenv(tmp_path, monkeypatch):
     dotenv = tmp_path / ".env"
     dotenv.write_text(
         "\n".join(
             [
-                "TEMPORAL_ADDRESS=dotenv.example:7233",
-                "TEMPORAL_NAMESPACE=dotenv",
+                "DATABASE_URL=postgresql://dotenv.example/ticketflow",
                 "TICKETFLOW_TASK_QUEUE=tickets-dotenv",
                 "TICKETFLOW_LOG_FORMAT=json",
                 "TICKETFLOW_LOG_LEVEL=WARNING",
@@ -85,17 +88,15 @@ def test_config_reads_temporal_settings_from_dotenv(tmp_path, monkeypatch):
 
     reloaded = importlib.reload(config)
 
-    assert reloaded.TEMPORAL_ADDRESS == "dotenv.example:7233"
-    assert reloaded.TEMPORAL_NAMESPACE == "dotenv"
+    assert reloaded.DATABASE_URL == "postgresql://dotenv.example/ticketflow"
     assert reloaded.TASK_QUEUE == "tickets-dotenv"
     assert reloaded.LOG_FORMAT == "json"
     assert reloaded.LOG_LEVEL == "WARNING"
     assert reloaded.LOG_FIELDS == ["time", "level", "message"]
 
-    monkeypatch.delenv("TEMPORAL_ADDRESS")
-    monkeypatch.delenv("TEMPORAL_NAMESPACE")
-    monkeypatch.delenv("TICKETFLOW_TASK_QUEUE")
-    monkeypatch.delenv("TICKETFLOW_LOG_FORMAT")
-    monkeypatch.delenv("TICKETFLOW_LOG_LEVEL")
-    monkeypatch.delenv("TICKETFLOW_LOG_FIELDS")
+    monkeypatch.delenv("DATABASE_URL", raising=False)
+    monkeypatch.delenv("TICKETFLOW_TASK_QUEUE", raising=False)
+    monkeypatch.delenv("TICKETFLOW_LOG_FORMAT", raising=False)
+    monkeypatch.delenv("TICKETFLOW_LOG_LEVEL", raising=False)
+    monkeypatch.delenv("TICKETFLOW_LOG_FIELDS", raising=False)
     importlib.reload(config)

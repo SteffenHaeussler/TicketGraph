@@ -9,15 +9,9 @@ from collections.abc import Awaitable, Callable, Iterable
 from dataclasses import dataclass
 
 import httpx
-from temporalio.api.operatorservice.v1 import request_response_pb2
-from temporalio.client import Client
-from temporalio.service import RPCError, RPCStatusCode
-
-from ticketflow import config
 
 SETTLED_STATUSES = {"resolved", "escalated", "rejected", "awaiting_approval"}
 TRANSIENT_STATUS_CODES = {500, 502, 503, 504}
-TICKET_STATUS_ATTRIBUTE = "TicketStatus"
 
 KEYWORD_TEMPLATES = [
     {
@@ -44,7 +38,7 @@ class BatchTimeoutError(RuntimeError):
 
 
 class PreflightError(RuntimeError):
-    """Raised when the Temporal setup is missing before a batch run."""
+    """Raised when the API setup is missing before a batch run."""
 
 
 @dataclass(frozen=True)
@@ -61,39 +55,6 @@ class BatchSummary:
 
     statuses: dict[str, int]
     model_paths: dict[str, int]
-
-
-async def check_temporal_setup() -> None:
-    """Verify the Temporal namespace and TicketStatus search attribute exist."""
-    try:
-        client = await Client.connect(
-            config.TEMPORAL_ADDRESS, namespace=config.TEMPORAL_NAMESPACE
-        )
-    except RPCError as exc:
-        raise PreflightError(
-            f"Temporal server unreachable at {config.TEMPORAL_ADDRESS} "
-            "(run `make server`)"
-        ) from exc
-
-    try:
-        response = await client.operator_service.list_search_attributes(
-            request_response_pb2.ListSearchAttributesRequest(
-                namespace=config.TEMPORAL_NAMESPACE
-            )
-        )
-    except RPCError as exc:
-        if exc.status == RPCStatusCode.NOT_FOUND:
-            raise PreflightError(
-                f"Temporal namespace '{config.TEMPORAL_NAMESPACE}' is missing "
-                "(start the server with `make server` or register the namespace)"
-            ) from exc
-        raise
-
-    if TICKET_STATUS_ATTRIBUTE not in response.custom_attributes:
-        raise PreflightError(
-            f"Search attribute '{TICKET_STATUS_ATTRIBUTE}' is not registered in "
-            f"namespace '{config.TEMPORAL_NAMESPACE}' (run `make search-attributes`)"
-        )
 
 
 def make_ticket_payloads(count: int) -> list[dict[str, str]]:
@@ -223,7 +184,6 @@ async def run_batch(
     timeout: float,
 ) -> BatchSummary:
     """Create a batch of tickets and return the settled status histogram."""
-    await check_temporal_setup()
     payloads = make_ticket_payloads(count)
     async with httpx.AsyncClient(base_url=base_url, timeout=30.0) as client:
         ticket_ids = await create_tickets(client, payloads, concurrency=concurrency)

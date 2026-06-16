@@ -6,8 +6,9 @@ from dotenv import load_dotenv
 
 load_dotenv(".env")
 
-TEMPORAL_ADDRESS = os.environ.get("TEMPORAL_ADDRESS", "localhost:7233")
-TEMPORAL_NAMESPACE = os.environ.get("TEMPORAL_NAMESPACE", "default")
+DATABASE_URL = os.environ.get(
+    "DATABASE_URL", "postgresql://ticketflow:ticketflow@localhost:5432/ticketflow"
+)
 TASK_QUEUE = os.environ.get("TICKETFLOW_TASK_QUEUE", "ticketflow")
 AGENT_TASK_QUEUE = os.environ.get("TICKETFLOW_AGENT_TASK_QUEUE", "ticketflow-agent")
 FALLBACK_TASK_QUEUE = os.environ.get(
