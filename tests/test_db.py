@@ -1,18 +1,49 @@
+from datetime import UTC, datetime, timedelta
+
 import pytest
 
 from ticketflow import db
 
+LEASED_ROW = (
+    1,
+    "q",
+    "classify",
+    "workflow-1",
+    {"ticket_id": "workflow-1"},
+    "workflow-1:classify",
+    "leased",
+    1,
+    5,
+    datetime(2026, 6, 16, 12, 0, tzinfo=UTC),
+    datetime(2026, 6, 16, 11, 0, tzinfo=UTC),
+    "worker-1",
+    datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC),
+    None,
+    None,
+    False,
+)
+
+
+class FakeCursor:
+    def __init__(self, row: tuple[object, ...] | None) -> None:
+        self.row = row
+
+    def fetchone(self) -> tuple[object, ...] | None:
+        return self.row
+
 
 class FakeConnection:
-    def __init__(self) -> None:
+    def __init__(self, row: tuple[object, ...] | None = None) -> None:
         self.sql: list[str] = []
         self.params: list[tuple[str, ...]] = []
         self.commits = 0
+        self.row = row
 
-    def execute(self, sql: str, params: tuple[str, ...] | None = None) -> None:
+    def execute(self, sql: str, params: tuple[str, ...] | None = None) -> FakeCursor:
         self.sql.append(sql)
         if params is not None:
             self.params.append(params)
+        return FakeCursor(self.row)
 
     def commit(self) -> None:
         self.commits += 1
@@ -30,15 +61,18 @@ class FakeConnectionContext:
 
 
 class FakePool:
-    def __init__(self, *, opened: bool = False) -> None:
-        self.connection_obj = FakeConnection()
+    def __init__(
+        self, *, opened: bool = False, row: tuple[object, ...] | None = None
+    ) -> None:
+        self.connection_obj = FakeConnection(row)
         self.opened = opened
         self.closed = False
 
     def open(self) -> None:
         self.opened = True
 
-    def connection(self) -> FakeConnectionContext:
+    def connection(self, timeout: float | None = None) -> FakeConnectionContext:
+        del timeout
         if not self.opened:
             raise AssertionError("connection() called before open()")
         return FakeConnectionContext(self.connection_obj)
@@ -123,6 +157,63 @@ def test_bootstrap_opens_and_closes_owned_pool(monkeypatch):
     assert pool.closed is True
 
 
+def test_dequeue_leases_due_pending_task_with_skip_locked():
+    pool = FakePool(opened=True, row=LEASED_ROW)
+
+    task = db.dequeue("q", "worker-1", pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "lease_expires_at = now() + interval '30 seconds'" in sql
+    assert "attempts = attempts + 1" in sql
+    assert "RETURNING id, queue_name, task_type" in sql
+    assert pool.connection_obj.params[-1] == ("worker-1", "q")
+    assert pool.connection_obj.commits == 1
+    assert task is not None
+    assert task.id == 1
+    assert task.queue_name == "q"
+    assert task.task_type == "classify"
+    assert task.workflow_id == "workflow-1"
+    assert task.payload == {"ticket_id": "workflow-1"}
+    assert task.idempotency_key == "workflow-1:classify"
+    assert task.status == "leased"
+    assert task.attempts == 1
+    assert task.max_attempts == 5
+    assert task.lease_owner == "worker-1"
+    assert task.lease_expires_at == datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+    assert task.result is None
+    assert task.error is None
+    assert task.permanent is False
+
+
+def test_dequeue_returns_none_when_no_task_is_available():
+    pool = FakePool(opened=True)
+
+    task = db.dequeue("q", "worker-1", pool=pool)
+
+    assert task is None
+    assert pool.connection_obj.commits == 1
+
+
+def test_dequeue_leaves_injected_pool_unopened_to_caller():
+    pool = FakePool(opened=True, row=LEASED_ROW)
+
+    db.dequeue("q", "worker-1", pool=pool)
+
+    assert pool.opened is True
+    assert pool.closed is False
+
+
+def test_dequeue_opens_and_closes_owned_pool(monkeypatch):
+    pool = FakePool(row=LEASED_ROW)
+    monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
+
+    db.dequeue("q", "worker-1", database_url="postgresql://example/tickets")
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
 @pytest.mark.integration
 def test_bootstrap_is_idempotent_against_real_postgres():
     db.bootstrap()
@@ -202,3 +293,39 @@ def test_bootstrap_creates_task_queue_against_real_postgres():
     assert marker[0] == 1
     assert expected_columns <= columns
     assert duplicate_rejected is True
+
+
+@pytest.mark.integration
+def test_dequeue_leases_one_due_pending_task_against_real_postgres():
+    db.bootstrap()
+
+    pool = db.make_pool()
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM task_queue")
+            conn.execute(
+                """
+                INSERT INTO task_queue (
+                    queue_name, task_type, workflow_id, payload, idempotency_key
+                )
+                VALUES (
+                    'q', 'classify', 'workflow-1', '{"ticket_id": "workflow-1"}',
+                    'workflow-1:classify'
+                )
+                """
+            )
+            conn.commit()
+
+        task = db.dequeue("q", "worker-1", pool=pool)
+        second_task = db.dequeue("q", "worker-2", pool=pool)
+
+        assert task is not None
+        assert task.status == "leased"
+        assert task.lease_owner == "worker-1"
+        assert task.attempts == 1
+        assert task.lease_expires_at is not None
+        assert task.lease_expires_at > datetime.now(UTC) - timedelta(seconds=5)
+        assert second_task is None
+    finally:
+        pool.close()
