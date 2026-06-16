@@ -38,9 +38,10 @@ packages = ["src/ticketflow"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
-addopts = "-m 'not smoke'"
+addopts = "-m 'not smoke and not integration'"
 markers = [
     "smoke: end-to-end tests against a running docker stack (make up)",
+    "integration: tests against a running Postgres (docker compose up postgres)",
 ]
 
 [tool.ruff]
