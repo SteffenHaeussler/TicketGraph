@@ -9,6 +9,7 @@ from psycopg_pool import ConnectionPool
 from ticketflow import config
 
 BOOTSTRAP_MIGRATION = "000_bootstrap"
+TASK_QUEUE_MIGRATION = "001_task_queue"
 
 
 class _Connection(Protocol):
@@ -42,10 +43,10 @@ def make_pool(database_url: str | None = None) -> ConnectionPool:
 
 
 def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> None:
-    """Create the initial migration marker table.
+    """Create the migration marker and task queue tables.
 
-    Later milestones add the task queue, workflow run, and read model tables.
-    This function is intentionally idempotent so startup can call it safely.
+    Later milestones add the workflow run and read model tables. This function
+    is intentionally idempotent so startup can call it safely.
 
     When no ``pool`` is supplied this owns the pool's lifecycle: it opens it
     before use and closes it afterwards. An injected ``pool`` is assumed to be
@@ -76,35 +77,40 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
             conn.execute(
                 """
                 CREATE TABLE IF NOT EXISTS task_queue (
-                    id bigserial PRIMARY KEY,
-                    queue_name text NOT NULL,
-                    task_type text NOT NULL,
-                    workflow_id text NOT NULL,
-                    payload jsonb NOT NULL,
-                    idempotency_key text NOT NULL UNIQUE,
-                    status text NOT NULL DEFAULT 'pending',
-                    attempts integer NOT NULL DEFAULT 0,
-                    max_attempts integer NOT NULL DEFAULT 3,
-                    available_at timestamptz NOT NULL DEFAULT now(),
-                    enqueued_at timestamptz NOT NULL DEFAULT now(),
-                    lease_owner text,
+                    id              bigserial PRIMARY KEY,
+                    queue_name      text        NOT NULL,
+                    task_type       text        NOT NULL,
+                    workflow_id     text        NOT NULL,
+                    payload         jsonb       NOT NULL DEFAULT '{}'::jsonb,
+                    idempotency_key text        NOT NULL UNIQUE,
+                    status          text        NOT NULL DEFAULT 'pending',
+                    attempts        integer     NOT NULL DEFAULT 0,
+                    max_attempts    integer     NOT NULL DEFAULT 5,
+                    available_at    timestamptz NOT NULL DEFAULT now(),
+                    enqueued_at     timestamptz NOT NULL DEFAULT now(),
+                    lease_owner     text,
                     lease_expires_at timestamptz,
-                    result jsonb,
-                    error text,
-                    permanent boolean NOT NULL DEFAULT false,
-                    CONSTRAINT task_queue_status_check
-                        CHECK (status IN ('pending', 'leased', 'done', 'failed')),
-                    CONSTRAINT task_queue_attempts_check
-                        CHECK (attempts >= 0 AND max_attempts > 0)
+                    result          jsonb,
+                    error           text,
+                    permanent       boolean     NOT NULL DEFAULT false,
+                    CHECK (status IN ('pending', 'leased', 'done', 'failed'))
                 )
                 """
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS idx_task_queue_pending
-                ON task_queue (queue_name, available_at, id)
+                CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch
+                ON task_queue (queue_name, available_at)
                 WHERE status = 'pending'
                 """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations (version)
+                VALUES (%s)
+                ON CONFLICT (version) DO NOTHING
+                """,
+                (TASK_QUEUE_MIGRATION,),
             )
             conn.commit()
     finally:

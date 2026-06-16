@@ -75,20 +75,40 @@ def test_bootstrap_creates_idempotent_migration_marker():
     db.bootstrap(pool=pool)
     db.bootstrap(pool=pool)
 
+    # Each call issues 5 statements: schema_migrations create + 000 marker,
+    # task_queue create, dispatch index, 001 marker.
     assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 8
+    assert len(pool.connection_obj.sql) == 10
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
     assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
-    assert "idempotency_key text NOT NULL UNIQUE" in pool.connection_obj.sql[2]
-    assert "payload jsonb NOT NULL" in pool.connection_obj.sql[2]
+    assert "idempotency_key text        NOT NULL UNIQUE" in pool.connection_obj.sql[2]
+    assert "payload         jsonb       NOT NULL" in pool.connection_obj.sql[2]
     assert (
-        "CREATE INDEX IF NOT EXISTS idx_task_queue_pending"
+        "CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch"
         in pool.connection_obj.sql[3]
     )
-    assert pool.connection_obj.params == [("000_bootstrap",), ("000_bootstrap",)]
+    assert pool.connection_obj.params == [
+        ("000_bootstrap",),
+        ("001_task_queue",),
+        ("000_bootstrap",),
+        ("001_task_queue",),
+    ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
+
+
+def test_bootstrap_creates_task_queue_table():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE TABLE IF NOT EXISTS task_queue" in sql
+    assert "idempotency_key text        NOT NULL UNIQUE" in sql
+    assert "CHECK (status IN ('pending', 'leased', 'done', 'failed'))" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch" in sql
+    assert ("001_task_queue",) in pool.connection_obj.params
 
 
 def test_bootstrap_leaves_injected_pool_unopened_to_caller():
@@ -128,3 +148,64 @@ def test_bootstrap_is_idempotent_against_real_postgres():
 
     assert row is not None
     assert row[0] == 1
+
+
+@pytest.mark.integration
+def test_bootstrap_creates_task_queue_against_real_postgres():
+    db.bootstrap()
+    db.bootstrap()
+
+    expected_columns = {
+        "id",
+        "queue_name",
+        "task_type",
+        "workflow_id",
+        "payload",
+        "idempotency_key",
+        "status",
+        "attempts",
+        "max_attempts",
+        "available_at",
+        "enqueued_at",
+        "lease_owner",
+        "lease_expires_at",
+        "result",
+        "error",
+        "permanent",
+    }
+
+    pool = db.make_pool()
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            marker = conn.execute(
+                "SELECT count(*) FROM schema_migrations WHERE version = %s",
+                (db.TASK_QUEUE_MIGRATION,),
+            ).fetchone()
+            columns = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'task_queue'"
+                ).fetchall()
+            }
+
+            # The UNIQUE constraint on idempotency_key holds.
+            insert_dup = (
+                "INSERT INTO task_queue (queue_name, task_type, workflow_id, "
+                "idempotency_key) VALUES ('q', 't', 'w', 'dup-key')"
+            )
+            conn.execute(insert_dup)
+            duplicate_rejected = False
+            try:
+                conn.execute(insert_dup)
+            except Exception:
+                duplicate_rejected = True
+            conn.rollback()
+    finally:
+        pool.close()
+
+    assert marker is not None
+    assert marker[0] == 1
+    assert expected_columns <= columns
+    assert duplicate_rejected is True
