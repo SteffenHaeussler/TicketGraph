@@ -223,6 +223,14 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
             )
             conn.execute(
                 """
+                CREATE TABLE IF NOT EXISTS ticket_results (
+                    ticket_id text PRIMARY KEY,
+                    data      jsonb NOT NULL
+                )
+                """
+            )
+            conn.execute(
+                """
                 INSERT INTO schema_migrations (version)
                 VALUES (%s)
                 ON CONFLICT (version) DO NOTHING

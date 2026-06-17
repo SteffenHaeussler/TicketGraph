@@ -13,10 +13,16 @@ logger = logging.getLogger(__name__)
 class TicketActivities:
     """Agent and side-effect operations used by future queue workers."""
 
-    def __init__(self, agent: Agent, db_path: str | None = None):
-        """Create operations backed by an agent and optional read-model path."""
+    def __init__(
+        self,
+        agent: Agent,
+        db_path: str | None = None,
+        database_url: str | None = None,
+    ):
+        """Create operations backed by an agent and optional persistence settings."""
         self._agent = agent
         self._db_path = db_path
+        self._database_url = database_url
 
     async def classify_ticket(self, ticket: Ticket) -> Classification:
         """Classify a ticket through the configured agent."""
@@ -52,4 +58,6 @@ class TicketActivities:
 
     async def record_result(self, result: TicketResult) -> None:
         """Persist the terminal workflow result to the read model."""
-        await asyncio.to_thread(readmodel.save_result, result, self._db_path)
+        await asyncio.to_thread(
+            readmodel.save_result, result, database_url=self._database_url
+        )

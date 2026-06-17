@@ -1,20 +1,16 @@
 from scripts import reset
-from ticketflow import readmodel
-from ticketflow.models import TicketResult, TicketStatus
 
 
-async def test_run_reset_clears_read_model_and_reports_counts(tmp_path):
-    db_path = str(tmp_path / "read.db")
-    readmodel.save_result(
-        TicketResult(
-            ticket_id="old",
-            status=TicketStatus.RESOLVED,
-            reply_text="archived",
-        ),
-        db_path,
-    )
+async def test_run_reset_clears_read_model_and_reports_counts(monkeypatch):
+    calls: list[str | None] = []
 
-    summary = await reset.run_reset(db_path=db_path)
+    def fake_clear(*, database_url: str | None = None) -> int:
+        calls.append(database_url)
+        return 3
 
-    assert summary == {"read_model_rows_cleared": 1}
-    assert readmodel.load_result("old", db_path) is None
+    monkeypatch.setattr(reset.readmodel, "clear", fake_clear)
+
+    summary = await reset.run_reset(database_url="postgresql://example/tickets")
+
+    assert summary == {"read_model_rows_cleared": 3}
+    assert calls == ["postgresql://example/tickets"]
