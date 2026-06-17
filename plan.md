@@ -83,12 +83,12 @@ RETURNING *;
 ## Milestone 2 — Read model on Postgres
 *DDIA: Ch 12 (idempotent / exactly-once effects).*
 
-- [ ] **2.1 Refund ledger.** Port `refunds(ticket_id PK, amount)` + `refund_attempts`; keep
+- [x] **2.1 Refund ledger.** Port `refunds(ticket_id PK, amount)` + `refund_attempts`; keep
   `record_refund` returning `True` only on first refund (`INSERT … ON CONFLICT DO NOTHING`).
 - [x] **2.2 Results store.** Port `ticket_results(ticket_id PK, data jsonb)` (`save_result` upsert,
   `load_result`). _Done:_ terminal ticket results persist through Postgres JSONB and tests cover
   upsert/load/clear behavior.
-- [ ] **2.3 Tests.** Retarget `test_readmodel.py` to Postgres; assert at-most-once refund semantics.
+- [x] **2.3 Tests.** Retarget `test_readmodel.py` to Postgres; assert at-most-once refund semantics.
 
 ## Milestone 3 — LangGraph workflow graph
 *DDIA: durable execution as a logged state machine.*

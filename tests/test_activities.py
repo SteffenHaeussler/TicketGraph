@@ -1,5 +1,3 @@
-import sqlite3
-
 import pytest
 
 from tests.helpers import (
@@ -43,31 +41,37 @@ async def test_agent_permanent_error_is_not_wrapped_in_runtime_dependency():
         await acts.classify_ticket(make_ticket())
 
 
-async def test_side_effect_methods_complete():
+async def test_side_effect_methods_complete(monkeypatch):
     agent = ScriptedAgent(billing_classification(), refund_draft())
+    monkeypatch.setattr(
+        "ticketflow.activities.readmodel.record_refund",
+        lambda *args, **kwargs: True,
+    )
     acts = TicketActivities(agent)
 
     await acts.send_reply(make_ticket(), "hello")
     await acts.execute_refund("t1", 42.0)
 
 
-async def test_execute_refund_duplicate_run_refunds_once(tmp_path):
+async def test_execute_refund_passes_refund_details_to_readmodel(monkeypatch):
     agent = ScriptedAgent(billing_classification(), refund_draft())
-    db_path = str(tmp_path / "read.db")
-    acts = TicketActivities(agent, db_path=db_path)
+    calls: list[tuple[str, float, int, str | None]] = []
 
-    await acts.execute_refund("t1", 42.0, attempt=1)
+    def fake_record_refund(
+        ticket_id: str,
+        amount: float,
+        attempt: int,
+        *,
+        database_url: str | None = None,
+    ) -> bool:
+        calls.append((ticket_id, amount, attempt, database_url))
+        return False
+
+    monkeypatch.setattr(
+        "ticketflow.activities.readmodel.record_refund", fake_record_refund
+    )
+    acts = TicketActivities(agent, database_url="postgresql://example/tickets")
+
     await acts.execute_refund("t1", 42.0, attempt=2)
 
-    conn = sqlite3.connect(db_path)
-    try:
-        attempts = conn.execute(
-            "SELECT COUNT(*) FROM refund_attempts WHERE ticket_id = 't1'"
-        ).fetchone()[0]
-        refunds = conn.execute(
-            "SELECT COUNT(*) FROM refunds WHERE ticket_id = 't1'"
-        ).fetchone()[0]
-    finally:
-        conn.close()
-    assert attempts == 2
-    assert refunds == 1
+    assert calls == [("t1", 42.0, 2, "postgresql://example/tickets")]

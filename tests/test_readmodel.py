@@ -1,7 +1,5 @@
 """Tests for the read model."""
 
-import sqlite3
-
 import pytest
 
 from ticketflow import db, readmodel
@@ -128,39 +126,43 @@ def test_clear_removes_ticket_results_and_reports_count() -> None:
     assert pool.connection_obj.commits == 1
 
 
-def test_record_refund_first_call_executes(tmp_path):
-    db = str(tmp_path / "read.db")
-    assert readmodel.record_refund("t-1", 42.0, attempt=1, db_path=db) is True
+def test_record_refund_returns_true_and_commits_on_first_refund() -> None:
+    pool = FakePool(rows=[None, ("t-1",)])
+
+    first = readmodel.record_refund("t-1", 42.0, attempt=1, pool=pool)
+
+    assert first is True
+    assert pool.connection_obj.commits == 1
+    assert pool.closed is False
 
 
-def test_record_refund_duplicate_ticket_is_noop(tmp_path):
-    db = str(tmp_path / "read.db")
-    readmodel.record_refund("t-1", 42.0, attempt=1, db_path=db)
-    assert readmodel.record_refund("t-1", 42.0, attempt=2, db_path=db) is False
+def test_record_refund_returns_false_on_duplicate_refund() -> None:
+    pool = FakePool(rows=[None, None])
+
+    duplicate = readmodel.record_refund("t-1", 42.0, attempt=2, pool=pool)
+
+    assert duplicate is False
 
 
-def test_record_refund_logs_every_attempt_but_refunds_once(tmp_path):
-    db = str(tmp_path / "read.db")
-    readmodel.record_refund("t-1", 42.0, attempt=1, db_path=db)
-    readmodel.record_refund("t-1", 42.0, attempt=2, db_path=db)
-    conn = sqlite3.connect(db)
-    try:
-        attempts = conn.execute(
-            "SELECT attempt FROM refund_attempts WHERE ticket_id = 't-1'"
-        ).fetchall()
-        refunds = conn.execute(
-            "SELECT COUNT(*) FROM refunds WHERE ticket_id = 't-1'"
-        ).fetchone()[0]
-    finally:
-        conn.close()
-    assert attempts == [(1,), (2,)]
-    assert refunds == 1
+def test_record_refund_logs_attempt_before_refund_insert() -> None:
+    pool = FakePool(rows=[None, ("t-1",)])
+
+    readmodel.record_refund("t-1", 42.0, attempt=3, pool=pool)
+
+    assert "INSERT INTO refund_attempts" in pool.connection_obj.sql[0]
+    assert "INSERT INTO refunds" in pool.connection_obj.sql[1]
+    assert "ON CONFLICT (ticket_id) DO NOTHING" in pool.connection_obj.sql[1]
+    assert pool.connection_obj.params == [("t-1", 3), ("t-1", 42.0)]
 
 
-def test_record_refund_different_tickets_both_execute(tmp_path):
-    db = str(tmp_path / "read.db")
-    assert readmodel.record_refund("t-1", 42.0, attempt=1, db_path=db) is True
-    assert readmodel.record_refund("t-2", 13.0, attempt=1, db_path=db) is True
+def test_record_refund_opens_and_closes_owned_pool(monkeypatch) -> None:
+    pool = FakePool(rows=[None, ("t-1",)])
+    monkeypatch.setattr(readmodel.db, "make_pool", lambda database_url=None: pool)
+
+    readmodel.record_refund("t-1", 42.0, attempt=1, database_url="postgresql://db")
+
+    assert pool.opened is True
+    assert pool.closed is True
 
 
 @pytest.mark.integration
@@ -204,6 +206,7 @@ def test_clear_removes_only_ticket_results_against_real_postgres() -> None:
     pool = db.make_pool()
     pool.open()
     try:
+        readmodel.clear(pool=pool)
         with pool.connection() as conn:
             conn.execute("DELETE FROM refunds")
             conn.execute("DELETE FROM refund_attempts")
@@ -225,3 +228,33 @@ def test_clear_removes_only_ticket_results_against_real_postgres() -> None:
 
     assert deleted == 2
     assert refund_count == (1,)
+
+
+@pytest.mark.integration
+def test_record_refund_is_at_most_once_against_real_postgres() -> None:
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM refunds")
+            conn.execute("DELETE FROM refund_attempts")
+            conn.commit()
+
+        first = readmodel.record_refund("t-1", 42.0, attempt=1, pool=pool)
+        second = readmodel.record_refund("t-1", 42.0, attempt=2, pool=pool)
+
+        with pool.connection() as conn:
+            refunds = conn.execute(
+                "SELECT count(*) FROM refunds WHERE ticket_id = %s", ("t-1",)
+            ).fetchone()
+            attempts = conn.execute(
+                "SELECT count(*) FROM refund_attempts WHERE ticket_id = %s", ("t-1",)
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert first is True
+    assert second is False
+    assert refunds == (1,)
+    assert attempts == (2,)
