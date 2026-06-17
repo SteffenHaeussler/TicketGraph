@@ -61,7 +61,7 @@ and self-contained — pick one up at a time. Check it off when its **Done** con
   _Done:_ enqueuing the same key twice yields one row.
 - [x] **1.3 `dequeue(queue_name, worker_id)`** via the `FOR UPDATE SKIP LOCKED` + lease update
   (see SQL below). _Done:_ returns a leased task or `None`.
-- [ ] **1.4 `complete()` / `fail()`.** complete → `done` + `result`. fail → if `attempts < max`
+- [x] **1.4 `complete()` / `fail()`.** complete → `done` + `result`. fail → if `attempts < max`
   and not `permanent`: `pending` with `available_at = now() + 1s·2^attempt`; else `failed` + error.
   _Done:_ backoff schedule observable in a test.
 - [ ] **1.5 `reclaim_expired()`** janitor: `status='leased' AND lease_expires_at < now()` → `pending`.
