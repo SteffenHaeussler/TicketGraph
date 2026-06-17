@@ -64,7 +64,7 @@ and self-contained — pick one up at a time. Check it off when its **Done** con
 - [x] **1.4 `complete()` / `fail()`.** complete → `done` + `result`. fail → if `attempts < max`
   and not `permanent`: `pending` with `available_at = now() + 1s·2^attempt`; else `failed` + error.
   _Done:_ backoff schedule observable in a test.
-- [ ] **1.5 `reclaim_expired()`** janitor: `status='leased' AND lease_expires_at < now()` → `pending`.
+- [x] **1.5 `reclaim_expired()`** janitor: `status='leased' AND lease_expires_at < now()` → `pending`.
   _Done:_ a dropped lease becomes redeliverable.
 - [ ] **1.6 Queue unit tests.** Concurrent `dequeue` delivers each task once (SKIP LOCKED); lease
   expiry + reclaim; backoff schedule; enqueue idempotency. _Done:_ all green.
