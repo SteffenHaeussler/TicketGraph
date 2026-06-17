@@ -1,9 +1,11 @@
-"""SQLite read model for final ticket results."""
+"""Read-model helpers for terminal ticket results and legacy refunds."""
 
 import sqlite3
-from pathlib import Path
+from typing import Any
 
-from ticketflow import config
+from psycopg.types.json import Jsonb
+
+from ticketflow import config, db
 from ticketflow.models import TicketResult
 
 
@@ -13,10 +15,6 @@ def _resolve(db_path: str | None) -> str:
 
 def _connect(db_path: str) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS ticket_results ("
-        "ticket_id TEXT PRIMARY KEY, data TEXT NOT NULL)"
-    )
     conn.execute(
         "CREATE TABLE IF NOT EXISTS refunds ("
         "ticket_id TEXT PRIMARY KEY, amount REAL NOT NULL)"
@@ -28,17 +26,32 @@ def _connect(db_path: str) -> sqlite3.Connection:
     return conn
 
 
-def save_result(result: TicketResult, db_path: str | None = None) -> None:
-    """Store or replace a terminal ticket result."""
-    conn = _connect(_resolve(db_path))
+def save_result(
+    result: TicketResult,
+    *,
+    database_url: str | None = None,
+    pool: Any | None = None,
+) -> None:
+    """Store or replace a terminal ticket result in Postgres."""
+    owned_pool = pool is None
+    active_pool = pool or db.make_pool(database_url)
     try:
-        with conn:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
             conn.execute(
-                "INSERT OR REPLACE INTO ticket_results (ticket_id, data) VALUES (?, ?)",
-                (result.ticket_id, result.model_dump_json()),
+                """
+                INSERT INTO ticket_results (ticket_id, data)
+                VALUES (%s, %s)
+                ON CONFLICT (ticket_id) DO UPDATE
+                SET data = EXCLUDED.data
+                """,
+                (result.ticket_id, Jsonb(result.model_dump(mode="json"))),
             )
+            conn.commit()
     finally:
-        conn.close()
+        if owned_pool:
+            active_pool.close()
 
 
 def record_refund(
@@ -65,32 +78,52 @@ def record_refund(
         conn.close()
 
 
-def load_result(ticket_id: str, db_path: str | None = None) -> TicketResult | None:
-    """Load a terminal ticket result, if it exists."""
-    path = _resolve(db_path)
-    if not Path(path).exists():
-        return None
-    conn = _connect(path)
+def load_result(
+    ticket_id: str,
+    *,
+    database_url: str | None = None,
+    pool: Any | None = None,
+) -> TicketResult | None:
+    """Load a terminal ticket result from Postgres, if it exists."""
+    owned_pool = pool is None
+    active_pool = pool or db.make_pool(database_url)
     try:
-        row = conn.execute(
-            "SELECT data FROM ticket_results WHERE ticket_id = ?", (ticket_id,)
-        ).fetchone()
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            row = conn.execute(
+                "SELECT data FROM ticket_results WHERE ticket_id = %s", (ticket_id,)
+            ).fetchone()
     finally:
-        conn.close()
-    return TicketResult.model_validate_json(row[0]) if row else None
+        if owned_pool:
+            active_pool.close()
+    return TicketResult.model_validate(row[0]) if row else None
 
 
-def clear(db_path: str | None = None) -> int:
-    """Remove all persisted ticket results and return the row count."""
-    path = _resolve(db_path)
-    if not Path(path).exists():
-        return 0
-    conn = _connect(path)
+def clear(
+    *,
+    database_url: str | None = None,
+    pool: Any | None = None,
+) -> int:
+    """Remove all persisted ticket results from Postgres and return the count."""
+    owned_pool = pool is None
+    active_pool = pool or db.make_pool(database_url)
     try:
-        with conn:
-            cursor = conn.execute("DELETE FROM ticket_results")
-            conn.execute("DELETE FROM refunds")
-            conn.execute("DELETE FROM refund_attempts")
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            row = conn.execute(
+                """
+                WITH deleted AS (
+                    DELETE FROM ticket_results
+                    RETURNING ticket_id
+                )
+                SELECT count(*) FROM deleted
+                """
+            ).fetchone()
+            conn.commit()
     finally:
-        conn.close()
-    return cursor.rowcount
+        if owned_pool:
+            active_pool.close()
+    assert row is not None
+    return int(row[0])

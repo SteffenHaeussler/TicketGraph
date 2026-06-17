@@ -109,11 +109,11 @@ def test_bootstrap_creates_idempotent_migration_marker():
     db.bootstrap(pool=pool)
     db.bootstrap(pool=pool)
 
-    # Each call issues 8 statements: schema_migrations create + 000 marker,
+    # Each call issues 9 statements: schema_migrations create + 000 marker,
     # task_queue create, dispatch index, 001 marker, refunds create,
-    # refund_attempts create, 002 marker.
+    # refund_attempts create, ticket_results create, 002 marker.
     assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 16
+    assert len(pool.connection_obj.sql) == 18
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
     assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
@@ -126,6 +126,9 @@ def test_bootstrap_creates_idempotent_migration_marker():
     assert "CREATE TABLE IF NOT EXISTS refunds" in pool.connection_obj.sql[5]
     assert "ticket_id   text             PRIMARY KEY" in pool.connection_obj.sql[5]
     assert "CREATE TABLE IF NOT EXISTS refund_attempts" in pool.connection_obj.sql[6]
+    assert "CREATE TABLE IF NOT EXISTS ticket_results" in pool.connection_obj.sql[7]
+    assert "ticket_id text PRIMARY KEY" in pool.connection_obj.sql[7]
+    assert "data      jsonb NOT NULL" in pool.connection_obj.sql[7]
     assert pool.connection_obj.params == [
         ("000_bootstrap",),
         ("001_task_queue",),
@@ -149,6 +152,18 @@ def test_bootstrap_creates_task_queue_table():
     assert "CHECK (status IN ('pending', 'leased', 'done', 'failed'))" in sql
     assert "CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch" in sql
     assert ("001_task_queue",) in pool.connection_obj.params
+
+
+def test_bootstrap_creates_ticket_results_table():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE TABLE IF NOT EXISTS ticket_results" in sql
+    assert "ticket_id text PRIMARY KEY" in sql
+    assert "data      jsonb NOT NULL" in sql
+    assert ("002_read_model",) in pool.connection_obj.params
 
 
 def test_bootstrap_leaves_injected_pool_unopened_to_caller():
@@ -306,6 +321,35 @@ def test_bootstrap_creates_task_queue_against_real_postgres():
     assert marker[0] == 1
     assert expected_columns <= columns
     assert duplicate_rejected is True
+
+
+@pytest.mark.integration
+def test_bootstrap_creates_ticket_results_against_real_postgres():
+    db.bootstrap()
+    db.bootstrap()
+
+    pool = db.make_pool()
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            marker = conn.execute(
+                "SELECT count(*) FROM schema_migrations WHERE version = %s",
+                (db.READ_MODEL_MIGRATION,),
+            ).fetchone()
+            columns = {
+                (row[0], row[1])
+                for row in conn.execute(
+                    "SELECT column_name, data_type FROM information_schema.columns "
+                    "WHERE table_name = 'ticket_results'"
+                ).fetchall()
+            }
+    finally:
+        pool.close()
+
+    assert marker is not None
+    assert marker[0] == 1
+    assert ("ticket_id", "text") in columns
+    assert ("data", "jsonb") in columns
 
 
 @pytest.mark.integration

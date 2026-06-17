@@ -1,4 +1,4 @@
-"""Wipe local Ticketflow read-model state."""
+"""Wipe Ticketflow read-model state."""
 
 from __future__ import annotations
 
@@ -8,21 +8,21 @@ import asyncio
 from ticketflow import config, readmodel
 
 
-async def run_reset(db_path: str | None = None) -> dict[str, int]:
-    """Clear the local read model."""
-    return {"read_model_rows_cleared": readmodel.clear(db_path)}
+async def run_reset(database_url: str | None = None) -> dict[str, int]:
+    """Clear the Postgres read model."""
+    return {"read_model_rows_cleared": readmodel.clear(database_url=database_url)}
 
 
 def parse_args() -> argparse.Namespace:
     """Parse reset command-line arguments."""
-    parser = argparse.ArgumentParser(description="Clear the local SQLite read model.")
-    parser.add_argument("--db-path", default=config.DB_PATH)
+    parser = argparse.ArgumentParser(description="Clear the Postgres read model.")
+    parser.add_argument("--database-url", default=config.DATABASE_URL)
     return parser.parse_args()
 
 
 async def amain(args: argparse.Namespace) -> dict[str, int]:
     """Run the reset command."""
-    return await run_reset(db_path=args.db_path)
+    return await run_reset(database_url=args.database_url)
 
 
 def main() -> int:
