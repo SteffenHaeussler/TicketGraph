@@ -115,6 +115,17 @@ def test_fail_returns_none_when_no_leased_row_matched() -> None:
     assert status is None
 
 
+def test_reclaim_expired_returns_count() -> None:
+    conn = FakeConnection(rows=[(2,)])
+
+    reclaimed = taskqueue.reclaim_expired(conn)
+
+    assert reclaimed == 2
+    assert "SET status = 'pending'" in conn.sql[0]
+    assert "WHERE status = 'leased' AND lease_expires_at < now()" in conn.sql[0]
+    assert "lease_owner = NULL" in conn.sql[0]
+
+
 @pytest.mark.integration
 def test_enqueue_is_idempotent_against_real_postgres() -> None:
     db.bootstrap()
@@ -335,3 +346,69 @@ def test_complete_and_fail_ignore_non_leased_rows_against_real_postgres() -> Non
     assert again is None
     assert failed is None
     assert row == ("done", {"x": 1}, None)
+
+
+@pytest.mark.integration
+def test_reclaim_expired_makes_dropped_lease_redeliverable() -> None:
+    pool = _open_clean_pool()
+    try:
+        with pool.connection() as conn:
+            task_id = _enqueue(conn)
+            conn.commit()
+
+        # Worker leases the task, then "crashes" without completing it.
+        leased = db.dequeue("ticketflow-agent", "worker-1", pool=pool)
+        assert leased is not None and leased.id == task_id
+        assert leased.attempts == 1
+
+        with pool.connection() as conn:
+            conn.execute(
+                "UPDATE task_queue SET lease_expires_at = now() - interval '1 second' "
+                "WHERE id = %s",
+                (task_id,),
+            )
+            conn.commit()
+
+        with pool.connection() as conn:
+            reclaimed = taskqueue.reclaim_expired(conn)
+            row = conn.execute(
+                "SELECT status, lease_owner FROM task_queue WHERE id = %s",
+                (task_id,),
+            ).fetchone()
+            conn.commit()
+
+        # The reclaimed task is redelivered to a fresh worker.
+        redelivered = db.dequeue("ticketflow-agent", "worker-2", pool=pool)
+    finally:
+        pool.close()
+
+    assert reclaimed == 1
+    assert row == ("pending", None)
+    assert redelivered is not None and redelivered.id == task_id
+    assert redelivered.attempts == 2  # second delivery
+
+
+@pytest.mark.integration
+def test_reclaim_expired_leaves_live_leases_alone() -> None:
+    pool = _open_clean_pool()
+    try:
+        with pool.connection() as conn:
+            task_id = _enqueue(conn)
+            conn.commit()
+
+        # Lease is valid for ~30s, so it has not expired.
+        leased = db.dequeue("ticketflow-agent", "worker-1", pool=pool)
+        assert leased is not None and leased.id == task_id
+
+        with pool.connection() as conn:
+            reclaimed = taskqueue.reclaim_expired(conn)
+            row = conn.execute(
+                "SELECT status, lease_owner FROM task_queue WHERE id = %s",
+                (task_id,),
+            ).fetchone()
+            conn.commit()
+    finally:
+        pool.close()
+
+    assert reclaimed == 0
+    assert row == ("leased", "worker-1")

@@ -105,3 +105,28 @@ def fail(conn: Any, task_id: int, *, error: str) -> str | None:
     if row is None:
         return None
     return row[0]
+
+
+def reclaim_expired(conn: Any) -> int:
+    """Return expired leases to ``pending`` so they can be redelivered.
+
+    Any task whose lease has elapsed (``status='leased'`` and
+    ``lease_expires_at < now()``) goes back to ``pending`` with its lease
+    released. Returns the number of tasks reclaimed. ``attempts`` is left as-is
+    so a crashed worker's attempt still counts toward ``max_attempts``.
+    """
+    row = conn.execute(
+        """
+        WITH reclaimed AS (
+            UPDATE task_queue
+            SET status = 'pending',
+                lease_owner = NULL,
+                lease_expires_at = NULL
+            WHERE status = 'leased' AND lease_expires_at < now()
+            RETURNING id
+        )
+        SELECT count(*) FROM reclaimed
+        """,
+        (),
+    ).fetchone()
+    return int(row[0])
