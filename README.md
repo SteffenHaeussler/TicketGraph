@@ -1,24 +1,27 @@
 # TicketFlow
 
 TicketFlow is migrating toward a LangGraph support-ticket workflow backed by
-Postgres. The current branch implements Milestone 0: dependency and
-infrastructure scaffolding only. Nothing orchestrates tickets yet.
+Postgres. The current branch implements Milestone 1: dependency and
+infrastructure scaffolding plus the durable Postgres-backed task queue. Nothing
+orchestrates tickets yet.
 
 Migration plan: `plan.md`
 
 ## Current Milestone
 
-Milestone 0 provides:
+Milestone 1 provides:
 
 - Postgres in Docker Compose.
 - LangGraph, LangGraph Postgres checkpoint, and psycopg dependencies.
 - `DATABASE_URL` configuration.
 - A small psycopg connection-pool and bootstrap helper.
+- A durable `task_queue` table with idempotent enqueue, leased dequeue,
+  completion, retry/fail handling, and expired-lease reclaim helpers.
 - Import-clean API and worker placeholders.
 
 The ticket API contract is still present, but orchestration endpoints return
 `503` with `LangGraph/Postgres orchestration is not wired yet.` until later
-milestones add the graph, task queue, runner, and workers.
+milestones add the graph, runner, and workers.
 
 ## Run It
 
@@ -51,12 +54,12 @@ Check readiness:
 make doctor
 ```
 
-In Milestone 0, `/health` reports the API process is alive and `/ready` reports
+In Milestone 1, `/health` reports the API process is alive and `/ready` reports
 the stack as degraded because orchestration is intentionally unavailable.
 
 ## Docker
 
-Run the Milestone 0 stack:
+Run the Milestone 1 stack:
 
 ```bash
 make up
