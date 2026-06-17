@@ -16,12 +16,10 @@ class TicketActivities:
     def __init__(
         self,
         agent: Agent,
-        db_path: str | None = None,
         database_url: str | None = None,
     ):
         """Create operations backed by an agent and optional persistence settings."""
         self._agent = agent
-        self._db_path = db_path
         self._database_url = database_url
 
     async def classify_ticket(self, ticket: Ticket) -> Classification:
@@ -43,7 +41,11 @@ class TicketActivities:
     ) -> None:
         """Execute a refund at most once per ticket id."""
         first = await asyncio.to_thread(
-            readmodel.record_refund, ticket_id, amount, attempt, self._db_path
+            readmodel.record_refund,
+            ticket_id,
+            amount,
+            attempt,
+            database_url=self._database_url,
         )
         if first:
             logger.info(

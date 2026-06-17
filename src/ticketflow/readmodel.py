@@ -1,29 +1,11 @@
 """Read-model helpers for terminal ticket results and legacy refunds."""
 
-import sqlite3
 from typing import Any
 
 from psycopg.types.json import Jsonb
 
-from ticketflow import config, db
+from ticketflow import db, ledger
 from ticketflow.models import TicketResult
-
-
-def _resolve(db_path: str | None) -> str:
-    return db_path if db_path is not None else config.DB_PATH
-
-
-def _connect(db_path: str) -> sqlite3.Connection:
-    conn = sqlite3.connect(db_path)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS refunds ("
-        "ticket_id TEXT PRIMARY KEY, amount REAL NOT NULL)"
-    )
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS refund_attempts ("
-        "ticket_id TEXT NOT NULL, attempt INTEGER NOT NULL)"
-    )
-    return conn
 
 
 def save_result(
@@ -55,27 +37,30 @@ def save_result(
 
 
 def record_refund(
-    ticket_id: str, amount: float, attempt: int, db_path: str | None = None
+    ticket_id: str,
+    amount: float,
+    attempt: int,
+    *,
+    database_url: str | None = None,
+    pool: Any | None = None,
 ) -> bool:
     """Log a refund attempt; return True only the first time a ticket is refunded.
 
     The ticket id is the idempotency key: duplicate activity runs land in
     refund_attempts but the refund itself is recorded at most once.
     """
-    conn = _connect(_resolve(db_path))
+    owned_pool = pool is None
+    active_pool = pool or db.make_pool(database_url)
     try:
-        with conn:
-            conn.execute(
-                "INSERT INTO refund_attempts (ticket_id, attempt) VALUES (?, ?)",
-                (ticket_id, attempt),
-            )
-            cursor = conn.execute(
-                "INSERT OR IGNORE INTO refunds (ticket_id, amount) VALUES (?, ?)",
-                (ticket_id, amount),
-            )
-            return cursor.rowcount == 1
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            first = ledger.record_refund(conn, ticket_id, amount, attempt)
+            conn.commit()
     finally:
-        conn.close()
+        if owned_pool:
+            active_pool.close()
+    return first
 
 
 def load_result(
