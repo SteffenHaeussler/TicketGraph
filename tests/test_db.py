@@ -109,10 +109,11 @@ def test_bootstrap_creates_idempotent_migration_marker():
     db.bootstrap(pool=pool)
     db.bootstrap(pool=pool)
 
-    # Each call issues 5 statements: schema_migrations create + 000 marker,
-    # task_queue create, dispatch index, 001 marker.
+    # Each call issues 8 statements: schema_migrations create + 000 marker,
+    # task_queue create, dispatch index, 001 marker, refunds create,
+    # refund_attempts create, 002 marker.
     assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 10
+    assert len(pool.connection_obj.sql) == 16
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
     assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
@@ -122,11 +123,16 @@ def test_bootstrap_creates_idempotent_migration_marker():
         "CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch"
         in pool.connection_obj.sql[3]
     )
+    assert "CREATE TABLE IF NOT EXISTS refunds" in pool.connection_obj.sql[5]
+    assert "ticket_id   text             PRIMARY KEY" in pool.connection_obj.sql[5]
+    assert "CREATE TABLE IF NOT EXISTS refund_attempts" in pool.connection_obj.sql[6]
     assert pool.connection_obj.params == [
         ("000_bootstrap",),
         ("001_task_queue",),
+        ("002_read_model",),
         ("000_bootstrap",),
         ("001_task_queue",),
+        ("002_read_model",),
     ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False

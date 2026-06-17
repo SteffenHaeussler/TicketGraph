@@ -12,6 +12,7 @@ from ticketflow import config
 
 BOOTSTRAP_MIGRATION = "000_bootstrap"
 TASK_QUEUE_MIGRATION = "001_task_queue"
+READ_MODEL_MIGRATION = "002_read_model"
 
 
 @dataclass(frozen=True)
@@ -134,8 +135,8 @@ def dequeue(
 def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> None:
     """Create the migration marker and task queue tables.
 
-    Later milestones add the workflow run and read model tables. This function
-    is intentionally idempotent so startup can call it safely.
+    Later milestones add the workflow run table. This function is intentionally
+    idempotent so startup can call it safely.
 
     When no ``pool`` is supplied this owns the pool's lifecycle: it opens it
     before use and closes it afterwards. An injected ``pool`` is assumed to be
@@ -200,6 +201,33 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 ON CONFLICT (version) DO NOTHING
                 """,
                 (TASK_QUEUE_MIGRATION,),
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS refunds (
+                    ticket_id   text             PRIMARY KEY,
+                    amount      double precision NOT NULL,
+                    recorded_at timestamptz      NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS refund_attempts (
+                    id           bigserial   PRIMARY KEY,
+                    ticket_id    text        NOT NULL,
+                    attempt      integer     NOT NULL,
+                    attempted_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations (version)
+                VALUES (%s)
+                ON CONFLICT (version) DO NOTHING
+                """,
+                (READ_MODEL_MIGRATION,),
             )
             conn.commit()
     finally:
