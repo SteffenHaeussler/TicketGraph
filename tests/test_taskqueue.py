@@ -1,3 +1,5 @@
+import threading
+from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime
 
 import pytest
@@ -412,3 +414,50 @@ def test_reclaim_expired_leaves_live_leases_alone() -> None:
 
     assert reclaimed == 0
     assert row == ("leased", "worker-1")
+
+
+@pytest.mark.integration
+def test_concurrent_dequeue_delivers_each_task_once() -> None:
+    task_count = 50
+    worker_count = 8
+    pool = _open_clean_pool()
+    try:
+        enqueued_ids: list[int] = []
+        with pool.connection() as conn:
+            for i in range(task_count):
+                task_id = taskqueue.enqueue(
+                    conn,
+                    queue_name="ticketflow-agent",
+                    task_type="classify_ticket",
+                    workflow_id=f"ticket-{i}",
+                    payload={"ticket_id": f"ticket-{i}"},
+                    idempotency_key=f"ticket-{i}:classify",
+                )
+                assert task_id is not None
+                enqueued_ids.append(task_id)
+            conn.commit()
+
+        # All workers start contending at once to exercise FOR UPDATE SKIP LOCKED.
+        barrier = threading.Barrier(worker_count)
+
+        def drain(worker_id: str) -> list[int]:
+            barrier.wait()
+            ids: list[int] = []
+            while True:
+                task = db.dequeue("ticketflow-agent", worker_id, pool=pool)
+                if task is None:
+                    break
+                ids.append(task.id)
+            return ids
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(
+                executor.map(drain, [f"worker-{w}" for w in range(worker_count)])
+            )
+    finally:
+        pool.close()
+
+    delivered = [task_id for ids in results for task_id in ids]
+    assert len(delivered) == task_count  # nothing lost
+    assert len(set(delivered)) == task_count  # nothing delivered twice
+    assert set(delivered) == set(enqueued_ids)  # exactly the enqueued tasks
