@@ -66,7 +66,7 @@ and self-contained — pick one up at a time. Check it off when its **Done** con
   _Done:_ backoff schedule observable in a test.
 - [x] **1.5 `reclaim_expired()`** janitor: `status='leased' AND lease_expires_at < now()` → `pending`.
   _Done:_ a dropped lease becomes redeliverable.
-- [ ] **1.6 Queue unit tests.** Concurrent `dequeue` delivers each task once (SKIP LOCKED); lease
+- [x] **1.6 Queue unit tests.** Concurrent `dequeue` delivers each task once (SKIP LOCKED); lease
   expiry + reclaim; backoff schedule; enqueue idempotency. _Done:_ all green.
 
 ```sql
