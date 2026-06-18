@@ -2,7 +2,10 @@
 
 import uuid
 
+from ticketflow import config, db, taskqueue
+from ticketflow.activities import TicketActivities
 from ticketflow.agent.base import AgentOverloadedError
+from ticketflow.db import _Pool
 from ticketflow.models import (
     ActionType,
     Classification,
@@ -50,6 +53,34 @@ def reply_only_draft(confidence: float = 0.9, model: str = "primary") -> DraftRe
         confidence=confidence,
         model=model,
     )
+
+
+async def process_one_agent_task(
+    pool: _Pool, activities: TicketActivities, worker_id: str = "w"
+) -> bool:
+    """Lease one ``ticketflow-agent`` task, run it, and store the result.
+
+    A stand-in for the real agent worker (Milestone 5) so M3.2 tests can drive a
+    dispatch -> queue -> resume loop end to end. Returns ``True`` if a task was
+    processed, ``False`` if the queue was empty.
+    """
+    task = db.dequeue(config.AGENT_TASK_QUEUE, worker_id, pool=pool)
+    if task is None:
+        return False
+
+    ticket = Ticket.model_validate(task.payload["ticket"])
+    if task.task_type == "classify":
+        result = await activities.classify_ticket(ticket)
+    elif task.task_type == "draft":
+        classification = Classification.model_validate(task.payload["classification"])
+        result = await activities.draft_reply(ticket, classification)
+    else:  # pragma: no cover - defensive
+        raise ValueError(f"unexpected task_type {task.task_type!r}")
+
+    with pool.connection() as conn:
+        taskqueue.complete(conn, task.id, result=result.model_dump(mode="json"))
+        conn.commit()
+    return True
 
 
 class ScriptedAgent:

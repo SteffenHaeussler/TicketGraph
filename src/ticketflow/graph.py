@@ -1,14 +1,18 @@
-"""Inline LangGraph ticket workflow (Milestone 3.1).
+"""LangGraph ticket workflow.
 
-A first proof that the LangGraph ``StateGraph`` plus the Postgres checkpointer
-work end to end. The nodes call the agent **inline** -- no task queue, no
-``interrupt()`` -- so a ticket runs straight through to ``resolved`` and its
-state survives a fresh process via the checkpointer.
+The ``StateGraph`` plus the Postgres checkpointer drive a ticket from
+``received`` to ``resolved`` and the run survives a fresh process via the
+checkpointer.
 
-Later milestones refine individual nodes: 3.2 turns ``classify``/``draft`` into
-enqueue-and-interrupt, 3.3 turns ``decide_approval`` into the real approval
-gate, and 3.5 makes ``execute``/``record`` terminal (refund ledger, read-model
-persistence, rejection/escalation replies).
+The ``classify`` and ``draft`` nodes do not call the agent inline. Each
+**enqueues a durable task** onto the Postgres task queue and then suspends with
+``interrupt()`` (Milestone 3.2). A separate worker (M5) produces the result and
+a runner (M4) resumes the graph with ``Command(resume=<result>)``; on resume the
+node re-runs from the top, so the enqueue is idempotent via its idempotency key.
+
+Later milestones refine the remaining nodes: 3.3 turns ``decide_approval`` into
+the real approval gate, and 3.5 makes ``execute``/``record`` terminal (refund
+ledger, read-model persistence, rejection/escalation replies).
 """
 
 from __future__ import annotations
@@ -18,10 +22,12 @@ from typing import TypedDict
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
+from langgraph.types import interrupt
 
-from ticketflow import config
+from ticketflow import config, taskqueue
 from ticketflow.activities import TicketActivities
 from ticketflow.agent.mock import MockAgent
+from ticketflow.db import _Pool
 from ticketflow.models import (
     ActionType,
     ApprovalDecision,
@@ -51,18 +57,36 @@ class TicketState(TypedDict, total=False):
     result: TicketResult | None
 
 
-def build_ticket_graph(activities: TicketActivities) -> StateGraph:
-    """Build the uncompiled ticket workflow graph backed by ``activities``.
+def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
+    """Build the uncompiled ticket workflow graph.
 
-    The graph is linear for Milestone 3.1::
+    ``pool`` is the Postgres connection pool the dispatching nodes use to
+    enqueue agent tasks. ``activities`` carries the side-effect operations used
+    by the inline terminal nodes (and, later, the agent worker).
+
+    The graph is linear::
 
         classify -> draft -> decide_approval -> execute -> record
+
+    ``classify`` and ``draft`` dispatch a task and ``interrupt()``; the rest run
+    inline.
     """
 
     async def classify(state: TicketState) -> TicketState:
         ticket = state.get("ticket")
         assert ticket is not None
-        classification = await activities.classify_ticket(ticket)
+        with pool.connection() as conn:
+            taskqueue.enqueue(
+                conn,
+                queue_name=config.AGENT_TASK_QUEUE,
+                task_type="classify",
+                workflow_id=ticket.id,
+                payload={"ticket": ticket.model_dump(mode="json")},
+                idempotency_key=f"{ticket.id}:classify",
+            )
+            conn.commit()
+        result = interrupt({"task_type": "classify", "workflow_id": ticket.id})
+        classification = Classification.model_validate(result)
         return {
             "classification": classification,
             "status": TicketStatus.CLASSIFYING,
@@ -72,7 +96,21 @@ def build_ticket_graph(activities: TicketActivities) -> StateGraph:
         ticket = state.get("ticket")
         classification = state.get("classification")
         assert ticket is not None and classification is not None
-        reply = await activities.draft_reply(ticket, classification)
+        with pool.connection() as conn:
+            taskqueue.enqueue(
+                conn,
+                queue_name=config.AGENT_TASK_QUEUE,
+                task_type="draft",
+                workflow_id=ticket.id,
+                payload={
+                    "ticket": ticket.model_dump(mode="json"),
+                    "classification": classification.model_dump(mode="json"),
+                },
+                idempotency_key=f"{ticket.id}:draft",
+            )
+            conn.commit()
+        result = interrupt({"task_type": "draft", "workflow_id": ticket.id})
+        reply = DraftReply.model_validate(result)
         return {"draft": reply, "status": TicketStatus.DRAFTING}
 
     async def decide_approval(state: TicketState) -> TicketState:
@@ -125,9 +163,10 @@ def build_ticket_graph(activities: TicketActivities) -> StateGraph:
 def compile_ticket_graph(
     activities: TicketActivities,
     checkpointer: BaseCheckpointSaver,
+    pool: _Pool,
 ) -> CompiledStateGraph:
     """Compile the ticket workflow graph with a durable ``checkpointer``."""
-    return build_ticket_graph(activities).compile(checkpointer=checkpointer)
+    return build_ticket_graph(activities, pool).compile(checkpointer=checkpointer)
 
 
 def default_activities() -> TicketActivities:
