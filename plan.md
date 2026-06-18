@@ -97,7 +97,7 @@ RETURNING *;
   (`classify → draft → decide_approval → execute → record`) with `PostgresSaver`. Nodes call the
   agent **inline** for now (no queue) to prove the graph runs and checkpoints. _Done:_ a ticket
   reaches `resolved`; state survives a fresh process via the checkpointer.
-- [ ] **3.2 Dispatch-and-interrupt.** Convert `classify`/`draft` to **enqueue a task + `interrupt()`**;
+- [x] **3.2 Dispatch-and-interrupt.** Convert `classify`/`draft` to **enqueue a task + `interrupt()`**;
   resume with `Command(resume=<result>)`. _Done:_ graph suspends at dispatch, resumes on result.
 - [x] **3.3 Approval gate.** `decide_approval` rule (`action==REFUND` OR `confidence<0.75`);
   `await_approval` sets `wakeup_at=now()+24h` and `interrupt()`s; resume by decision or timer.
