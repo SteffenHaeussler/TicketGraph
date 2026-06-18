@@ -17,9 +17,6 @@ while the task is still ``pending``, the work is re-dispatched to the unthrottle
 
 Approval-needed drafts pause at the approval gate (Milestone 3.3): they
 ``interrupt()`` and resume from a human decision or a timer envelope.
-
-A later milestone makes ``execute``/``record`` terminal (refund
-ledger, read-model persistence, rejection/escalation replies).
 """
 
 from __future__ import annotations
@@ -45,7 +42,12 @@ from ticketflow.models import (
     TicketResult,
     TicketStatus,
 )
-from ticketflow.workflows import APPROVAL_TIMEOUT, CONFIDENCE_THRESHOLD
+from ticketflow.workflows import (
+    APPROVAL_TIMEOUT,
+    CONFIDENCE_THRESHOLD,
+    ESCALATION_REPLY,
+    REJECTION_REPLY,
+)
 
 
 def _is_timeout(resume: Any) -> bool:
@@ -73,6 +75,7 @@ class TicketState(TypedDict, total=False):
     decision: ApprovalDecision | None
     wakeup_at: datetime | None
     status: TicketStatus
+    refund_executed: bool
     result: TicketResult | None
 
 
@@ -233,33 +236,53 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
         ticket = state.get("ticket")
         reply = state.get("draft")
         assert ticket is not None and reply is not None
+        status = state.get("status")
+
+        if status == TicketStatus.REJECTED:
+            await activities.send_reply(ticket, REJECTION_REPLY)
+            return {"refund_executed": False}
+        if status == TicketStatus.ESCALATED:
+            await activities.send_reply(ticket, ESCALATION_REPLY)
+            return {"refund_executed": False}
+
+        refund_executed = False
+        if reply.action.type == ActionType.REFUND:
+            assert reply.action.refund_amount is not None
+            refund_executed = await activities.execute_refund(
+                ticket.id, reply.action.refund_amount, attempt=1
+            )
         await activities.send_reply(ticket, reply.reply_text)
-        return {}
+        return {"refund_executed": refund_executed}
 
     async def record(state: TicketState) -> TicketState:
         ticket = state.get("ticket")
         reply = state.get("draft")
         classification = state.get("classification")
         assert ticket is not None and reply is not None and classification is not None
+        status = state.get("status")
+        terminal_status = TicketStatus.RESOLVED
+        if status == TicketStatus.REJECTED:
+            terminal_status = TicketStatus.REJECTED
+        elif status == TicketStatus.ESCALATED:
+            terminal_status = TicketStatus.ESCALATED
+        reply_text = {
+            TicketStatus.REJECTED: REJECTION_REPLY,
+            TicketStatus.ESCALATED: ESCALATION_REPLY,
+        }.get(terminal_status, reply.reply_text)
         result = TicketResult(
             ticket_id=ticket.id,
-            status=TicketStatus.RESOLVED,
-            reply_text=reply.reply_text,
-            refund_executed=False,
+            status=terminal_status,
+            reply_text=reply_text,
+            refund_executed=state.get("refund_executed", False),
             model_path=f"{classification.model}/{reply.model}",
         )
-        return {"result": result, "status": TicketStatus.RESOLVED}
+        await activities.record_result(result)
+        return {"result": result, "status": terminal_status, "wakeup_at": None}
 
     def route_after_decide(
         state: TicketState,
     ) -> Literal["prepare_approval", "execute"]:
         return "prepare_approval" if state.get("needs_approval") else "execute"
-
-    def route_after_approval(state: TicketState) -> Literal["execute", "end"]:
-        decision = state.get("decision")
-        if decision is not None and decision.approved:
-            return "execute"
-        return "end"
 
     builder: StateGraph = StateGraph(TicketState)
     builder.add_node("classify", classify)
@@ -279,11 +302,7 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
         {"prepare_approval": "prepare_approval", "execute": "execute"},
     )
     builder.add_edge("prepare_approval", "await_approval")
-    builder.add_conditional_edges(
-        "await_approval",
-        route_after_approval,
-        {"execute": "execute", "end": END},
-    )
+    builder.add_edge("await_approval", "execute")
     builder.add_edge("execute", "record")
     builder.add_edge("record", END)
 

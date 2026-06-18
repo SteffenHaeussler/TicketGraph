@@ -53,6 +53,19 @@ async def test_side_effect_methods_complete(monkeypatch):
     await acts.execute_refund("t1", 42.0)
 
 
+async def test_execute_refund_returns_readmodel_result(monkeypatch):
+    agent = ScriptedAgent(billing_classification(), refund_draft())
+    monkeypatch.setattr(
+        "ticketflow.activities.readmodel.record_refund",
+        lambda *args, **kwargs: False,
+    )
+    acts = TicketActivities(agent)
+
+    first = await acts.execute_refund("t1", 42.0)
+
+    assert first is False
+
+
 async def test_execute_refund_passes_refund_details_to_readmodel(monkeypatch):
     agent = ScriptedAgent(billing_classification(), refund_draft())
     calls: list[tuple[str, float, int, str | None]] = []
@@ -72,6 +85,7 @@ async def test_execute_refund_passes_refund_details_to_readmodel(monkeypatch):
     )
     acts = TicketActivities(agent, database_url="postgresql://example/tickets")
 
-    await acts.execute_refund("t1", 42.0, attempt=2)
+    first = await acts.execute_refund("t1", 42.0, attempt=2)
 
+    assert first is False
     assert calls == [("t1", 42.0, 2, "postgresql://example/tickets")]

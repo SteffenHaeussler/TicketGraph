@@ -103,7 +103,7 @@ RETURNING *;
   `await_approval` sets `wakeup_at=now()+24h` and `interrupt()`s; resume by decision or timer.
 - [x] **3.4 Schedule-to-start fallback.** Primary dispatch sets `wakeup_at=now()+30s`; if the task
   is still `pending` when the timer fires, re-dispatch to `ticketflow-agent-fallback`.
-- [ ] **3.5 Terminal nodes.** `execute` (refund via ledger + `send_reply`) and `record`; preserve
+- [x] **3.5 Terminal nodes.** `execute` (refund via ledger + `send_reply`) and `record`; preserve
   `REJECTION_REPLY` / `ESCALATION_REPLY` text and `CONFIDENCE_THRESHOLD=0.75`.
 
 ## Milestone 4 — Runner (the workflow driver)
