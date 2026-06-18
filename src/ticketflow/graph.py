@@ -10,6 +10,11 @@ The ``classify`` and ``draft`` nodes do not call the agent inline. Each
 a runner (M4) resumes the graph with ``Command(resume=<result>)``; on resume the
 node re-runs from the top, so the enqueue is idempotent via its idempotency key.
 
+Each dispatch also arms a schedule-to-start timer (``wakeup_at = now()+30s``,
+Milestone 3.4): if the runner resumes with a ``{"kind": "timeout"}`` envelope
+while the task is still ``pending``, the work is re-dispatched to the unthrottled
+``ticketflow-agent-fallback`` queue.
+
 Approval-needed drafts pause at the approval gate (Milestone 3.3): they
 ``interrupt()`` and resume from a human decision or a timer envelope.
 
@@ -19,8 +24,8 @@ ledger, read-model persistence, rejection/escalation replies).
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from typing import Literal, TypedDict
+from datetime import datetime, timedelta, timezone
+from typing import Any, Literal, TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -41,6 +46,16 @@ from ticketflow.models import (
     TicketStatus,
 )
 from ticketflow.workflows import APPROVAL_TIMEOUT, CONFIDENCE_THRESHOLD
+
+
+def _is_timeout(resume: Any) -> bool:
+    """True if a resume value is a ``{"kind": "timeout"}`` control envelope.
+
+    The runner resumes a dispatch interrupt with either the raw agent result
+    (a ``Classification``/``DraftReply`` dict, which has no ``kind`` field) or a
+    timeout envelope when the schedule-to-start timer fires.
+    """
+    return isinstance(resume, dict) and resume.get("kind") == "timeout"
 
 
 class TicketState(TypedDict, total=False):
@@ -76,20 +91,79 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
                                           |-> prepare_approval -> await_approval
     """
 
-    async def classify(state: TicketState) -> TicketState:
-        ticket = state.get("ticket")
-        assert ticket is not None
+    async def dispatch_agent_task(
+        *, task_type: str, workflow_id: str, payload: dict[str, Any]
+    ) -> Any:
+        """Enqueue an agent task, suspend, and fall back if it stalls (M3.4).
+
+        Primary dispatch enqueues onto ``AGENT_TASK_QUEUE`` and ``interrupt()``s
+        with a ``wakeup_at = now()+AGENT_SCHEDULE_TO_START_S`` so the runner can
+        arm a schedule-to-start timer. If the runner resumes with a
+        ``{"kind": "timeout"}`` envelope and the task is still ``pending``, the
+        same work is re-dispatched to the unthrottled fallback queue and the
+        node suspends again; otherwise (a worker already leased it) it just waits
+        for the result. Returns the raw agent result the runner resumes with.
+
+        The node re-runs from the top on each resume, so both enqueues are
+        idempotent via their keys and replay safely.
+        """
+        key = f"{workflow_id}:{task_type}"
         with pool.connection() as conn:
             taskqueue.enqueue(
                 conn,
                 queue_name=config.AGENT_TASK_QUEUE,
-                task_type="classify",
-                workflow_id=ticket.id,
-                payload={"ticket": ticket.model_dump(mode="json")},
-                idempotency_key=f"{ticket.id}:classify",
+                task_type=task_type,
+                workflow_id=workflow_id,
+                payload=payload,
+                idempotency_key=key,
             )
             conn.commit()
-        result = interrupt({"task_type": "classify", "workflow_id": ticket.id})
+        wakeup_at = datetime.now(timezone.utc) + timedelta(
+            seconds=config.AGENT_SCHEDULE_TO_START_S
+        )
+        resume = interrupt(
+            {
+                "task_type": task_type,
+                "workflow_id": workflow_id,
+                "queue": config.AGENT_TASK_QUEUE,
+                "wakeup_at": wakeup_at.isoformat(),
+            }
+        )
+        if _is_timeout(resume):
+            with pool.connection() as conn:
+                redispatched = taskqueue.is_pending(conn, key)
+                if redispatched:
+                    taskqueue.enqueue(
+                        conn,
+                        queue_name=config.FALLBACK_TASK_QUEUE,
+                        task_type=task_type,
+                        workflow_id=workflow_id,
+                        payload=payload,
+                        idempotency_key=f"{key}:fallback",
+                    )
+                conn.commit()
+            # Wait on whichever queue now owns the work: the fallback if we just
+            # routed it there, otherwise the primary worker that already leased it.
+            queue = (
+                config.FALLBACK_TASK_QUEUE if redispatched else config.AGENT_TASK_QUEUE
+            )
+            resume = interrupt(
+                {
+                    "task_type": task_type,
+                    "workflow_id": workflow_id,
+                    "queue": queue,
+                }
+            )
+        return resume
+
+    async def classify(state: TicketState) -> TicketState:
+        ticket = state.get("ticket")
+        assert ticket is not None
+        result = await dispatch_agent_task(
+            task_type="classify",
+            workflow_id=ticket.id,
+            payload={"ticket": ticket.model_dump(mode="json")},
+        )
         classification = Classification.model_validate(result)
         return {
             "classification": classification,
@@ -100,20 +174,14 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
         ticket = state.get("ticket")
         classification = state.get("classification")
         assert ticket is not None and classification is not None
-        with pool.connection() as conn:
-            taskqueue.enqueue(
-                conn,
-                queue_name=config.AGENT_TASK_QUEUE,
-                task_type="draft",
-                workflow_id=ticket.id,
-                payload={
-                    "ticket": ticket.model_dump(mode="json"),
-                    "classification": classification.model_dump(mode="json"),
-                },
-                idempotency_key=f"{ticket.id}:draft",
-            )
-            conn.commit()
-        result = interrupt({"task_type": "draft", "workflow_id": ticket.id})
+        result = await dispatch_agent_task(
+            task_type="draft",
+            workflow_id=ticket.id,
+            payload={
+                "ticket": ticket.model_dump(mode="json"),
+                "classification": classification.model_dump(mode="json"),
+            },
+        )
         reply = DraftReply.model_validate(result)
         return {"draft": reply, "status": TicketStatus.DRAFTING}
 

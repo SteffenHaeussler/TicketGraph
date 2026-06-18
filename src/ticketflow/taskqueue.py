@@ -50,6 +50,15 @@ def enqueue(
     return row[0]
 
 
+def is_pending(conn: Any, idempotency_key: str) -> bool:
+    """True if the task with this idempotency key is still awaiting a worker."""
+    row = conn.execute(
+        "SELECT 1 FROM task_queue WHERE idempotency_key = %s AND status = 'pending'",
+        (idempotency_key,),
+    ).fetchone()
+    return row is not None
+
+
 def complete(conn: Any, task_id: int, *, result: Mapping[str, Any]) -> str | None:
     """Mark a leased task done and store its result.
 

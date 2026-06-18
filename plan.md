@@ -101,7 +101,7 @@ RETURNING *;
   resume with `Command(resume=<result>)`. _Done:_ graph suspends at dispatch, resumes on result.
 - [x] **3.3 Approval gate.** `decide_approval` rule (`action==REFUND` OR `confidence<0.75`);
   `await_approval` sets `wakeup_at=now()+24h` and `interrupt()`s; resume by decision or timer.
-- [ ] **3.4 Schedule-to-start fallback.** Primary dispatch sets `wakeup_at=now()+30s`; if the task
+- [x] **3.4 Schedule-to-start fallback.** Primary dispatch sets `wakeup_at=now()+30s`; if the task
   is still `pending` when the timer fires, re-dispatch to `ticketflow-agent-fallback`.
 - [ ] **3.5 Terminal nodes.** `execute` (refund via ledger + `send_reply`) and `record`; preserve
   `REJECTION_REPLY` / `ESCALATION_REPLY` text and `CONFIDENCE_THRESHOLD=0.75`.

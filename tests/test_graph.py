@@ -85,8 +85,18 @@ def recording_activities() -> RecordingActivities:
 
 
 def idempotency_keys(pool: FakePool) -> list[object]:
-    # taskqueue.enqueue params: (queue, task_type, workflow_id, idempotency_key, ...)
-    return [params[3] for params in pool.connection_obj.params]
+    # taskqueue.enqueue params: (queue, task_type, workflow_id, idempotency_key, ...).
+    # Skip shorter tuples from reads like taskqueue.is_pending (single param).
+    return [params[3] for params in pool.connection_obj.params if len(params) > 3]
+
+
+def enqueue_calls(pool: FakePool) -> list[tuple[object, object]]:
+    """(queue_name, idempotency_key) for each enqueue recorded on the pool."""
+    return [
+        (params[0], params[3])
+        for params in pool.connection_obj.params
+        if len(params) > 3
+    ]
 
 
 async def resume_through_agents(
@@ -162,6 +172,67 @@ async def test_happy_path_dispatches_then_resolves() -> None:
     assert f"{ticket.id}:classify" in keys
     assert f"{ticket.id}:draft" in keys
     assert activities.sent_replies == [(ticket.id, final["draft"].reply_text)]
+
+
+async def test_schedule_to_start_timeout_redispatches_to_fallback() -> None:
+    pool = FakePool(opened=True, row=(1,))
+    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    ticket = make_ticket("t-fallback")
+    cfg = config_for(ticket.id)
+
+    out = await compiled.ainvoke(
+        {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+    )
+    assert "__interrupt__" in out  # suspended at the classify dispatch
+    payload = out["__interrupt__"][0].value
+    assert payload["queue"] == config.AGENT_TASK_QUEUE
+    assert isinstance(payload["wakeup_at"], str)
+
+    # The schedule-to-start timer fires while the task is still pending.
+    out = await compiled.ainvoke(Command(resume={"kind": "timeout"}), cfg)
+    assert "__interrupt__" in out  # re-suspended after the fallback dispatch
+    assert out["__interrupt__"][0].value["queue"] == config.FALLBACK_TASK_QUEUE
+
+    # The same work was re-dispatched to the fallback queue under its own key.
+    assert (
+        config.FALLBACK_TASK_QUEUE,
+        f"{ticket.id}:classify:fallback",
+    ) in enqueue_calls(pool)
+
+    # Resuming with the agent result advances to the draft dispatch as usual.
+    out = await compiled.ainvoke(
+        Command(resume=make_classification().model_dump(mode="json")), cfg
+    )
+    assert "__interrupt__" in out
+    assert out["__interrupt__"][0].value["task_type"] == "draft"
+
+
+async def test_schedule_to_start_timeout_skips_fallback_when_not_pending() -> None:
+    # row=None makes taskqueue.is_pending() report the task is no longer pending
+    # (a worker already leased it), so no fallback dispatch happens.
+    pool = FakePool(opened=True, row=None)
+    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    ticket = make_ticket("t-leased")
+    cfg = config_for(ticket.id)
+
+    out = await compiled.ainvoke(
+        {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+    )
+    assert "__interrupt__" in out
+
+    out = await compiled.ainvoke(Command(resume={"kind": "timeout"}), cfg)
+    assert "__interrupt__" in out  # re-suspended, still waiting on the primary task
+    assert out["__interrupt__"][0].value["queue"] == config.AGENT_TASK_QUEUE
+
+    # No work was routed to the fallback queue.
+    assert all(queue != config.FALLBACK_TASK_QUEUE for queue, _ in enqueue_calls(pool))
+
+    # The result still resumes the graph normally.
+    out = await compiled.ainvoke(
+        Command(resume=make_classification().model_dump(mode="json")), cfg
+    )
+    assert "__interrupt__" in out
+    assert out["__interrupt__"][0].value["task_type"] == "draft"
 
 
 async def test_decide_approval_flags_refund_drafts() -> None:
@@ -311,6 +382,71 @@ async def test_dispatch_loop_resolves_through_real_postgres() -> None:
     assert state["result"].reply_text == state["draft"].reply_text
 
 
+@pytest.mark.integration
+async def test_schedule_to_start_timeout_routes_to_fallback_through_postgres() -> None:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from ticketflow import db
+
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    activities = TicketActivities(
+        MockAgent(
+            seed=1, failure_rate=0.0, refund_rate=0.0, confidence_range=(0.8, 1.0)
+        )
+    )
+    ticket = make_ticket("t-fb")
+    cfg = config_for(ticket.id)
+
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM task_queue WHERE workflow_id = %s", (ticket.id,))
+            conn.commit()
+
+        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
+            await saver.setup()
+            compiled = graph.compile_ticket_graph(activities, saver, pool)
+
+            out = await compiled.ainvoke(
+                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+            )
+            # Suspended at the classify dispatch with only the primary task pending.
+            assert "__interrupt__" in out
+            assert _pending_keys(pool, ticket.id) == [f"{ticket.id}:classify"]
+
+            # No primary worker picked it up; the schedule-to-start timer fires.
+            out = await compiled.ainvoke(Command(resume={"kind": "timeout"}), cfg)
+            assert "__interrupt__" in out
+            assert out["__interrupt__"][0].value["queue"] == config.FALLBACK_TASK_QUEUE
+            assert f"{ticket.id}:classify:fallback" in _pending_keys(pool, ticket.id)
+
+            # The unthrottled fallback worker drains it; resume with its result.
+            assert await process_one_agent_task(
+                pool, activities, queue_name=config.FALLBACK_TASK_QUEUE
+            )
+            out = await compiled.ainvoke(
+                Command(resume=_task_result(pool, f"{ticket.id}:classify:fallback")),
+                cfg,
+            )
+
+            # Drive the remaining dispatch(es) to completion through the primary
+            # queue. An orphaned primary copy of the classify task may also be
+            # pending, so drain until the awaited task has produced its result.
+            while "__interrupt__" in out:
+                interrupt = out["__interrupt__"][0].value
+                key = f"{interrupt['workflow_id']}:{interrupt['task_type']}"
+                while _result_for(pool, key) is None:
+                    assert await process_one_agent_task(pool, activities)
+                out = await compiled.ainvoke(
+                    Command(resume=_result_for(pool, key)), cfg
+                )
+
+            assert out["status"] == TicketStatus.RESOLVED
+    finally:
+        pool.close()
+
+
 def _pending_keys(pool: object, workflow_id: str) -> list[str]:
     with pool.connection() as conn:  # type: ignore[attr-defined]
         rows = conn.execute(
@@ -329,3 +465,14 @@ def _task_result(pool: object, idempotency_key: str) -> dict:
         ).fetchone()
     assert row is not None and row[0] is not None
     return row[0]
+
+
+def _result_for(pool: object, idempotency_key: str) -> dict | None:
+    """Return a task's stored result, or ``None`` if it has not produced one."""
+    with pool.connection() as conn:  # type: ignore[attr-defined]
+        row = conn.execute(
+            "SELECT result FROM task_queue "
+            "WHERE idempotency_key = %s AND result IS NOT NULL",
+            (idempotency_key,),
+        ).fetchone()
+    return row[0] if row is not None else None
