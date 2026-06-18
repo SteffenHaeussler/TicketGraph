@@ -56,15 +56,20 @@ def reply_only_draft(confidence: float = 0.9, model: str = "primary") -> DraftRe
 
 
 async def process_one_agent_task(
-    pool: _Pool, activities: TicketActivities, worker_id: str = "w"
+    pool: _Pool,
+    activities: TicketActivities,
+    worker_id: str = "w",
+    queue_name: str = config.AGENT_TASK_QUEUE,
 ) -> bool:
-    """Lease one ``ticketflow-agent`` task, run it, and store the result.
+    """Lease one task from ``queue_name``, run it, and store the result.
 
     A stand-in for the real agent worker (Milestone 5) so M3.2 tests can drive a
-    dispatch -> queue -> resume loop end to end. Returns ``True`` if a task was
-    processed, ``False`` if the queue was empty.
+    dispatch -> queue -> resume loop end to end. Pass
+    ``queue_name=config.FALLBACK_TASK_QUEUE`` to drain the schedule-to-start
+    fallback queue (M3.4). Returns ``True`` if a task was processed, ``False`` if
+    the queue was empty.
     """
-    task = db.dequeue(config.AGENT_TASK_QUEUE, worker_id, pool=pool)
+    task = db.dequeue(queue_name, worker_id, pool=pool)
     if task is None:
         return False
 
