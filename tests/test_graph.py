@@ -25,9 +25,10 @@ from ticketflow.models import (
     ProposedAction,
     Ticket,
     TicketCategory,
+    TicketResult,
     TicketStatus,
 )
-from ticketflow.workflows import APPROVAL_TIMEOUT
+from ticketflow.workflows import APPROVAL_TIMEOUT, ESCALATION_REPLY, REJECTION_REPLY
 
 
 class RecordingActivities(TicketActivities):
@@ -36,9 +37,21 @@ class RecordingActivities(TicketActivities):
     def __init__(self, agent: MockAgent):
         super().__init__(agent)
         self.sent_replies: list[tuple[str, str]] = []
+        self.refund_calls: list[tuple[str, float, int]] = []
+        self.refund_results: list[bool] = [True]
+        self.recorded_results: list[TicketResult] = []
 
     async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
         self.sent_replies.append((ticket.id, reply_text))
+
+    async def execute_refund(
+        self, ticket_id: str, amount: float, attempt: int = 1
+    ) -> bool:
+        self.refund_calls.append((ticket_id, amount, attempt))
+        return self.refund_results.pop(0)
+
+    async def record_result(self, result: TicketResult) -> None:
+        self.recorded_results.append(result)
 
 
 def make_ticket(ticket_id: str = "t-1") -> Ticket:
@@ -172,6 +185,8 @@ async def test_happy_path_dispatches_then_resolves() -> None:
     assert f"{ticket.id}:classify" in keys
     assert f"{ticket.id}:draft" in keys
     assert activities.sent_replies == [(ticket.id, final["draft"].reply_text)]
+    assert activities.refund_calls == []
+    assert activities.recorded_results == [final["result"]]
 
 
 async def test_schedule_to_start_timeout_redispatches_to_fallback() -> None:
@@ -279,12 +294,37 @@ async def test_approved_resume_continues_to_resolution() -> None:
     assert final["status"] == TicketStatus.RESOLVED
     assert final["decision"] == decision
     assert final["result"].status == TicketStatus.RESOLVED
+    assert final["result"].refund_executed is True
     draft = state.get("draft")
     assert draft is not None
+    assert activities.refund_calls == [(ticket.id, 42.0, 1)]
     assert activities.sent_replies == [(ticket.id, draft.reply_text)]
+    assert activities.recorded_results == [final["result"]]
 
 
-async def test_rejected_resume_stops_without_sending_draft() -> None:
+async def test_approved_duplicate_refund_records_no_new_refund() -> None:
+    pool = FakePool(opened=True, row=(1,))
+    activities = recording_activities()
+    activities.refund_results = [False]
+    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    ticket = make_ticket("t-approved-duplicate")
+    await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
+    decision = ApprovalDecision(approved=True, approver="sam@example.com")
+
+    final = await compiled.ainvoke(
+        Command(
+            resume={"kind": "decision", "decision": decision.model_dump(mode="json")}
+        ),
+        config_for(ticket.id),
+    )
+
+    assert final["status"] == TicketStatus.RESOLVED
+    assert final["result"].refund_executed is False
+    assert activities.refund_calls == [(ticket.id, 42.0, 1)]
+    assert activities.recorded_results == [final["result"]]
+
+
+async def test_rejected_resume_sends_and_records_rejection_reply() -> None:
     pool = FakePool(opened=True, row=(1,))
     activities = recording_activities()
     compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
@@ -303,11 +343,16 @@ async def test_rejected_resume_stops_without_sending_draft() -> None:
 
     assert final["status"] == TicketStatus.REJECTED
     assert final["decision"] == decision
-    assert final.get("result") is None
-    assert activities.sent_replies == []
+    assert final["result"].status == TicketStatus.REJECTED
+    assert final["result"].reply_text == REJECTION_REPLY
+    assert final["result"].refund_executed is False
+    assert final["wakeup_at"] is None
+    assert activities.sent_replies == [(ticket.id, REJECTION_REPLY)]
+    assert activities.refund_calls == []
+    assert activities.recorded_results == [final["result"]]
 
 
-async def test_timeout_resume_escalates_without_sending_draft() -> None:
+async def test_timeout_resume_sends_and_records_escalation_reply() -> None:
     pool = FakePool(opened=True, row=(1,))
     activities = recording_activities()
     compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
@@ -321,8 +366,13 @@ async def test_timeout_resume_escalates_without_sending_draft() -> None:
 
     assert final["status"] == TicketStatus.ESCALATED
     assert final.get("decision") is None
-    assert final.get("result") is None
-    assert activities.sent_replies == []
+    assert final["result"].status == TicketStatus.ESCALATED
+    assert final["result"].reply_text == ESCALATION_REPLY
+    assert final["result"].refund_executed is False
+    assert final["wakeup_at"] is None
+    assert activities.sent_replies == [(ticket.id, ESCALATION_REPLY)]
+    assert activities.refund_calls == []
+    assert activities.recorded_results == [final["result"]]
 
 
 @pytest.mark.integration

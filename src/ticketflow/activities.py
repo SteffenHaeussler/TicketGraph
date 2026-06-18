@@ -38,7 +38,7 @@ class TicketActivities:
 
     async def execute_refund(
         self, ticket_id: str, amount: float, attempt: int = 1
-    ) -> None:
+    ) -> bool:
         """Execute a refund at most once per ticket id."""
         first = await asyncio.to_thread(
             readmodel.record_refund,
@@ -57,6 +57,7 @@ class TicketActivities:
                 ticket_id,
                 attempt,
             )
+        return first
 
     async def record_result(self, result: TicketResult) -> None:
         """Persist the terminal workflow result to the read model."""
