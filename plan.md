@@ -99,7 +99,7 @@ RETURNING *;
   reaches `resolved`; state survives a fresh process via the checkpointer.
 - [ ] **3.2 Dispatch-and-interrupt.** Convert `classify`/`draft` to **enqueue a task + `interrupt()`**;
   resume with `Command(resume=<result>)`. _Done:_ graph suspends at dispatch, resumes on result.
-- [ ] **3.3 Approval gate.** `decide_approval` rule (`action==REFUND` OR `confidence<0.75`);
+- [x] **3.3 Approval gate.** `decide_approval` rule (`action==REFUND` OR `confidence<0.75`);
   `await_approval` sets `wakeup_at=now()+24h` and `interrupt()`s; resume by decision or timer.
 - [ ] **3.4 Schedule-to-start fallback.** Primary dispatch sets `wakeup_at=now()+30s`; if the task
   is still `pending` when the timer fires, re-dispatch to `ticketflow-agent-fallback`.
