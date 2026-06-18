@@ -93,7 +93,7 @@ RETURNING *;
 ## Milestone 3 — LangGraph workflow graph
 *DDIA: durable execution as a logged state machine.*
 
-- [ ] **3.1 Graph skeleton (inline).** `graph.py`: `TicketState` + `StateGraph`
+- [x] **3.1 Graph skeleton (inline).** `graph.py`: `TicketState` + `StateGraph`
   (`classify → draft → decide_approval → execute → record`) with `PostgresSaver`. Nodes call the
   agent **inline** for now (no queue) to prove the graph runs and checkpoints. _Done:_ a ticket
   reaches `resolved`; state survives a fresh process via the checkpointer.
