@@ -10,14 +10,17 @@ The ``classify`` and ``draft`` nodes do not call the agent inline. Each
 a runner (M4) resumes the graph with ``Command(resume=<result>)``; on resume the
 node re-runs from the top, so the enqueue is idempotent via its idempotency key.
 
-Later milestones refine the remaining nodes: 3.3 turns ``decide_approval`` into
-the real approval gate, and 3.5 makes ``execute``/``record`` terminal (refund
+Approval-needed drafts pause at the approval gate (Milestone 3.3): they
+``interrupt()`` and resume from a human decision or a timer envelope.
+
+A later milestone makes ``execute``/``record`` terminal (refund
 ledger, read-model persistence, rejection/escalation replies).
 """
 
 from __future__ import annotations
 
-from typing import TypedDict
+from datetime import datetime, timezone
+from typing import Literal, TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
 from langgraph.graph import END, START, StateGraph
@@ -37,7 +40,7 @@ from ticketflow.models import (
     TicketResult,
     TicketStatus,
 )
-from ticketflow.workflows import CONFIDENCE_THRESHOLD
+from ticketflow.workflows import APPROVAL_TIMEOUT, CONFIDENCE_THRESHOLD
 
 
 class TicketState(TypedDict, total=False):
@@ -53,6 +56,7 @@ class TicketState(TypedDict, total=False):
     draft: DraftReply | None
     needs_approval: bool
     decision: ApprovalDecision | None
+    wakeup_at: datetime | None
     status: TicketStatus
     result: TicketResult | None
 
@@ -64,12 +68,12 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
     enqueue agent tasks. ``activities`` carries the side-effect operations used
     by the inline terminal nodes (and, later, the agent worker).
 
-    The graph is linear::
+    ``classify`` and ``draft`` dispatch a task and ``interrupt()``; the rest run
+    inline. After drafting, the graph either executes directly or pauses at the
+    approval gate::
 
         classify -> draft -> decide_approval -> execute -> record
-
-    ``classify`` and ``draft`` dispatch a task and ``interrupt()``; the rest run
-    inline.
+                                          |-> prepare_approval -> await_approval
     """
 
     async def classify(state: TicketState) -> TicketState:
@@ -122,6 +126,41 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
         )
         return {"needs_approval": needs_approval}
 
+    async def prepare_approval(state: TicketState) -> TicketState:
+        _ = state
+        return {
+            "status": TicketStatus.AWAITING_APPROVAL,
+            "wakeup_at": datetime.now(timezone.utc) + APPROVAL_TIMEOUT,
+        }
+
+    async def await_approval(state: TicketState) -> TicketState:
+        ticket = state.get("ticket")
+        reply = state.get("draft")
+        wakeup_at = state.get("wakeup_at")
+        assert ticket is not None and reply is not None and wakeup_at is not None
+
+        resume = interrupt(
+            {
+                "kind": "approval_required",
+                "ticket_id": ticket.id,
+                "wakeup_at": wakeup_at.isoformat(),
+                "draft": reply.model_dump(mode="json"),
+            }
+        )
+        if not isinstance(resume, dict):
+            raise ValueError("approval resume payload must be an object")
+
+        kind = resume.get("kind")
+        if kind == "timeout":
+            return {"status": TicketStatus.ESCALATED}
+        if kind != "decision":
+            raise ValueError("approval resume kind must be 'decision' or 'timeout'")
+
+        decision = ApprovalDecision.model_validate(resume.get("decision"))
+        if decision.approved:
+            return {"decision": decision}
+        return {"decision": decision, "status": TicketStatus.REJECTED}
+
     async def execute(state: TicketState) -> TicketState:
         ticket = state.get("ticket")
         reply = state.get("draft")
@@ -143,17 +182,40 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
         )
         return {"result": result, "status": TicketStatus.RESOLVED}
 
+    def route_after_decide(
+        state: TicketState,
+    ) -> Literal["prepare_approval", "execute"]:
+        return "prepare_approval" if state.get("needs_approval") else "execute"
+
+    def route_after_approval(state: TicketState) -> Literal["execute", "end"]:
+        decision = state.get("decision")
+        if decision is not None and decision.approved:
+            return "execute"
+        return "end"
+
     builder: StateGraph = StateGraph(TicketState)
     builder.add_node("classify", classify)
     builder.add_node("draft", draft)
     builder.add_node("decide_approval", decide_approval)
+    builder.add_node("prepare_approval", prepare_approval)
+    builder.add_node("await_approval", await_approval)
     builder.add_node("execute", execute)
     builder.add_node("record", record)
 
     builder.add_edge(START, "classify")
     builder.add_edge("classify", "draft")
     builder.add_edge("draft", "decide_approval")
-    builder.add_edge("decide_approval", "execute")
+    builder.add_conditional_edges(
+        "decide_approval",
+        route_after_decide,
+        {"prepare_approval": "prepare_approval", "execute": "execute"},
+    )
+    builder.add_edge("prepare_approval", "await_approval")
+    builder.add_conditional_edges(
+        "await_approval",
+        route_after_approval,
+        {"execute": "execute", "end": END},
+    )
     builder.add_edge("execute", "record")
     builder.add_edge("record", END)
 

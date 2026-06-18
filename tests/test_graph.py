@@ -1,4 +1,11 @@
-"""Tests for the dispatch-and-interrupt LangGraph ticket workflow (M3.2)."""
+"""Tests for the dispatch-and-interrupt LangGraph ticket workflow (M3.2/M3.3).
+
+``classify`` and ``draft`` dispatch a task and ``interrupt()``; the tests resume
+them with the agent result. Refund / low-confidence drafts then pause at the
+approval gate, which resumes from a human decision or a timer envelope.
+"""
+
+from datetime import datetime, timezone
 
 import pytest
 from langchain_core.runnables import RunnableConfig
@@ -12,6 +19,7 @@ from ticketflow.activities import TicketActivities
 from ticketflow.agent.mock import MockAgent
 from ticketflow.models import (
     ActionType,
+    ApprovalDecision,
     Classification,
     DraftReply,
     ProposedAction,
@@ -19,6 +27,18 @@ from ticketflow.models import (
     TicketCategory,
     TicketStatus,
 )
+from ticketflow.workflows import APPROVAL_TIMEOUT
+
+
+class RecordingActivities(TicketActivities):
+    """Ticket activities that keep side effects visible to graph tests."""
+
+    def __init__(self, agent: MockAgent):
+        super().__init__(agent)
+        self.sent_replies: list[tuple[str, str]] = []
+
+    async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
+        self.sent_replies.append((ticket.id, reply_text))
 
 
 def make_ticket(ticket_id: str = "t-1") -> Ticket:
@@ -58,10 +78,10 @@ def refund_draft(amount: float = 42.0, confidence: float = 0.9) -> DraftReply:
     )
 
 
-def unit_activities() -> TicketActivities:
-    # The agent is never called by the graph in M3.2 (the worker owns that);
-    # the inline ``execute`` node still needs ``send_reply``.
-    return TicketActivities(MockAgent(seed=1, failure_rate=0.0))
+def recording_activities() -> RecordingActivities:
+    # The agent is never called by the graph (the worker owns that in M5); the
+    # inline ``execute`` node still needs ``send_reply``, captured here.
+    return RecordingActivities(MockAgent(seed=1, failure_rate=0.0))
 
 
 def idempotency_keys(pool: FakePool) -> list[object]:
@@ -69,26 +89,67 @@ def idempotency_keys(pool: FakePool) -> list[object]:
     return [params[3] for params in pool.connection_obj.params]
 
 
-async def test_happy_path_dispatches_then_resolves() -> None:
-    pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(unit_activities(), InMemorySaver(), pool)
-    ticket = make_ticket()
-    cfg = config_for(ticket.id)
+async def resume_through_agents(
+    compiled, ticket: Ticket, *, classification: Classification, draft: DraftReply
+) -> dict:
+    """Drive past the classify and draft dispatch interrupts.
 
+    Returns the invoke output after the draft result is applied -- either the
+    final resolved state or the approval-gate interrupt envelope.
+    """
+    cfg = config_for(ticket.id)
     out = await compiled.ainvoke(
         {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
     )
     assert "__interrupt__" in out  # suspended at the classify dispatch
-
     out = await compiled.ainvoke(
-        Command(resume=make_classification().model_dump(mode="json")), cfg
+        Command(resume=classification.model_dump(mode="json")), cfg
     )
     assert "__interrupt__" in out  # suspended at the draft dispatch
+    return await compiled.ainvoke(Command(resume=draft.model_dump(mode="json")), cfg)
 
-    final = await compiled.ainvoke(
-        Command(resume=reply_draft().model_dump(mode="json")), cfg
+
+async def drive_to_approval_interrupt(
+    compiled, ticket: Ticket, *, draft: DraftReply
+) -> tuple[dict, graph.TicketState]:
+    """Drive through dispatch to the approval gate and assert the envelope."""
+    started_at = datetime.now(timezone.utc)
+    out = await resume_through_agents(
+        compiled, ticket, classification=make_classification(), draft=draft
+    )
+    finished_at = datetime.now(timezone.utc)
+    snapshot = await compiled.aget_state(config_for(ticket.id))
+    state = snapshot.values
+
+    assert "__interrupt__" in out
+    interrupts = out["__interrupt__"]
+    assert len(interrupts) == 1
+    payload = interrupts[0].value
+    assert payload["kind"] == "approval_required"
+    assert payload["ticket_id"] == ticket.id
+    assert isinstance(payload["wakeup_at"], str)
+    assert payload["draft"] == state["draft"].model_dump(mode="json")
+
+    assert snapshot.next == ("await_approval",)
+    assert state["status"] == TicketStatus.AWAITING_APPROVAL
+    assert state["needs_approval"] is True
+    assert state["wakeup_at"] is not None
+    assert started_at + APPROVAL_TIMEOUT <= state["wakeup_at"]
+    assert state["wakeup_at"] <= finished_at + APPROVAL_TIMEOUT
+    return out, state
+
+
+async def test_happy_path_dispatches_then_resolves() -> None:
+    pool = FakePool(opened=True, row=(1,))
+    activities = recording_activities()
+    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    ticket = make_ticket()
+
+    final = await resume_through_agents(
+        compiled, ticket, classification=make_classification(), draft=reply_draft()
     )
 
+    assert "__interrupt__" not in final
     assert final["status"] == TicketStatus.RESOLVED
     assert final["classification"].category == TicketCategory.GENERAL
     assert final["draft"].reply_text == "Try restarting the app."
@@ -100,42 +161,97 @@ async def test_happy_path_dispatches_then_resolves() -> None:
     keys = idempotency_keys(pool)
     assert f"{ticket.id}:classify" in keys
     assert f"{ticket.id}:draft" in keys
+    assert activities.sent_replies == [(ticket.id, final["draft"].reply_text)]
 
 
 async def test_decide_approval_flags_refund_drafts() -> None:
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(unit_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
     ticket = make_ticket("t-refund")
-    cfg = config_for(ticket.id)
 
-    await compiled.ainvoke({"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg)
-    await compiled.ainvoke(
-        Command(resume=make_classification().model_dump(mode="json")), cfg
-    )
-    final = await compiled.ainvoke(
-        Command(resume=refund_draft().model_dump(mode="json")), cfg
-    )
+    _, state = await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
 
-    assert final["draft"].action.type == ActionType.REFUND
-    assert final["needs_approval"] is True
+    draft = state.get("draft")
+    assert draft is not None
+    assert draft.action.type == ActionType.REFUND
 
 
 async def test_decide_approval_flags_low_confidence_drafts() -> None:
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(unit_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
     ticket = make_ticket("t-lowconf")
-    cfg = config_for(ticket.id)
 
-    await compiled.ainvoke({"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg)
-    await compiled.ainvoke(
-        Command(resume=make_classification().model_dump(mode="json")), cfg
+    _, state = await drive_to_approval_interrupt(
+        compiled, ticket, draft=reply_draft(confidence=0.4)
     )
+
+    draft = state.get("draft")
+    assert draft is not None
+    assert draft.confidence < 0.75
+
+
+async def test_approved_resume_continues_to_resolution() -> None:
+    pool = FakePool(opened=True, row=(1,))
+    activities = recording_activities()
+    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    ticket = make_ticket("t-approved")
+    _, state = await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
+    decision = ApprovalDecision(approved=True, approver="sam@example.com")
+
     final = await compiled.ainvoke(
-        Command(resume=reply_draft(confidence=0.4).model_dump(mode="json")), cfg
+        Command(
+            resume={"kind": "decision", "decision": decision.model_dump(mode="json")}
+        ),
+        config_for(ticket.id),
     )
 
-    assert final["draft"].confidence < 0.75
-    assert final["needs_approval"] is True
+    assert final["status"] == TicketStatus.RESOLVED
+    assert final["decision"] == decision
+    assert final["result"].status == TicketStatus.RESOLVED
+    draft = state.get("draft")
+    assert draft is not None
+    assert activities.sent_replies == [(ticket.id, draft.reply_text)]
+
+
+async def test_rejected_resume_stops_without_sending_draft() -> None:
+    pool = FakePool(opened=True, row=(1,))
+    activities = recording_activities()
+    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    ticket = make_ticket("t-rejected")
+    await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
+    decision = ApprovalDecision(
+        approved=False, approver="sam@example.com", note="Manual review rejected it."
+    )
+
+    final = await compiled.ainvoke(
+        Command(
+            resume={"kind": "decision", "decision": decision.model_dump(mode="json")}
+        ),
+        config_for(ticket.id),
+    )
+
+    assert final["status"] == TicketStatus.REJECTED
+    assert final["decision"] == decision
+    assert final.get("result") is None
+    assert activities.sent_replies == []
+
+
+async def test_timeout_resume_escalates_without_sending_draft() -> None:
+    pool = FakePool(opened=True, row=(1,))
+    activities = recording_activities()
+    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    ticket = make_ticket("t-timeout")
+    await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
+
+    final = await compiled.ainvoke(
+        Command(resume={"kind": "timeout"}),
+        config_for(ticket.id),
+    )
+
+    assert final["status"] == TicketStatus.ESCALATED
+    assert final.get("decision") is None
+    assert final.get("result") is None
+    assert activities.sent_replies == []
 
 
 @pytest.mark.integration
