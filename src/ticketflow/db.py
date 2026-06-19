@@ -210,6 +210,79 @@ def claim_run(
     return _run_from_row(row) if row is not None else None
 
 
+def save_run(
+    ticket_id: str,
+    *,
+    status: str,
+    wakeup_at: datetime | None,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> None:
+    """Persist a workflow run's new ``status``/``wakeup_at`` and release its lease.
+
+    The runner calls this after advancing the graph: the status projection, the
+    next timer, and the lease release land in one ``UPDATE`` (one transaction) so
+    a re-claim never sees a half-applied step. ``status`` must satisfy the
+    ``workflow_run`` CHECK constraint.
+    """
+    owned_pool = pool is None
+    active_pool = pool or make_pool(database_url)
+    try:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            conn.execute(
+                """
+                UPDATE workflow_run
+                SET status = %s,
+                    wakeup_at = %s,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    updated_at = now()
+                WHERE ticket_id = %s
+                """,
+                (status, wakeup_at, ticket_id),
+            )
+            conn.commit()
+    finally:
+        if owned_pool:
+            active_pool.close()
+
+
+def wake_run(
+    ticket_id: str,
+    *,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> None:
+    """Make a run claimable now by pulling its ``wakeup_at`` to the present.
+
+    An awaiting run carries a future ``wakeup_at`` (the 30s schedule-to-start or
+    24h approval timer), so the runner will not claim it until the timer is due.
+    When the awaited result lands a worker calls this to wake the run so the
+    runner picks it up immediately rather than waiting out the timer.
+    """
+    owned_pool = pool is None
+    active_pool = pool or make_pool(database_url)
+    try:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            conn.execute(
+                """
+                UPDATE workflow_run
+                SET wakeup_at = now(),
+                    updated_at = now()
+                WHERE ticket_id = %s
+                """,
+                (ticket_id,),
+            )
+            conn.commit()
+    finally:
+        if owned_pool:
+            active_pool.close()
+
+
 def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> None:
     """Create the migration marker and task queue tables.
 

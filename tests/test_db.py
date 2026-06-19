@@ -331,6 +331,131 @@ def test_claim_run_opens_and_closes_owned_pool(monkeypatch):
     assert pool.closed is True
 
 
+def test_save_run_persists_status_and_releases_lease():
+    pool = FakePool(opened=True)
+    wakeup_at = datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+
+    db.save_run("ticket-1", status="awaiting_approval", wakeup_at=wakeup_at, pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "UPDATE workflow_run" in sql
+    assert "status = %s" in sql
+    assert "wakeup_at = %s" in sql
+    assert "lease_owner = NULL" in sql
+    assert "lease_expires_at = NULL" in sql
+    assert "updated_at = now()" in sql
+    assert "WHERE ticket_id = %s" in sql
+    assert pool.connection_obj.params[-1] == (
+        "awaiting_approval",
+        wakeup_at,
+        "ticket-1",
+    )
+    assert pool.connection_obj.commits == 1
+
+
+def test_save_run_accepts_null_wakeup_at():
+    pool = FakePool(opened=True)
+
+    db.save_run("ticket-1", status="resolved", wakeup_at=None, pool=pool)
+
+    assert pool.connection_obj.params[-1] == ("resolved", None, "ticket-1")
+
+
+def test_save_run_opens_and_closes_owned_pool(monkeypatch):
+    pool = FakePool()
+    monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
+
+    db.save_run("ticket-1", status="resolved", wakeup_at=None)
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
+def test_save_run_leaves_injected_pool_unopened_to_caller():
+    pool = FakePool(opened=True)
+
+    db.save_run("ticket-1", status="resolved", wakeup_at=None, pool=pool)
+
+    assert pool.opened is True
+    assert pool.closed is False
+
+
+def test_wake_run_pulls_wakeup_at_to_now():
+    pool = FakePool(opened=True)
+
+    db.wake_run("ticket-1", pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "UPDATE workflow_run" in sql
+    assert "wakeup_at = now()" in sql
+    assert "updated_at = now()" in sql
+    assert "WHERE ticket_id = %s" in sql
+    assert pool.connection_obj.params[-1] == ("ticket-1",)
+    assert pool.connection_obj.commits == 1
+
+
+def test_wake_run_opens_and_closes_owned_pool(monkeypatch):
+    pool = FakePool()
+    monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
+
+    db.wake_run("ticket-1")
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
+@pytest.mark.integration
+def test_save_run_round_trips_status_and_lease_against_real_postgres():
+    pool = _open_clean_run_pool()
+    try:
+        with pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run "
+                "(ticket_id, status, lease_owner, lease_expires_at) "
+                "VALUES ('saved', 'classifying', 'runner-1', now())"
+            )
+            conn.commit()
+
+        wakeup_at = datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+        db.save_run("saved", status="awaiting_approval", wakeup_at=wakeup_at, pool=pool)
+
+        with pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+                "FROM workflow_run WHERE ticket_id = 'saved'"
+            ).fetchone()
+        assert row is not None
+        assert row[0] == "awaiting_approval"
+        assert row[1] == wakeup_at
+        assert row[2] is None
+        assert row[3] is None
+    finally:
+        pool.close()
+
+
+@pytest.mark.integration
+def test_wake_run_makes_a_future_run_claimable_against_real_postgres():
+    pool = _open_clean_run_pool()
+    try:
+        with pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                "VALUES ('asleep', 'classifying', now() + interval '1 hour')"
+            )
+            conn.commit()
+
+        # Not yet due, so it cannot be claimed.
+        assert db.claim_run("runner-1", pool=pool) is None
+
+        db.wake_run("asleep", pool=pool)
+
+        claimed = db.claim_run("runner-1", pool=pool)
+        assert claimed is not None
+        assert claimed.ticket_id == "asleep"
+    finally:
+        pool.close()
+
+
 @pytest.mark.integration
 def test_bootstrap_is_idempotent_against_real_postgres():
     db.bootstrap()

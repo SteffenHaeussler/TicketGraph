@@ -1,0 +1,237 @@
+"""Tests for the workflow runner loop (Milestone 4.2).
+
+Unit tests cover the envelope/resume helpers and ``step``'s claim -> resume ->
+persist (and no-op release) decision against a fake graph and pool. The
+integration test drives a seeded run ``received -> resolved`` purely through
+``runner.step`` interleaved with the worker stub, against real Postgres.
+"""
+
+from datetime import UTC, datetime
+from typing import Any
+
+import pytest
+
+from tests.helpers import drive_until_quiescent
+from tests.test_db import FakeConnection, FakePool
+from ticketflow import config, db, runner
+from ticketflow.db import WorkflowRun
+
+
+class FakeInterrupt:
+    def __init__(self, value: Any) -> None:
+        self.value = value
+
+
+class FakeSnapshot:
+    def __init__(self, interrupts: list[FakeInterrupt]) -> None:
+        self.interrupts = interrupts
+
+
+class FakeCompiled:
+    """Stands in for a compiled graph: records the resume passed to ``ainvoke``."""
+
+    def __init__(self, snapshot: FakeSnapshot, invoke_result: dict | None = None):
+        self._snapshot = snapshot
+        self._invoke_result = invoke_result or {}
+        self.invoked_with: list[Any] = []
+
+    async def aget_state(self, config: Any) -> FakeSnapshot:
+        return self._snapshot
+
+    async def ainvoke(self, input: Any, config: Any) -> dict[str, Any]:
+        self.invoked_with.append(input)
+        return self._invoke_result
+
+
+def make_run(
+    status: str = "classifying", wakeup_at: datetime | None = None
+) -> WorkflowRun:
+    return WorkflowRun(
+        ticket_id="t-1",
+        status=status,
+        wakeup_at=wakeup_at,
+        lease_owner="runner-1",
+        lease_expires_at=datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC),
+        created_at=datetime(2026, 6, 16, 11, 0, tzinfo=UTC),
+        updated_at=datetime(2026, 6, 16, 12, 0, tzinfo=UTC),
+    )
+
+
+def test_pending_envelope_returns_first_interrupt_value():
+    envelope = {"idempotency_key": "t-1:classify", "task_type": "classify"}
+    snapshot = FakeSnapshot([FakeInterrupt(envelope)])
+
+    assert runner._pending_envelope(snapshot) == envelope
+
+
+def test_pending_envelope_returns_none_without_interrupts():
+    assert runner._pending_envelope(FakeSnapshot([])) is None
+
+
+def test_resume_value_returns_stored_task_result():
+    conn = FakeConnection(row=({"category": "billing"},))
+
+    value = runner._resume_value(conn, {"idempotency_key": "t-1:classify"})
+
+    assert value == {"category": "billing"}
+    assert "FROM task_queue" in conn.sql[-1]
+    assert conn.params[-1] == ("t-1:classify",)
+
+
+def test_resume_value_is_none_when_result_not_ready():
+    conn = FakeConnection(row=None)
+
+    assert runner._resume_value(conn, {"idempotency_key": "t-1:classify"}) is None
+
+
+def test_resume_value_is_none_for_approval_envelope():
+    conn = FakeConnection(row=({"should": "not be read"},))
+
+    # An approval envelope carries no idempotency_key; it resumes from a signal
+    # (M4.4), so the runner never treats it as ready in M4.2.
+    assert runner._resume_value(conn, {"kind": "approval_required"}) is None
+
+
+async def test_step_resumes_when_result_is_ready(monkeypatch):
+    run = make_run()
+    snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
+    compiled = FakeCompiled(
+        snapshot, invoke_result={"status": "drafting", "wakeup_at": None}
+    )
+    pool = FakePool(opened=True, row=({"category": "billing"},))
+
+    monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        db,
+        "save_run",
+        lambda ticket_id, *, status, wakeup_at, pool: saved.append(
+            {"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at}
+        ),
+    )
+
+    advanced = await runner.step(compiled, pool, "runner-1")
+
+    assert advanced is True
+    assert len(compiled.invoked_with) == 1
+    assert saved == [{"ticket_id": "t-1", "status": "drafting", "wakeup_at": None}]
+
+
+async def test_step_releases_without_advancing_when_result_not_ready(monkeypatch):
+    run = make_run(wakeup_at=datetime(2026, 6, 16, 12, 0, tzinfo=UTC))
+    snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
+    compiled = FakeCompiled(snapshot)
+    pool = FakePool(opened=True, row=None)  # no stored task result yet
+
+    monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        db,
+        "save_run",
+        lambda ticket_id, *, status, wakeup_at, pool: saved.append(
+            {"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at}
+        ),
+    )
+
+    advanced = await runner.step(compiled, pool, "runner-1")
+
+    assert advanced is False
+    assert compiled.invoked_with == []  # the graph was not resumed
+    # The lease is released, leaving status/wakeup_at untouched for a later claim.
+    assert saved == [
+        {"ticket_id": "t-1", "status": "classifying", "wakeup_at": run.wakeup_at}
+    ]
+
+
+async def test_step_returns_false_when_no_run_is_claimable(monkeypatch):
+    monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: None)
+    called = False
+
+    def _save(*args, **kwargs):
+        nonlocal called
+        called = True
+
+    monkeypatch.setattr(db, "save_run", _save)
+
+    compiled = FakeCompiled(FakeSnapshot([]))
+    assert await runner.step(compiled, FakePool(opened=True), "runner-1") is False
+    assert called is False
+    assert compiled.invoked_with == []
+
+
+@pytest.mark.integration
+async def test_runner_drives_a_seeded_run_to_resolved_through_postgres():
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from ticketflow import graph
+    from ticketflow.activities import TicketActivities
+    from ticketflow.agent.mock import MockAgent
+    from ticketflow.models import Ticket, TicketStatus
+
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    activities = TicketActivities(
+        MockAgent(
+            seed=1, failure_rate=0.0, refund_rate=0.0, confidence_range=(0.8, 1.0)
+        )
+    )
+    ticket = Ticket(
+        id="t-runner",
+        customer_email="customer@example.com",
+        subject="Need help",
+        body="My login keeps failing and I want it fixed.",
+    )
+    cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
+
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM task_queue WHERE workflow_id = %s", (ticket.id,))
+            # claim_run leases the oldest claimable run table-wide, so isolate
+            # this run from any leftover rows other tests left behind.
+            conn.execute("DELETE FROM workflow_run")
+            conn.commit()
+
+        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
+            await saver.setup()
+            compiled = graph.compile_ticket_graph(activities, saver, pool)
+
+            # Seed: the initial invoke creates the checkpoint + classify outbox and
+            # parks at await_classify; the workflow_run row mirrors that state.
+            out = await compiled.ainvoke(
+                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+            )
+            assert "__interrupt__" in out
+            snapshot = await compiled.aget_state(cfg)
+            with pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                    "VALUES (%s, %s, %s)",
+                    (
+                        ticket.id,
+                        snapshot.values["status"],
+                        snapshot.values.get("wakeup_at"),
+                    ),
+                )
+                conn.commit()
+
+            await drive_until_quiescent(compiled, pool, activities, ticket.id)
+
+            final = await compiled.aget_state(cfg)
+
+        with pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+                "FROM workflow_run WHERE ticket_id = %s",
+                (ticket.id,),
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert final.values["status"] == TicketStatus.RESOLVED
+    assert row is not None
+    assert row[0] == "resolved"
+    assert row[1] is None  # wakeup_at cleared at the terminal step
+    assert row[2] is None  # lease released
+    assert row[3] is None

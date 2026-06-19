@@ -1,6 +1,7 @@
 """Test doubles and factories shared across test modules."""
 
 import uuid
+from typing import Any
 
 from ticketflow import config, db, taskqueue
 from ticketflow.activities import TicketActivities
@@ -110,6 +111,42 @@ async def process_one_task(
         taskqueue.complete(conn, task.id, result=result.model_dump(mode="json"))
         conn.commit()
     return True
+
+
+async def drive_until_quiescent(
+    compiled: Any,
+    pool: _Pool,
+    activities: TicketActivities,
+    ticket_id: str,
+    *,
+    worker_id: str = "runner-1",
+    max_iterations: int = 50,
+) -> None:
+    """Interleave ``runner.step`` with the worker stub until no work remains.
+
+    Stands in for the real runner + worker processes (plan M7.3): each iteration
+    advances the graph by one ready resume, otherwise drains one queued task and
+    wakes the run so the next ``runner.step`` can pick up the fresh result. Raises
+    if quiescence is not reached within ``max_iterations``.
+    """
+    from ticketflow import runner
+
+    for _ in range(max_iterations):
+        if await runner.step(compiled, pool, worker_id):
+            continue
+        produced = False
+        for queue_name in (
+            config.AGENT_TASK_QUEUE,
+            config.FALLBACK_TASK_QUEUE,
+            config.TASK_QUEUE,
+        ):
+            if await process_one_task(pool, activities, queue_name=queue_name):
+                produced = True
+                break
+        if not produced:
+            return
+        db.wake_run(ticket_id, pool=pool)
+    raise AssertionError(f"run {ticket_id} did not reach quiescence")
 
 
 class ScriptedAgent:

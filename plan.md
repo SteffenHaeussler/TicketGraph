@@ -111,7 +111,7 @@ RETURNING *;
 
 - [ ] **4.1 `workflow_run` table** `(ticket_id PK, status, wakeup_at, lease_owner,
   lease_expires_at, …)` + a claim/lease helper.
-- [ ] **4.2 Runner loop.** `runner.py`: lease a runnable run (result/signal ready OR `wakeup_at`
+- [x] **4.2 Runner loop.** `runner.py`: lease a runnable run (result/signal ready OR `wakeup_at`
   due), resume its graph, persist **checkpoint + state + outbox tasks in one transaction**, release.
 - [ ] **4.3 Timers.** Resume runs whose `wakeup_at <= now()` with a "timeout" input (drives 24h
   approval expiry and 30s fallback).
