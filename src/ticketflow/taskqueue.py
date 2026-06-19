@@ -59,6 +59,22 @@ def is_pending(conn: Any, idempotency_key: str) -> bool:
     return row is not None
 
 
+def cancel_pending(conn: Any, idempotency_key: str, *, reason: str) -> bool:
+    """Permanently stop a pending task from being leased."""
+    row = conn.execute(
+        """
+        UPDATE task_queue
+        SET status = 'failed',
+            error = %s,
+            permanent = true
+        WHERE idempotency_key = %s AND status = 'pending'
+        RETURNING id
+        """,
+        (reason, idempotency_key),
+    ).fetchone()
+    return row is not None
+
+
 def complete(conn: Any, task_id: int, *, result: Mapping[str, Any]) -> str | None:
     """Mark a leased task done and store its result.
 

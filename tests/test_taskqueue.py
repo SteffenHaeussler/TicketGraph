@@ -128,6 +128,30 @@ def test_reclaim_expired_returns_count() -> None:
     assert "lease_owner = NULL" in conn.sql[0]
 
 
+def test_cancel_pending_marks_task_failed_and_permanent() -> None:
+    conn = FakeConnection(rows=[(1,)])
+
+    cancelled = taskqueue.cancel_pending(
+        conn, "ticket-123:classify", reason="redispatched to fallback"
+    )
+
+    assert cancelled is True
+    assert "SET status = 'failed'" in conn.sql[0]
+    assert "permanent = true" in conn.sql[0]
+    assert "WHERE idempotency_key = %s AND status = 'pending'" in conn.sql[0]
+    assert conn.params[0] == ("redispatched to fallback", "ticket-123:classify")
+
+
+def test_cancel_pending_returns_false_when_no_pending_task_matched() -> None:
+    conn = FakeConnection(rows=[None])
+
+    cancelled = taskqueue.cancel_pending(
+        conn, "ticket-123:classify", reason="redispatched to fallback"
+    )
+
+    assert cancelled is False
+
+
 @pytest.mark.integration
 def test_enqueue_is_idempotent_against_real_postgres() -> None:
     db.bootstrap()

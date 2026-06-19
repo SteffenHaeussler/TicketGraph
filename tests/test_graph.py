@@ -6,13 +6,14 @@ approval gate, which resumes from a human decision or a timer envelope.
 """
 
 from datetime import datetime, timezone
+from typing import Any
 
 import pytest
 from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from tests.helpers import process_one_agent_task
+from tests.helpers import process_one_task
 from tests.test_db import FakePool
 from ticketflow import config, graph
 from ticketflow.activities import TicketActivities
@@ -93,7 +94,7 @@ def refund_draft(amount: float = 42.0, confidence: float = 0.9) -> DraftReply:
 
 def recording_activities() -> RecordingActivities:
     # The agent is never called by the graph (the worker owns that in M5); the
-    # inline ``execute`` node still needs ``send_reply``, captured here.
+    # terminal task worker owns side effects; tests assert the graph does not.
     return RecordingActivities(MockAgent(seed=1, failure_rate=0.0))
 
 
@@ -132,6 +133,51 @@ async def resume_through_agents(
     return await compiled.ainvoke(Command(resume=draft.model_dump(mode="json")), cfg)
 
 
+def make_terminal_result(
+    ticket: Ticket,
+    classification: Classification,
+    draft: DraftReply,
+    *,
+    status: TicketStatus = TicketStatus.RESOLVED,
+    refund_executed: bool = False,
+) -> TicketResult:
+    reply_text = {
+        TicketStatus.REJECTED: REJECTION_REPLY,
+        TicketStatus.ESCALATED: ESCALATION_REPLY,
+    }.get(status, draft.reply_text)
+    return TicketResult(
+        ticket_id=ticket.id,
+        status=status,
+        reply_text=reply_text,
+        refund_executed=refund_executed,
+        model_path=f"{classification.model}/{draft.model}",
+    )
+
+
+def terminal_interrupt_payload(out: dict, ticket: Ticket) -> dict:
+    assert "__interrupt__" in out
+    interrupts = out["__interrupt__"]
+    assert len(interrupts) == 1
+    payload = interrupts[0].value
+    assert payload["kind"] == "terminal_task"
+    assert payload["task_type"] == "finalize_ticket"
+    assert payload["workflow_id"] == ticket.id
+    assert payload["queue"] == config.TASK_QUEUE
+    assert payload["idempotency_key"] == f"{ticket.id}:finalize"
+    return payload
+
+
+async def resume_terminal(
+    compiled, ticket: Ticket, result: TicketResult
+) -> dict[str, Any]:
+    final = await compiled.ainvoke(
+        Command(resume=result.model_dump(mode="json")),
+        config_for(ticket.id),
+    )
+    assert "__interrupt__" not in final
+    return final
+
+
 async def drive_to_approval_interrupt(
     compiled, ticket: Ticket, *, draft: DraftReply
 ) -> tuple[dict, graph.TicketState]:
@@ -168,11 +214,23 @@ async def test_happy_path_dispatches_then_resolves() -> None:
     compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
     ticket = make_ticket()
 
-    final = await resume_through_agents(
-        compiled, ticket, classification=make_classification(), draft=reply_draft()
+    classification = make_classification()
+    draft = reply_draft()
+
+    out = await resume_through_agents(
+        compiled, ticket, classification=classification, draft=draft
+    )
+    payload = terminal_interrupt_payload(out, ticket)
+    assert payload["result"]["status"] == TicketStatus.RESOLVED
+    assert f"{ticket.id}:finalize" in idempotency_keys(pool)
+    assert activities.sent_replies == []
+    assert activities.refund_calls == []
+    assert activities.recorded_results == []
+
+    final = await resume_terminal(
+        compiled, ticket, make_terminal_result(ticket, classification, draft)
     )
 
-    assert "__interrupt__" not in final
     assert final["status"] == TicketStatus.RESOLVED
     assert final["classification"].category == TicketCategory.GENERAL
     assert final["draft"].reply_text == "Try restarting the app."
@@ -184,9 +242,30 @@ async def test_happy_path_dispatches_then_resolves() -> None:
     keys = idempotency_keys(pool)
     assert f"{ticket.id}:classify" in keys
     assert f"{ticket.id}:draft" in keys
-    assert activities.sent_replies == [(ticket.id, final["draft"].reply_text)]
+    assert activities.sent_replies == []
     assert activities.refund_calls == []
-    assert activities.recorded_results == [final["result"]]
+    assert activities.recorded_results == []
+
+
+async def test_agent_dispatch_updates_visible_status_before_interrupt() -> None:
+    pool = FakePool(opened=True, row=(1,))
+    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    ticket = make_ticket("t-visible")
+    cfg = config_for(ticket.id)
+
+    out = await compiled.ainvoke(
+        {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+    )
+    assert "__interrupt__" in out
+    snapshot = await compiled.aget_state(cfg)
+    assert snapshot.values["status"] == TicketStatus.CLASSIFYING
+
+    out = await compiled.ainvoke(
+        Command(resume=make_classification().model_dump(mode="json")), cfg
+    )
+    assert "__interrupt__" in out
+    snapshot = await compiled.aget_state(cfg)
+    assert snapshot.values["status"] == TicketStatus.DRAFTING
 
 
 async def test_schedule_to_start_timeout_redispatches_to_fallback() -> None:
@@ -213,6 +292,9 @@ async def test_schedule_to_start_timeout_redispatches_to_fallback() -> None:
         config.FALLBACK_TASK_QUEUE,
         f"{ticket.id}:classify:fallback",
     ) in enqueue_calls(pool)
+    assert ("redispatched to fallback", f"{ticket.id}:classify") in (
+        pool.connection_obj.params
+    )
 
     # Resuming with the agent result advances to the draft dispatch as usual.
     out = await compiled.ainvoke(
@@ -250,6 +332,26 @@ async def test_schedule_to_start_timeout_skips_fallback_when_not_pending() -> No
     assert out["__interrupt__"][0].value["task_type"] == "draft"
 
 
+async def test_timeout_skips_fallback_when_cancel_loses_race() -> None:
+    # The first row lets the initial dispatch enqueue appear successful; the
+    # second row makes the atomic cancel report that no pending row was claimed.
+    pool = FakePool(opened=True, row=(1,))
+    pool.connection_obj.rows = [(1,), None]
+    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    ticket = make_ticket("t-cancel-race")
+    cfg = config_for(ticket.id)
+
+    out = await compiled.ainvoke(
+        {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+    )
+    assert "__interrupt__" in out
+
+    out = await compiled.ainvoke(Command(resume={"kind": "timeout"}), cfg)
+    assert "__interrupt__" in out
+    assert out["__interrupt__"][0].value["queue"] == config.AGENT_TASK_QUEUE
+    assert all(queue != config.FALLBACK_TASK_QUEUE for queue, _ in enqueue_calls(pool))
+
+
 async def test_decide_approval_flags_refund_drafts() -> None:
     pool = FakePool(opened=True, row=(1,))
     compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
@@ -284,22 +386,30 @@ async def test_approved_resume_continues_to_resolution() -> None:
     _, state = await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
     decision = ApprovalDecision(approved=True, approver="sam@example.com")
 
-    final = await compiled.ainvoke(
+    out = await compiled.ainvoke(
         Command(
             resume={"kind": "decision", "decision": decision.model_dump(mode="json")}
         ),
         config_for(ticket.id),
     )
 
+    terminal_interrupt_payload(out, ticket)
+    draft = state.get("draft")
+    classification = state.get("classification")
+    assert draft is not None and classification is not None
+    final = await resume_terminal(
+        compiled,
+        ticket,
+        make_terminal_result(ticket, classification, draft, refund_executed=True),
+    )
+
     assert final["status"] == TicketStatus.RESOLVED
     assert final["decision"] == decision
     assert final["result"].status == TicketStatus.RESOLVED
     assert final["result"].refund_executed is True
-    draft = state.get("draft")
-    assert draft is not None
-    assert activities.refund_calls == [(ticket.id, 42.0, 1)]
-    assert activities.sent_replies == [(ticket.id, draft.reply_text)]
-    assert activities.recorded_results == [final["result"]]
+    assert activities.refund_calls == []
+    assert activities.sent_replies == []
+    assert activities.recorded_results == []
 
 
 async def test_approved_duplicate_refund_records_no_new_refund() -> None:
@@ -311,17 +421,29 @@ async def test_approved_duplicate_refund_records_no_new_refund() -> None:
     await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
     decision = ApprovalDecision(approved=True, approver="sam@example.com")
 
-    final = await compiled.ainvoke(
+    out = await compiled.ainvoke(
         Command(
             resume={"kind": "decision", "decision": decision.model_dump(mode="json")}
         ),
         config_for(ticket.id),
     )
 
+    terminal_interrupt_payload(out, ticket)
+    snapshot = await compiled.aget_state(config_for(ticket.id))
+    draft = snapshot.values.get("draft")
+    classification = snapshot.values.get("classification")
+    assert isinstance(draft, DraftReply)
+    assert isinstance(classification, Classification)
+    final = await resume_terminal(
+        compiled,
+        ticket,
+        make_terminal_result(ticket, classification, draft, refund_executed=False),
+    )
+
     assert final["status"] == TicketStatus.RESOLVED
     assert final["result"].refund_executed is False
-    assert activities.refund_calls == [(ticket.id, 42.0, 1)]
-    assert activities.recorded_results == [final["result"]]
+    assert activities.refund_calls == []
+    assert activities.recorded_results == []
 
 
 async def test_rejected_resume_sends_and_records_rejection_reply() -> None:
@@ -334,11 +456,25 @@ async def test_rejected_resume_sends_and_records_rejection_reply() -> None:
         approved=False, approver="sam@example.com", note="Manual review rejected it."
     )
 
-    final = await compiled.ainvoke(
+    out = await compiled.ainvoke(
         Command(
             resume={"kind": "decision", "decision": decision.model_dump(mode="json")}
         ),
         config_for(ticket.id),
+    )
+
+    terminal_interrupt_payload(out, ticket)
+    snapshot = await compiled.aget_state(config_for(ticket.id))
+    draft = snapshot.values.get("draft")
+    classification = snapshot.values.get("classification")
+    assert isinstance(draft, DraftReply)
+    assert isinstance(classification, Classification)
+    final = await resume_terminal(
+        compiled,
+        ticket,
+        make_terminal_result(
+            ticket, classification, draft, status=TicketStatus.REJECTED
+        ),
     )
 
     assert final["status"] == TicketStatus.REJECTED
@@ -347,9 +483,9 @@ async def test_rejected_resume_sends_and_records_rejection_reply() -> None:
     assert final["result"].reply_text == REJECTION_REPLY
     assert final["result"].refund_executed is False
     assert final["wakeup_at"] is None
-    assert activities.sent_replies == [(ticket.id, REJECTION_REPLY)]
+    assert activities.sent_replies == []
     assert activities.refund_calls == []
-    assert activities.recorded_results == [final["result"]]
+    assert activities.recorded_results == []
 
 
 async def test_timeout_resume_sends_and_records_escalation_reply() -> None:
@@ -359,9 +495,23 @@ async def test_timeout_resume_sends_and_records_escalation_reply() -> None:
     ticket = make_ticket("t-timeout")
     await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
 
-    final = await compiled.ainvoke(
+    out = await compiled.ainvoke(
         Command(resume={"kind": "timeout"}),
         config_for(ticket.id),
+    )
+
+    terminal_interrupt_payload(out, ticket)
+    snapshot = await compiled.aget_state(config_for(ticket.id))
+    draft = snapshot.values.get("draft")
+    classification = snapshot.values.get("classification")
+    assert isinstance(draft, DraftReply)
+    assert isinstance(classification, Classification)
+    final = await resume_terminal(
+        compiled,
+        ticket,
+        make_terminal_result(
+            ticket, classification, draft, status=TicketStatus.ESCALATED
+        ),
     )
 
     assert final["status"] == TicketStatus.ESCALATED
@@ -370,9 +520,9 @@ async def test_timeout_resume_sends_and_records_escalation_reply() -> None:
     assert final["result"].reply_text == ESCALATION_REPLY
     assert final["result"].refund_executed is False
     assert final["wakeup_at"] is None
-    assert activities.sent_replies == [(ticket.id, ESCALATION_REPLY)]
+    assert activities.sent_replies == []
     assert activities.refund_calls == []
-    assert activities.recorded_results == [final["result"]]
+    assert activities.recorded_results == []
 
 
 @pytest.mark.integration
@@ -411,8 +561,10 @@ async def test_dispatch_loop_resolves_through_real_postgres() -> None:
             # Drive the dispatch -> worker -> resume loop to completion.
             while "__interrupt__" in out:
                 interrupt = out["__interrupt__"][0].value
-                key = f"{interrupt['workflow_id']}:{interrupt['task_type']}"
-                assert await process_one_agent_task(pool, activities)
+                key = interrupt["idempotency_key"]
+                assert await process_one_task(
+                    pool, activities, queue_name=interrupt["queue"]
+                )
                 result = _task_result(pool, key)
                 out = await compiled.ainvoke(Command(resume=result), cfg)
 
@@ -469,10 +621,10 @@ async def test_schedule_to_start_timeout_routes_to_fallback_through_postgres() -
             out = await compiled.ainvoke(Command(resume={"kind": "timeout"}), cfg)
             assert "__interrupt__" in out
             assert out["__interrupt__"][0].value["queue"] == config.FALLBACK_TASK_QUEUE
-            assert f"{ticket.id}:classify:fallback" in _pending_keys(pool, ticket.id)
+            assert _pending_keys(pool, ticket.id) == [f"{ticket.id}:classify:fallback"]
 
             # The unthrottled fallback worker drains it; resume with its result.
-            assert await process_one_agent_task(
+            assert await process_one_task(
                 pool, activities, queue_name=config.FALLBACK_TASK_QUEUE
             )
             out = await compiled.ainvoke(
@@ -485,9 +637,11 @@ async def test_schedule_to_start_timeout_routes_to_fallback_through_postgres() -
             # pending, so drain until the awaited task has produced its result.
             while "__interrupt__" in out:
                 interrupt = out["__interrupt__"][0].value
-                key = f"{interrupt['workflow_id']}:{interrupt['task_type']}"
+                key = interrupt["idempotency_key"]
                 while _result_for(pool, key) is None:
-                    assert await process_one_agent_task(pool, activities)
+                    assert await process_one_task(
+                        pool, activities, queue_name=interrupt["queue"]
+                    )
                 out = await compiled.ainvoke(
                     Command(resume=_result_for(pool, key)), cfg
                 )

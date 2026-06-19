@@ -13,6 +13,8 @@ from ticketflow.models import (
     ProposedAction,
     Ticket,
     TicketCategory,
+    TicketResult,
+    TicketStatus,
 )
 
 
@@ -61,7 +63,7 @@ async def process_one_agent_task(
     worker_id: str = "w",
     queue_name: str = config.AGENT_TASK_QUEUE,
 ) -> bool:
-    """Lease one task from ``queue_name``, run it, and store the result.
+    """Lease one agent task from ``queue_name``, run it, and store the result.
 
     A stand-in for the real agent worker (Milestone 5) so M3.2 tests can drive a
     dispatch -> queue -> resume loop end to end. Pass
@@ -69,6 +71,16 @@ async def process_one_agent_task(
     fallback queue (M3.4). Returns ``True`` if a task was processed, ``False`` if
     the queue was empty.
     """
+    return await process_one_task(pool, activities, worker_id, queue_name)
+
+
+async def process_one_task(
+    pool: _Pool,
+    activities: TicketActivities,
+    worker_id: str = "w",
+    queue_name: str = config.AGENT_TASK_QUEUE,
+) -> bool:
+    """Process one queued task from ``queue_name`` in graph integration tests."""
     task = db.dequeue(queue_name, worker_id, pool=pool)
     if task is None:
         return False
@@ -79,6 +91,18 @@ async def process_one_agent_task(
     elif task.task_type == "draft":
         classification = Classification.model_validate(task.payload["classification"])
         result = await activities.draft_reply(ticket, classification)
+    elif task.task_type == "finalize_ticket":
+        action = ProposedAction.model_validate(task.payload["action"])
+        result = TicketResult.model_validate(task.payload["result"])
+        refund_executed = False
+        if result.status == TicketStatus.RESOLVED and action.type == ActionType.REFUND:
+            assert action.refund_amount is not None
+            refund_executed = await activities.execute_refund(
+                ticket.id, action.refund_amount, attempt=1
+            )
+        await activities.send_reply(ticket, result.reply_text)
+        result = result.model_copy(update={"refund_executed": refund_executed})
+        await activities.record_result(result)
     else:  # pragma: no cover - defensive
         raise ValueError(f"unexpected task_type {task.task_type!r}")
 
