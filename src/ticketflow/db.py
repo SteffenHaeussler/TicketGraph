@@ -13,6 +13,7 @@ from ticketflow import config
 BOOTSTRAP_MIGRATION = "000_bootstrap"
 TASK_QUEUE_MIGRATION = "001_task_queue"
 READ_MODEL_MIGRATION = "002_read_model"
+WORKFLOW_RUN_MIGRATION = "003_workflow_run"
 
 
 @dataclass(frozen=True)
@@ -35,6 +36,19 @@ class QueuedTask:
     result: dict[str, Any] | None
     error: str | None
     permanent: bool
+
+
+@dataclass(frozen=True)
+class WorkflowRun:
+    """Workflow run row leased by the runner pool."""
+
+    ticket_id: str
+    status: str
+    wakeup_at: datetime | None
+    lease_owner: str | None
+    lease_expires_at: datetime | None
+    created_at: datetime
+    updated_at: datetime
 
 
 class _Cursor(Protocol):
@@ -130,6 +144,70 @@ def dequeue(
             active_pool.close()
 
     return _task_from_row(row) if row is not None else None
+
+
+def _run_from_row(row: tuple[Any, ...]) -> WorkflowRun:
+    return WorkflowRun(
+        ticket_id=row[0],
+        status=row[1],
+        wakeup_at=row[2],
+        lease_owner=row[3],
+        lease_expires_at=row[4],
+        created_at=row[5],
+        updated_at=row[6],
+    )
+
+
+def claim_run(
+    worker_id: str,
+    *,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> WorkflowRun | None:
+    """Lease one runnable workflow run for ``worker_id``.
+
+    A run is claimable when it is not in a terminal status, its lease is free
+    or expired, and it is due to run (``wakeup_at`` is null or in the past). The
+    oldest matching run is leased with ``FOR UPDATE SKIP LOCKED`` so several
+    runner processes can claim disjoint runs concurrently.
+
+    The finer "an agent result or approval signal is ready" predicate is layered
+    on by the runner in later milestones; for now a future ``wakeup_at`` (an
+    armed approval/fallback timer) keeps a run unclaimed until the timer is due.
+    """
+    owned_pool = pool is None
+    active_pool = pool or make_pool(database_url)
+    try:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            row = conn.execute(
+                """
+                UPDATE workflow_run
+                SET lease_owner = %s,
+                    lease_expires_at = now() + interval '30 seconds',
+                    updated_at = now()
+                WHERE ticket_id = (
+                    SELECT ticket_id
+                    FROM workflow_run
+                    WHERE status NOT IN ('resolved', 'rejected', 'escalated')
+                      AND (lease_expires_at IS NULL OR lease_expires_at < now())
+                      AND (wakeup_at IS NULL OR wakeup_at <= now())
+                    ORDER BY created_at
+                    FOR UPDATE SKIP LOCKED
+                    LIMIT 1
+                )
+                RETURNING ticket_id, status, wakeup_at, lease_owner,
+                          lease_expires_at, created_at, updated_at
+                """,
+                (worker_id,),
+            ).fetchone()
+            conn.commit()
+    finally:
+        if owned_pool:
+            active_pool.close()
+
+    return _run_from_row(row) if row is not None else None
 
 
 def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> None:
@@ -236,6 +314,35 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 ON CONFLICT (version) DO NOTHING
                 """,
                 (READ_MODEL_MIGRATION,),
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS workflow_run (
+                    ticket_id        text        PRIMARY KEY,
+                    status           text        NOT NULL DEFAULT 'received',
+                    wakeup_at        timestamptz,
+                    lease_owner      text,
+                    lease_expires_at timestamptz,
+                    created_at       timestamptz NOT NULL DEFAULT now(),
+                    updated_at       timestamptz NOT NULL DEFAULT now(),
+                    CHECK (status IN ('received', 'classifying', 'drafting',
+                        'awaiting_approval', 'resolved', 'rejected', 'escalated'))
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_workflow_run_status
+                ON workflow_run (status)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations (version)
+                VALUES (%s)
+                ON CONFLICT (version) DO NOTHING
+                """,
+                (WORKFLOW_RUN_MIGRATION,),
             )
             conn.commit()
     finally:

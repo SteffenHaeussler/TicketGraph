@@ -23,6 +23,16 @@ LEASED_ROW = (
     False,
 )
 
+CLAIMED_RUN_ROW = (
+    "ticket-1",
+    "classifying",
+    None,
+    "runner-1",
+    datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC),
+    datetime(2026, 6, 16, 11, 0, tzinfo=UTC),
+    datetime(2026, 6, 16, 12, 0, tzinfo=UTC),
+)
+
 
 class FakeCursor:
     def __init__(self, row: tuple[object, ...] | None) -> None:
@@ -109,11 +119,12 @@ def test_bootstrap_creates_idempotent_migration_marker():
     db.bootstrap(pool=pool)
     db.bootstrap(pool=pool)
 
-    # Each call issues 9 statements: schema_migrations create + 000 marker,
+    # Each call issues 12 statements: schema_migrations create + 000 marker,
     # task_queue create, dispatch index, 001 marker, refunds create,
-    # refund_attempts create, ticket_results create, 002 marker.
+    # refund_attempts create, ticket_results create, 002 marker,
+    # workflow_run create, status index, 003 marker.
     assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 18
+    assert len(pool.connection_obj.sql) == 24
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
     assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
@@ -129,13 +140,21 @@ def test_bootstrap_creates_idempotent_migration_marker():
     assert "CREATE TABLE IF NOT EXISTS ticket_results" in pool.connection_obj.sql[7]
     assert "ticket_id text PRIMARY KEY" in pool.connection_obj.sql[7]
     assert "data      jsonb NOT NULL" in pool.connection_obj.sql[7]
+    assert "CREATE TABLE IF NOT EXISTS workflow_run" in pool.connection_obj.sql[9]
+    assert "ticket_id        text        PRIMARY KEY" in pool.connection_obj.sql[9]
+    assert (
+        "CREATE INDEX IF NOT EXISTS ix_workflow_run_status"
+        in pool.connection_obj.sql[10]
+    )
     assert pool.connection_obj.params == [
         ("000_bootstrap",),
         ("001_task_queue",),
         ("002_read_model",),
+        ("003_workflow_run",),
         ("000_bootstrap",),
         ("001_task_queue",),
         ("002_read_model",),
+        ("003_workflow_run",),
     ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
@@ -164,6 +183,20 @@ def test_bootstrap_creates_ticket_results_table():
     assert "ticket_id text PRIMARY KEY" in sql
     assert "data      jsonb NOT NULL" in sql
     assert ("002_read_model",) in pool.connection_obj.params
+
+
+def test_bootstrap_creates_workflow_run_table():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE TABLE IF NOT EXISTS workflow_run" in sql
+    assert "ticket_id        text        PRIMARY KEY" in sql
+    assert "CHECK (status IN ('received', 'classifying', 'drafting'," in sql
+    assert "'awaiting_approval', 'resolved', 'rejected', 'escalated'))" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_workflow_run_status" in sql
+    assert ("003_workflow_run",) in pool.connection_obj.params
 
 
 def test_bootstrap_leaves_injected_pool_unopened_to_caller():
@@ -237,6 +270,59 @@ def test_dequeue_opens_and_closes_owned_pool(monkeypatch):
     monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
 
     db.dequeue("q", "worker-1", database_url="postgresql://example/tickets")
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
+def test_claim_run_leases_due_unleased_run_with_skip_locked():
+    pool = FakePool(opened=True, row=CLAIMED_RUN_ROW)
+
+    run = db.claim_run("runner-1", pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "FOR UPDATE SKIP LOCKED" in sql
+    assert "lease_expires_at = now() + interval '30 seconds'" in sql
+    assert "status NOT IN ('resolved', 'rejected', 'escalated')" in sql
+    assert "lease_expires_at IS NULL OR lease_expires_at < now()" in sql
+    assert "wakeup_at IS NULL OR wakeup_at <= now()" in sql
+    assert "ORDER BY created_at" in sql
+    assert "RETURNING ticket_id, status, wakeup_at" in sql
+    assert pool.connection_obj.params[-1] == ("runner-1",)
+    assert pool.connection_obj.commits == 1
+    assert run is not None
+    assert run.ticket_id == "ticket-1"
+    assert run.status == "classifying"
+    assert run.wakeup_at is None
+    assert run.lease_owner == "runner-1"
+    assert run.lease_expires_at == datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+    assert run.created_at == datetime(2026, 6, 16, 11, 0, tzinfo=UTC)
+    assert run.updated_at == datetime(2026, 6, 16, 12, 0, tzinfo=UTC)
+
+
+def test_claim_run_returns_none_when_no_run_is_claimable():
+    pool = FakePool(opened=True)
+
+    run = db.claim_run("runner-1", pool=pool)
+
+    assert run is None
+    assert pool.connection_obj.commits == 1
+
+
+def test_claim_run_leaves_injected_pool_unopened_to_caller():
+    pool = FakePool(opened=True, row=CLAIMED_RUN_ROW)
+
+    db.claim_run("runner-1", pool=pool)
+
+    assert pool.opened is True
+    assert pool.closed is False
+
+
+def test_claim_run_opens_and_closes_owned_pool(monkeypatch):
+    pool = FakePool(row=CLAIMED_RUN_ROW)
+    monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
+
+    db.claim_run("runner-1", database_url="postgresql://example/tickets")
 
     assert pool.opened is True
     assert pool.closed is True
@@ -386,3 +472,129 @@ def test_dequeue_leases_one_due_pending_task_against_real_postgres():
         assert second_task is None
     finally:
         pool.close()
+
+
+@pytest.mark.integration
+def test_bootstrap_creates_workflow_run_against_real_postgres():
+    db.bootstrap()
+    db.bootstrap()
+
+    expected_columns = {
+        "ticket_id",
+        "status",
+        "wakeup_at",
+        "lease_owner",
+        "lease_expires_at",
+        "created_at",
+        "updated_at",
+    }
+
+    pool = db.make_pool()
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            marker = conn.execute(
+                "SELECT count(*) FROM schema_migrations WHERE version = %s",
+                (db.WORKFLOW_RUN_MIGRATION,),
+            ).fetchone()
+            columns = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_name = 'workflow_run'"
+                ).fetchall()
+            }
+            index = conn.execute(
+                "SELECT count(*) FROM pg_indexes "
+                "WHERE indexname = 'ix_workflow_run_status'"
+            ).fetchone()
+
+            # The ticket_id primary key rejects a duplicate run.
+            conn.execute("DELETE FROM workflow_run")
+            conn.execute("INSERT INTO workflow_run (ticket_id) VALUES ('dup')")
+            duplicate_rejected = False
+            try:
+                conn.execute("INSERT INTO workflow_run (ticket_id) VALUES ('dup')")
+            except Exception:
+                duplicate_rejected = True
+            conn.rollback()
+    finally:
+        pool.close()
+
+    assert marker is not None
+    assert marker[0] == 1
+    assert expected_columns <= columns
+    assert index is not None and index[0] == 1
+    assert duplicate_rejected is True
+
+
+def _open_clean_run_pool() -> db.ConnectionPool:
+    """Bootstrap, open a pool, and truncate ``workflow_run`` for isolation."""
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    with pool.connection() as conn:
+        conn.execute("DELETE FROM workflow_run")
+        conn.commit()
+    return pool
+
+
+@pytest.mark.integration
+def test_claim_run_leases_runnable_runs_oldest_first_against_real_postgres():
+    pool = _open_clean_run_pool()
+    try:
+        with pool.connection() as conn:
+            # Two runnable runs (older first), one with a future timer, and one
+            # already held under a live lease -- only the runnable two qualify.
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, created_at) "
+                "VALUES ('older', now() - interval '10 seconds')"
+            )
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, created_at) "
+                "VALUES ('newer', now())"
+            )
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, wakeup_at) "
+                "VALUES ('future-timer', now() + interval '1 hour')"
+            )
+            conn.execute(
+                "INSERT INTO workflow_run "
+                "(ticket_id, lease_owner, lease_expires_at) "
+                "VALUES ('held', 'runner-9', now() + interval '30 seconds')"
+            )
+            conn.commit()
+
+        first = db.claim_run("runner-1", pool=pool)
+        second = db.claim_run("runner-2", pool=pool)
+        third = db.claim_run("runner-3", pool=pool)
+    finally:
+        pool.close()
+
+    assert first is not None and first.ticket_id == "older"
+    assert first.lease_owner == "runner-1"
+    assert first.lease_expires_at is not None
+    assert second is not None and second.ticket_id == "newer"
+    assert second.lease_owner == "runner-2"
+    # The future-timer and live-leased runs are not claimable.
+    assert third is None
+
+
+@pytest.mark.integration
+def test_claim_run_reclaims_expired_lease_against_real_postgres():
+    pool = _open_clean_run_pool()
+    try:
+        with pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run "
+                "(ticket_id, lease_owner, lease_expires_at) "
+                "VALUES ('stale', 'runner-dead', now() - interval '1 second')"
+            )
+            conn.commit()
+
+        claimed = db.claim_run("runner-1", pool=pool)
+    finally:
+        pool.close()
+
+    assert claimed is not None and claimed.ticket_id == "stale"
+    assert claimed.lease_owner == "runner-1"
