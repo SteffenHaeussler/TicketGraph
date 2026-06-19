@@ -38,11 +38,14 @@ class FakeConnection:
         self.params: list[tuple[str, ...]] = []
         self.commits = 0
         self.row = row
+        self.rows: list[tuple[object, ...] | None] = []
 
     def execute(self, sql: str, params: tuple[str, ...] | None = None) -> FakeCursor:
         self.sql.append(sql)
         if params is not None:
             self.params.append(params)
+        if self.rows:
+            return FakeCursor(self.rows.pop(0))
         return FakeCursor(self.row)
 
     def commit(self) -> None:

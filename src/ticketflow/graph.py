@@ -4,19 +4,24 @@ The ``StateGraph`` plus the Postgres checkpointer drive a ticket from
 ``received`` to ``resolved`` and the run survives a fresh process via the
 checkpointer.
 
-The ``classify`` and ``draft`` nodes do not call the agent inline. Each
+The ``classify`` and ``draft`` stages do not call the agent inline. Each
 **enqueues a durable task** onto the Postgres task queue and then suspends with
 ``interrupt()`` (Milestone 3.2). A separate worker (M5) produces the result and
-a runner (M4) resumes the graph with ``Command(resume=<result>)``; on resume the
-node re-runs from the top, so the enqueue is idempotent via its idempotency key.
+a runner (M4) resumes the graph with ``Command(resume=<result>)``. Dispatch and
+await are split so queued statuses checkpoint before the graph parks.
 
 Each dispatch also arms a schedule-to-start timer (``wakeup_at = now()+30s``,
 Milestone 3.4): if the runner resumes with a ``{"kind": "timeout"}`` envelope
 while the task is still ``pending``, the work is re-dispatched to the unthrottled
-``ticketflow-agent-fallback`` queue.
+``ticketflow-agent-fallback`` queue and the original pending task is made
+non-runnable.
 
 Approval-needed drafts pause at the approval gate (Milestone 3.3): they
 ``interrupt()`` and resume from a human decision or a timer envelope.
+
+Terminal side effects also go through the task queue. The graph records the
+desired terminal result, dispatches a ``finalize_ticket`` task, and resumes with
+the result that the worker persisted after sending replies/refunds.
 """
 
 from __future__ import annotations
@@ -83,33 +88,22 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
     """Build the uncompiled ticket workflow graph.
 
     ``pool`` is the Postgres connection pool the dispatching nodes use to
-    enqueue agent tasks. ``activities`` carries the side-effect operations used
-    by the inline terminal nodes (and, later, the agent worker).
+    enqueue agent and terminal tasks. ``activities`` is accepted for API
+    compatibility with callers; side effects are performed by queued workers.
 
-    ``classify`` and ``draft`` dispatch a task and ``interrupt()``; the rest run
-    inline. After drafting, the graph either executes directly or pauses at the
-    approval gate::
+    ``dispatch_*`` nodes enqueue and checkpoint status; ``await_*`` nodes
+    ``interrupt()``. After drafting, the graph either dispatches terminal work
+    directly or pauses at the approval gate::
 
-        classify -> draft -> decide_approval -> execute -> record
-                                          |-> prepare_approval -> await_approval
+        dispatch_classify -> await_classify -> dispatch_draft -> await_draft
+          -> decide_approval -> execute -> record
+                              |-> prepare_approval -> await_approval
     """
+    del activities
 
-    async def dispatch_agent_task(
+    def enqueue_agent_task(
         *, task_type: str, workflow_id: str, payload: dict[str, Any]
-    ) -> Any:
-        """Enqueue an agent task, suspend, and fall back if it stalls (M3.4).
-
-        Primary dispatch enqueues onto ``AGENT_TASK_QUEUE`` and ``interrupt()``s
-        with a ``wakeup_at = now()+AGENT_SCHEDULE_TO_START_S`` so the runner can
-        arm a schedule-to-start timer. If the runner resumes with a
-        ``{"kind": "timeout"}`` envelope and the task is still ``pending``, the
-        same work is re-dispatched to the unthrottled fallback queue and the
-        node suspends again; otherwise (a worker already leased it) it just waits
-        for the result. Returns the raw agent result the runner resumes with.
-
-        The node re-runs from the top on each resume, so both enqueues are
-        idempotent via their keys and replay safely.
-        """
+    ) -> datetime:
         key = f"{workflow_id}:{task_type}"
         with pool.connection() as conn:
             taskqueue.enqueue(
@@ -121,20 +115,34 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
                 idempotency_key=key,
             )
             conn.commit()
-        wakeup_at = datetime.now(timezone.utc) + timedelta(
+        return datetime.now(timezone.utc) + timedelta(
             seconds=config.AGENT_SCHEDULE_TO_START_S
         )
+
+    async def await_agent_task(
+        *,
+        task_type: str,
+        workflow_id: str,
+        payload: dict[str, Any],
+        wakeup_at: datetime | None,
+    ) -> Any:
+        """Suspend for an agent result, redispatching to fallback on timeout."""
+        key = f"{workflow_id}:{task_type}"
+        active_queue = config.AGENT_TASK_QUEUE
         resume = interrupt(
             {
+                "idempotency_key": key,
                 "task_type": task_type,
                 "workflow_id": workflow_id,
-                "queue": config.AGENT_TASK_QUEUE,
-                "wakeup_at": wakeup_at.isoformat(),
+                "queue": active_queue,
+                "wakeup_at": wakeup_at.isoformat() if wakeup_at else None,
             }
         )
         if _is_timeout(resume):
             with pool.connection() as conn:
-                redispatched = taskqueue.is_pending(conn, key)
+                redispatched = taskqueue.cancel_pending(
+                    conn, key, reason="redispatched to fallback"
+                )
                 if redispatched:
                     taskqueue.enqueue(
                         conn,
@@ -145,39 +153,51 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
                         idempotency_key=f"{key}:fallback",
                     )
                 conn.commit()
-            # Wait on whichever queue now owns the work: the fallback if we just
-            # routed it there, otherwise the primary worker that already leased it.
-            queue = (
+            active_queue = (
                 config.FALLBACK_TASK_QUEUE if redispatched else config.AGENT_TASK_QUEUE
             )
+            active_key = f"{key}:fallback" if redispatched else key
             resume = interrupt(
                 {
+                    "idempotency_key": active_key,
                     "task_type": task_type,
                     "workflow_id": workflow_id,
-                    "queue": queue,
+                    "queue": active_queue,
                 }
             )
         return resume
 
-    async def classify(state: TicketState) -> TicketState:
+    async def dispatch_classify(state: TicketState) -> TicketState:
         ticket = state.get("ticket")
         assert ticket is not None
-        result = await dispatch_agent_task(
+        wakeup_at = enqueue_agent_task(
             task_type="classify",
             workflow_id=ticket.id,
             payload={"ticket": ticket.model_dump(mode="json")},
+        )
+        return {"status": TicketStatus.CLASSIFYING, "wakeup_at": wakeup_at}
+
+    async def await_classify(state: TicketState) -> TicketState:
+        ticket = state.get("ticket")
+        assert ticket is not None
+        result = await await_agent_task(
+            task_type="classify",
+            workflow_id=ticket.id,
+            payload={"ticket": ticket.model_dump(mode="json")},
+            wakeup_at=state.get("wakeup_at"),
         )
         classification = Classification.model_validate(result)
         return {
             "classification": classification,
             "status": TicketStatus.CLASSIFYING,
+            "wakeup_at": None,
         }
 
-    async def draft(state: TicketState) -> TicketState:
+    async def dispatch_draft(state: TicketState) -> TicketState:
         ticket = state.get("ticket")
         classification = state.get("classification")
         assert ticket is not None and classification is not None
-        result = await dispatch_agent_task(
+        wakeup_at = enqueue_agent_task(
             task_type="draft",
             workflow_id=ticket.id,
             payload={
@@ -185,8 +205,23 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
                 "classification": classification.model_dump(mode="json"),
             },
         )
+        return {"status": TicketStatus.DRAFTING, "wakeup_at": wakeup_at}
+
+    async def await_draft(state: TicketState) -> TicketState:
+        ticket = state.get("ticket")
+        classification = state.get("classification")
+        assert ticket is not None and classification is not None
+        result = await await_agent_task(
+            task_type="draft",
+            workflow_id=ticket.id,
+            payload={
+                "ticket": ticket.model_dump(mode="json"),
+                "classification": classification.model_dump(mode="json"),
+            },
+            wakeup_at=state.get("wakeup_at"),
+        )
         reply = DraftReply.model_validate(result)
-        return {"draft": reply, "status": TicketStatus.DRAFTING}
+        return {"draft": reply, "status": TicketStatus.DRAFTING, "wakeup_at": None}
 
     async def decide_approval(state: TicketState) -> TicketState:
         reply = state.get("draft")
@@ -235,49 +270,62 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
     async def execute(state: TicketState) -> TicketState:
         ticket = state.get("ticket")
         reply = state.get("draft")
-        assert ticket is not None and reply is not None
-        status = state.get("status")
-
-        if status == TicketStatus.REJECTED:
-            await activities.send_reply(ticket, REJECTION_REPLY)
-            return {"refund_executed": False}
-        if status == TicketStatus.ESCALATED:
-            await activities.send_reply(ticket, ESCALATION_REPLY)
-            return {"refund_executed": False}
-
-        refund_executed = False
-        if reply.action.type == ActionType.REFUND:
-            assert reply.action.refund_amount is not None
-            refund_executed = await activities.execute_refund(
-                ticket.id, reply.action.refund_amount, attempt=1
-            )
-        await activities.send_reply(ticket, reply.reply_text)
-        return {"refund_executed": refund_executed}
-
-    async def record(state: TicketState) -> TicketState:
-        ticket = state.get("ticket")
-        reply = state.get("draft")
         classification = state.get("classification")
         assert ticket is not None and reply is not None and classification is not None
         status = state.get("status")
+
         terminal_status = TicketStatus.RESOLVED
+        reply_text = reply.reply_text
         if status == TicketStatus.REJECTED:
             terminal_status = TicketStatus.REJECTED
+            reply_text = REJECTION_REPLY
         elif status == TicketStatus.ESCALATED:
             terminal_status = TicketStatus.ESCALATED
-        reply_text = {
-            TicketStatus.REJECTED: REJECTION_REPLY,
-            TicketStatus.ESCALATED: ESCALATION_REPLY,
-        }.get(terminal_status, reply.reply_text)
-        result = TicketResult(
+            reply_text = ESCALATION_REPLY
+
+        expected_result = TicketResult(
             ticket_id=ticket.id,
             status=terminal_status,
             reply_text=reply_text,
-            refund_executed=state.get("refund_executed", False),
+            refund_executed=False,
             model_path=f"{classification.model}/{reply.model}",
         )
-        await activities.record_result(result)
-        return {"result": result, "status": terminal_status, "wakeup_at": None}
+        key = f"{ticket.id}:finalize"
+        payload = {
+            "ticket": ticket.model_dump(mode="json"),
+            "action": reply.action.model_dump(mode="json"),
+            "result": expected_result.model_dump(mode="json"),
+        }
+        with pool.connection() as conn:
+            taskqueue.enqueue(
+                conn,
+                queue_name=config.TASK_QUEUE,
+                task_type="finalize_ticket",
+                workflow_id=ticket.id,
+                payload=payload,
+                idempotency_key=key,
+            )
+            conn.commit()
+
+        resume = interrupt(
+            {
+                "kind": "terminal_task",
+                "idempotency_key": key,
+                "task_type": "finalize_ticket",
+                "workflow_id": ticket.id,
+                "queue": config.TASK_QUEUE,
+                "result": expected_result.model_dump(mode="json"),
+            }
+        )
+        result = TicketResult.model_validate(resume)
+        if result.ticket_id != ticket.id:
+            raise ValueError("terminal result ticket_id does not match workflow")
+        return {
+            "result": result,
+            "status": result.status,
+            "refund_executed": result.refund_executed,
+            "wakeup_at": None,
+        }
 
     def route_after_decide(
         state: TicketState,
@@ -285,17 +333,20 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
         return "prepare_approval" if state.get("needs_approval") else "execute"
 
     builder: StateGraph = StateGraph(TicketState)
-    builder.add_node("classify", classify)
-    builder.add_node("draft", draft)
+    builder.add_node("dispatch_classify", dispatch_classify)
+    builder.add_node("await_classify", await_classify)
+    builder.add_node("dispatch_draft", dispatch_draft)
+    builder.add_node("await_draft", await_draft)
     builder.add_node("decide_approval", decide_approval)
     builder.add_node("prepare_approval", prepare_approval)
     builder.add_node("await_approval", await_approval)
     builder.add_node("execute", execute)
-    builder.add_node("record", record)
 
-    builder.add_edge(START, "classify")
-    builder.add_edge("classify", "draft")
-    builder.add_edge("draft", "decide_approval")
+    builder.add_edge(START, "dispatch_classify")
+    builder.add_edge("dispatch_classify", "await_classify")
+    builder.add_edge("await_classify", "dispatch_draft")
+    builder.add_edge("dispatch_draft", "await_draft")
+    builder.add_edge("await_draft", "decide_approval")
     builder.add_conditional_edges(
         "decide_approval",
         route_after_decide,
@@ -303,8 +354,7 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
     )
     builder.add_edge("prepare_approval", "await_approval")
     builder.add_edge("await_approval", "execute")
-    builder.add_edge("execute", "record")
-    builder.add_edge("record", END)
+    builder.add_edge("execute", END)
 
     return builder
 
