@@ -1,17 +1,15 @@
-"""Worker entrypoint placeholder for the Postgres/LangGraph migration."""
+"""Worker entrypoint for the durable LangGraph/Postgres runner (Milestone 4.2).
+
+The runner loop lives in :mod:`ticketflow.runner`; this module stays the process
+entrypoint that the ``worker`` make target invokes. The target is renamed to
+``runner`` in Milestone 7.6.
+"""
 
 import asyncio
-import logging
 
-from ticketflow.logging import setup_logging
+from ticketflow.runner import main
 
-logger = logging.getLogger(__name__)
-
-
-async def main() -> None:
-    """Report that the durable runner is not implemented in Milestone 0."""
-    setup_logging()
-    logger.warning("LangGraph/Postgres runner is not wired yet")
+__all__ = ["main"]
 
 
 if __name__ == "__main__":
