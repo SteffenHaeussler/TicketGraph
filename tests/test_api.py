@@ -4,25 +4,54 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-from ticketflow import config, db, graph
+from ticketflow import config, db, graph, readmodel
 from ticketflow.api import app
-from ticketflow.models import TicketStatus
+from ticketflow.models import (
+    ActionType,
+    Classification,
+    DraftReply,
+    ProposedAction,
+    TicketCategory,
+    TicketResult,
+    TicketStatus,
+)
 
 
 def http_client() -> AsyncClient:
     return AsyncClient(transport=ASGITransport(app=app), base_url="http://test")
 
 
-class FakeCompiledGraph:
-    """Stand-in compiled graph: records seed invocations, returns fixed state."""
+class FakeSnapshot:
+    """Stand-in LangGraph state snapshot exposing only ``values``."""
 
-    def __init__(self, output: dict[str, object]) -> None:
-        self._output = output
+    def __init__(self, values: dict[str, object]) -> None:
+        self.values = values
+
+
+class FakeCompiledGraph:
+    """Stand-in compiled graph: records seed invocations, returns fixed state.
+
+    ``output`` is returned by ``ainvoke`` (the POST seed path); ``state_values``
+    is returned (wrapped in a snapshot) by ``aget_state`` (the GET read path).
+    """
+
+    def __init__(
+        self,
+        output: dict[str, object] | None = None,
+        state_values: dict[str, object] | None = None,
+    ) -> None:
+        self._output = output or {}
+        self._state_values = state_values or {}
         self.invocations: list[tuple[object, object]] = []
+        self.state_reads: list[object] = []
 
     async def ainvoke(self, input: object, config: object) -> dict[str, object]:
         self.invocations.append((input, config))
         return self._output
+
+    async def aget_state(self, config: object) -> FakeSnapshot:
+        self.state_reads.append(config)
+        return FakeSnapshot(self._state_values)
 
 
 async def test_health_returns_alive_status():
@@ -113,14 +142,84 @@ async def test_list_tickets_reports_orchestration_unavailable():
     }
 
 
-async def test_get_ticket_reports_orchestration_unavailable():
+async def test_get_ticket_reads_state_from_checkpoint(monkeypatch):
+    classification = Classification(category=TicketCategory.BILLING, confidence=0.9)
+    draft = DraftReply(
+        reply_text="We will refund you.",
+        action=ProposedAction(type=ActionType.REFUND, refund_amount=12.5),
+        confidence=0.6,
+    )
+    fake_graph = FakeCompiledGraph(
+        state_values={
+            "status": TicketStatus.AWAITING_APPROVAL,
+            "classification": classification,
+            "draft": draft,
+        }
+    )
+    monkeypatch.setattr(app.state, "compiled", fake_graph, raising=False)
+    monkeypatch.setattr(app.state, "pool", object(), raising=False)
+
+    async with http_client() as http:
+        response = await http.get("/tickets/ticket-123")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ticket_id"] == "ticket-123"
+    assert body["status"] == "awaiting_approval"
+    assert body["classification"] == classification.model_dump(mode="json")
+    assert body["draft"] == draft.model_dump(mode="json")
+    assert body["decision"] is None
+    assert body["result"] is None
+
+    # The checkpoint was read on the ticket's own durable thread.
+    assert fake_graph.state_reads == [{"configurable": {"thread_id": "ticket-123"}}]
+
+
+async def test_get_ticket_falls_back_to_read_model(monkeypatch):
+    fake_graph = FakeCompiledGraph(state_values={})
+    sentinel_pool = object()
+    monkeypatch.setattr(app.state, "compiled", fake_graph, raising=False)
+    monkeypatch.setattr(app.state, "pool", sentinel_pool, raising=False)
+
+    result = TicketResult(
+        ticket_id="ticket-123",
+        status=TicketStatus.RESOLVED,
+        reply_text="Refund issued.",
+        refund_executed=True,
+    )
+    loaded: list[tuple[str, object]] = []
+
+    def fake_load_result(ticket_id, *, pool=None, database_url=None):
+        loaded.append((ticket_id, pool))
+        return result
+
+    monkeypatch.setattr(readmodel, "load_result", fake_load_result)
+
+    async with http_client() as http:
+        response = await http.get("/tickets/ticket-123")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ticket_id"] == "ticket-123"
+    assert body["status"] == "resolved"
+    assert body["result"] == result.model_dump(mode="json")
+    assert body["classification"] is None
+
+    # The fallback uses the request's open pool.
+    assert loaded == [("ticket-123", sentinel_pool)]
+
+
+async def test_get_ticket_returns_404_when_unknown(monkeypatch):
+    fake_graph = FakeCompiledGraph(state_values={})
+    monkeypatch.setattr(app.state, "compiled", fake_graph, raising=False)
+    monkeypatch.setattr(app.state, "pool", object(), raising=False)
+    monkeypatch.setattr(readmodel, "load_result", lambda ticket_id, **kw: None)
+
     async with http_client() as http:
         response = await http.get("/tickets/does-not-exist")
 
-    assert response.status_code == 503
-    assert response.json() == {
-        "detail": "LangGraph/Postgres orchestration is not wired yet."
-    }
+    assert response.status_code == 404
+    assert response.json() == {"detail": "ticket not found"}
 
 
 async def test_submit_approval_reports_orchestration_unavailable():
@@ -194,3 +293,84 @@ async def test_create_ticket_persists_workflow_run_and_outbox_through_postgres()
     assert task[1] == "classify"
     assert task[2] == "pending"
     assert task[3] == f"{ticket_id}:classify"
+
+
+@pytest.mark.integration
+async def test_get_ticket_reads_state_through_postgres_checkpoint():
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM task_queue")
+            conn.execute("DELETE FROM workflow_run")
+            conn.commit()
+
+        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
+            await saver.setup()
+            app.state.pool = pool
+            app.state.compiled = graph.compile_ticket_graph(
+                graph.default_activities(), saver, pool
+            )
+
+            async with http_client() as http:
+                created = await http.post(
+                    "/tickets",
+                    json={
+                        "customer_email": "jo@example.com",
+                        "subject": "refund please",
+                        "body": "I was double charged.",
+                    },
+                )
+                ticket_id = created.json()["ticket_id"]
+
+                response = await http.get(f"/tickets/{ticket_id}")
+
+                # A ticket that never started has no checkpoint and no result.
+                missing = await http.get("/tickets/never-existed")
+    finally:
+        pool.close()
+
+    # The status is read straight from the durable checkpoint.
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ticket_id"] == ticket_id
+    assert body["status"] == "classifying"
+    assert body["result"] is None
+
+    assert missing.status_code == 404
+
+
+@pytest.mark.integration
+async def test_get_ticket_falls_back_to_read_model_through_postgres():
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    try:
+        readmodel.clear(pool=pool)
+        result = TicketResult(
+            ticket_id="terminal-ticket",
+            status=TicketStatus.RESOLVED,
+            reply_text="Refund issued.",
+            refund_executed=True,
+        )
+        readmodel.save_result(result, pool=pool)
+
+        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
+            await saver.setup()
+            app.state.pool = pool
+            app.state.compiled = graph.compile_ticket_graph(
+                graph.default_activities(), saver, pool
+            )
+
+            async with http_client() as http:
+                # No checkpoint exists for this ticket; the read model answers.
+                response = await http.get("/tickets/terminal-ticket")
+    finally:
+        pool.close()
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["ticket_id"] == "terminal-ticket"
+    assert body["status"] == "resolved"
+    assert body["result"] == result.model_dump(mode="json")
