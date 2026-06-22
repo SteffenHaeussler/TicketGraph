@@ -181,10 +181,9 @@ async def test_process_one_task_fails_unknown_task_and_wakes_run(monkeypatch) ->
     monkeypatch.setattr(
         agent_worker.taskqueue,
         "fail",
-        lambda conn, task_id, *, error, permanent=False: failures.append(
-            (task_id, error, permanent)
-        )
-        or "failed",
+        lambda conn, task_id, *, error, permanent=False: (
+            failures.append((task_id, error, permanent)) or "failed"
+        ),
     )
 
     def wake_run(ticket_id: str, *, pool: object) -> None:
@@ -220,10 +219,9 @@ async def test_agent_exception_fails_without_waking(monkeypatch) -> None:
     monkeypatch.setattr(
         agent_worker.taskqueue,
         "fail",
-        lambda conn, task_id, *, error, permanent=False: failures.append(
-            (task_id, error, permanent)
-        )
-        or "pending",
+        lambda conn, task_id, *, error, permanent=False: (
+            failures.append((task_id, error, permanent)) or "pending"
+        ),
     )
 
     def wake_run(ticket_id: str, *, pool: object) -> None:
@@ -262,10 +260,9 @@ async def test_agent_permanent_error_marks_task_permanent_and_wakes_run(
     monkeypatch.setattr(
         agent_worker.taskqueue,
         "fail",
-        lambda conn, task_id, *, error, permanent=False: failures.append(
-            (task_id, error, permanent)
-        )
-        or "failed",
+        lambda conn, task_id, *, error, permanent=False: (
+            failures.append((task_id, error, permanent)) or "failed"
+        ),
     )
 
     def wake_run(ticket_id: str, *, pool: object) -> None:
