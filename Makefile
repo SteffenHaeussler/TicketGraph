@@ -1,7 +1,8 @@
 .PHONY: install install-hooks lint format-check format typecheck check test coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger worker fallback-worker side-effect-worker api doctor ticket status approve reject batch reset
 
 N ?= 100
-API_URL ?= http://localhost:8000
+API_PORT ?= 8000
+API_URL ?= http://localhost:$(API_PORT)
 JAEGER_URL ?= http://localhost:16686
 
 install:
@@ -33,14 +34,16 @@ test:
 coverage:
 	uv run pytest --cov=ticketflow --cov-report=term-missing
 
-## --- deployment smoke tests (against a running docker stack) ---
+## --- deployment smoke tests (self-managed docker stack) ---
 
 smoke:
+	@set -e; \
+	trap 'docker compose down' EXIT; \
+	API_PORT=$(API_PORT) docker compose up --build -d; \
+	uv run python scripts/wait_for_api.py --base-url $(API_URL); \
 	API_URL=$(API_URL) uv run pytest tests/test_smoke_stack.py -o addopts=
 
-test-docker: up
-	API_URL=$(API_URL) uv run pytest tests/test_smoke_stack.py -o addopts=
-	docker compose down
+test-docker: smoke
 
 test-docker-tracing:
 	TICKETFLOW_TRACE_EXPORTER=otlp COMPOSE_PROFILES=tracing docker compose up --build -d
@@ -50,10 +53,10 @@ test-docker-tracing:
 ## --- run the Milestone 0 stack ---
 
 server:
-	docker compose up postgres
+	docker compose -f docker-compose.yml -f docker-compose.host-postgres.yml up postgres
 
 server-docker:
-	docker compose up postgres jaeger
+	docker compose -f docker-compose.yml -f docker-compose.host-postgres.yml up postgres jaeger
 
 up:
 	docker compose up --build -d

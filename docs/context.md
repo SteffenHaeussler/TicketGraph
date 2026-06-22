@@ -170,17 +170,17 @@ DDIA-flavored narrative), `docs/agent-activity-ops.md` (LLM worker operations).
 
 ## Deployment smoke test as an opt-out pytest marker
 
-- **Decision:** End-to-end tests against the running docker stack live in
+- **Decision:** End-to-end tests against the docker stack live in
   `tests/test_smoke_stack.py` behind a `smoke` marker that pytest deselects by
-  default (`addopts = "-m 'not smoke'"`); `make smoke` opts back in, and
-  `make test-docker` wraps the up → test → down cycle.
+  default (`addopts = "-m 'not smoke'"`); `make smoke` starts the stack, waits
+  for the API, runs the tests, and tears the stack down.
 - **Why:** `make test` must stay runnable without Docker (CI, quick local
   loops), but "the compose stack actually processes a ticket" is exactly the
-  failure mode unit tests can't catch. The tests reuse `scripts/doctor.py` for
-  the readiness wait and `scripts/batch.py`'s settled-status set rather than
-  re-encoding either.
-- **Where:** `tests/test_smoke_stack.py`, `pyproject.toml`
-  (`[tool.pytest.ini_options]`), `Makefile` (`up`/`down`/`smoke`/`test-docker`).
+  failure mode unit tests can't catch. `make smoke` uses `scripts/wait_for_api.py`
+  for a clear readiness wait before pytest runs.
+- **Where:** `tests/test_smoke_stack.py`, `scripts/wait_for_api.py`,
+  `pyproject.toml` (`[tool.pytest.ini_options]`), `Makefile`
+  (`smoke`/`test-docker`).
 
 ---
 
