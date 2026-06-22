@@ -355,6 +355,40 @@ def test_claim_run_opens_and_closes_owned_pool(monkeypatch):
     assert pool.closed is True
 
 
+def test_reclaim_expired_runs_clears_stale_run_leases():
+    pool = FakePool(opened=True, row=(2,))
+
+    reclaimed = db.reclaim_expired_runs(pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert reclaimed == 2
+    assert "UPDATE workflow_run" in sql
+    assert "lease_owner = NULL" in sql
+    assert "lease_expires_at = NULL" in sql
+    assert "lease_expires_at < now()" in sql
+    assert "RETURNING ticket_id" in sql
+    assert pool.connection_obj.commits == 1
+
+
+def test_reclaim_expired_runs_opens_and_closes_owned_pool(monkeypatch):
+    pool = FakePool(row=(1,))
+    monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
+
+    db.reclaim_expired_runs(database_url="postgresql://example/tickets")
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
+def test_reclaim_expired_runs_leaves_injected_pool_unopened_to_caller():
+    pool = FakePool(opened=True, row=(0,))
+
+    db.reclaim_expired_runs(pool=pool)
+
+    assert pool.opened is True
+    assert pool.closed is False
+
+
 def test_save_run_persists_status_and_releases_lease():
     pool = FakePool(opened=True)
     wakeup_at = datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
@@ -801,3 +835,42 @@ def test_claim_run_reclaims_expired_lease_against_real_postgres():
 
     assert claimed is not None and claimed.ticket_id == "stale"
     assert claimed.lease_owner == "runner-1"
+
+
+@pytest.mark.integration
+def test_reclaim_expired_runs_clears_only_expired_leases_against_real_postgres():
+    pool = _open_clean_run_pool()
+    try:
+        with pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run "
+                "(ticket_id, status, wakeup_at, lease_owner, lease_expires_at) "
+                "VALUES ("
+                "'stale', 'classifying', now() + interval '10 minutes', "
+                "'runner-dead', now() - interval '1 second'"
+                ")"
+            )
+            conn.execute(
+                "INSERT INTO workflow_run "
+                "(ticket_id, lease_owner, lease_expires_at) "
+                "VALUES ('live', 'runner-live', now() + interval '30 seconds')"
+            )
+            conn.commit()
+
+        reclaimed = db.reclaim_expired_runs(pool=pool)
+
+        with pool.connection() as conn:
+            stale = conn.execute(
+                "SELECT status, wakeup_at IS NOT NULL, lease_owner, "
+                "lease_expires_at FROM workflow_run WHERE ticket_id = 'stale'"
+            ).fetchone()
+            live = conn.execute(
+                "SELECT lease_owner, lease_expires_at IS NOT NULL "
+                "FROM workflow_run WHERE ticket_id = 'live'"
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert reclaimed == 1
+    assert stale == ("classifying", True, None, None)
+    assert live == ("runner-live", True)

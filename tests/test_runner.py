@@ -6,6 +6,7 @@ integration test drives a seeded run ``received -> resolved`` purely through
 ``runner.step`` interleaved with the worker stub, against real Postgres.
 """
 
+import logging
 import uuid
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -14,7 +15,7 @@ import pytest
 
 from tests.helpers import billing_classification, drive_until_quiescent, refund_draft
 from tests.test_db import FakeConnection, FakePool
-from ticketflow import config, db, runner
+from ticketflow import config, db, runner, taskqueue
 from ticketflow.db import WorkflowRun
 
 
@@ -334,6 +335,87 @@ async def test_step_returns_false_when_no_run_is_claimable(monkeypatch):
     assert await runner.step(compiled, FakePool(opened=True), "runner-1") is False
     assert called is False
     assert compiled.invoked_with == []
+
+
+def test_reclaim_expired_leases_reclaims_tasks_and_runs(monkeypatch, caplog):
+    pool = FakePool(opened=True)
+    calls: list[tuple[str, object]] = []
+
+    def _reclaim_tasks(conn):
+        calls.append(("tasks", conn))
+        return 3
+
+    def _reclaim_runs(*, pool):
+        calls.append(("runs", pool))
+        return 2
+
+    monkeypatch.setattr(taskqueue, "reclaim_expired", _reclaim_tasks)
+    monkeypatch.setattr(db, "reclaim_expired_runs", _reclaim_runs)
+
+    with caplog.at_level(logging.INFO, logger="ticketflow.runner"):
+        result = runner.reclaim_expired_leases(pool)
+
+    assert result == runner.JanitorResult(tasks=3, runs=2)
+    assert calls == [("tasks", pool.connection_obj), ("runs", pool)]
+    assert pool.connection_obj.commits == 1
+    assert "reclaimed expired leases" in caplog.text
+
+
+def test_reclaim_expired_leases_does_not_log_zero_counts(monkeypatch, caplog):
+    pool = FakePool(opened=True)
+    monkeypatch.setattr(taskqueue, "reclaim_expired", lambda conn: 0)
+    monkeypatch.setattr(db, "reclaim_expired_runs", lambda *, pool: 0)
+
+    with caplog.at_level(logging.INFO, logger="ticketflow.runner"):
+        result = runner.reclaim_expired_leases(pool)
+
+    assert result == runner.JanitorResult(tasks=0, runs=0)
+    assert "reclaimed expired leases" not in caplog.text
+
+
+async def test_run_forever_runs_janitor_on_startup_and_interval(monkeypatch):
+    compiled = FakeCompiled(FakeSnapshot([]))
+    pool = FakePool(opened=True)
+    steps = 0
+    janitor_calls = 0
+    loop_times = iter([10.0, 14.0, 15.0, 19.0])
+
+    class FakeLoop:
+        def time(self):
+            return next(loop_times)
+
+    async def _step(compiled, pool, worker_id):
+        nonlocal steps
+        steps += 1
+        return False
+
+    async def _sleep(interval):
+        assert interval == 0.01
+
+    def _janitor(pool):
+        nonlocal janitor_calls
+        janitor_calls += 1
+        return runner.JanitorResult(tasks=0, runs=0)
+
+    monkeypatch.setattr(runner, "step", _step)
+    monkeypatch.setattr(runner, "reclaim_expired_leases", _janitor)
+    monkeypatch.setattr(runner.asyncio, "get_running_loop", lambda: FakeLoop())
+    monkeypatch.setattr(runner.asyncio, "sleep", _sleep)
+
+    def _stop():
+        return steps >= 3
+
+    await runner.run_forever(
+        compiled,
+        pool,
+        "runner-1",
+        poll_interval=0.01,
+        janitor_interval=5.0,
+        stop=_stop,
+    )
+
+    assert steps == 3
+    assert janitor_calls == 2
 
 
 @pytest.mark.integration

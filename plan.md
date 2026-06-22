@@ -117,7 +117,7 @@ RETURNING *;
   approval expiry and 30s fallback).
 - [ ] **4.4 Signals.** `pending_signal(workflow_id, kind, payload, consumed)`; deliver approval
   decisions into the resumed graph; mark consumed.
-- [ ] **4.5 Janitor wired in.** Periodically call `reclaim_expired()` for tasks and runs.
+- [x] **4.5 Janitor wired in.** Periodically call `reclaim_expired()` for tasks and runs.
 
 ## Milestone 5 — Workers
 *DDIA: Ch 11 backpressure & rate limiting.*
