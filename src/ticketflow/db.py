@@ -297,6 +297,41 @@ def save_run(
             active_pool.close()
 
 
+def create_run(
+    ticket_id: str,
+    *,
+    status: str,
+    wakeup_at: datetime | None,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> None:
+    """Insert the initial ``workflow_run`` projection for a freshly started ticket.
+
+    The API seeds the durable graph checkpoint and the initial outbox task, then
+    calls this to record the run's status projection so the runner can lease it.
+    ``lease_owner``/``lease_expires_at`` stay NULL (unleased) and the timestamps
+    default to ``now()``; ``status`` must satisfy the ``workflow_run`` CHECK
+    constraint.
+    """
+    owned_pool = pool is None
+    active_pool = pool or make_pool(database_url)
+    try:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            conn.execute(
+                """
+                INSERT INTO workflow_run (ticket_id, status, wakeup_at)
+                VALUES (%s, %s, %s)
+                """,
+                (ticket_id, status, wakeup_at),
+            )
+            conn.commit()
+    finally:
+        if owned_pool:
+            active_pool.close()
+
+
 def wake_run(
     ticket_id: str,
     *,
