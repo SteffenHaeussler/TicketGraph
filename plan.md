@@ -126,7 +126,7 @@ RETURNING *;
   bucket (`AGENT_MAX_PER_SECOND`) + bounded concurrency (`AGENT_MAX_CONCURRENT`), calls
   `TicketActivities` → `MockAgent`, writes result, wakes the run.
 - [x] **5.2 Fallback worker.** Unthrottled consumer of `ticketflow-agent-fallback`.
-- [ ] **5.3 Side-effect worker.** Default-queue consumer for `send_reply` / `execute_refund` /
+- [x] **5.3 Side-effect worker.** Default-queue consumer for `send_reply` / `execute_refund` /
   `record_result` with retries.
 - [ ] **5.4 Permanent failures.** Map `AgentPermanentError` → `permanent=True` task result
   (non-retryable; workflow escalates).

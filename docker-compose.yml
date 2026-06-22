@@ -42,6 +42,17 @@ services:
       postgres:
         condition: service_healthy
 
+  side-effect-worker:
+    build: .
+    command: python -m ticketflow.side_effect_worker
+    environment:
+      DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
+      TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
+      TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   api:
     build: .
     command: uvicorn ticketflow.api:app --host 0.0.0.0 --port 8000
