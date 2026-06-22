@@ -17,6 +17,7 @@ from ticketflow.models import (
     TicketStatus,
     TicketStatusInfo,
 )
+from ticketflow.signals import APPROVAL_DECISION_SIGNAL
 from ticketflow.tracing import instrument_fastapi_app, setup_tracing_components
 
 setup_logging()
@@ -102,6 +103,10 @@ def _orchestration_unavailable() -> HTTPException:
     return HTTPException(status_code=503, detail=ORCHESTRATION_UNAVAILABLE_DETAIL)
 
 
+def _approval_conflict() -> HTTPException:
+    return HTTPException(status_code=409, detail="ticket is not awaiting approval")
+
+
 @app.get("/health")
 async def health() -> dict[str, str]:
     """Report whether the HTTP process is alive."""
@@ -152,10 +157,11 @@ async def create_ticket(
 
 
 @app.get("/tickets")
-async def list_tickets(status: TicketStatus) -> ListTicketsResponse:
-    """Reject ticket listing until workflow runs are stored in Postgres."""
-    _ = status
-    raise _orchestration_unavailable()
+async def list_tickets(request: Request, status: TicketStatus) -> ListTicketsResponse:
+    """Return ticket ids whose workflow-run projection has ``status``."""
+    return ListTicketsResponse(
+        ticket_ids=db.list_runs_by_status(status, pool=request.app.state.pool)
+    )
 
 
 @app.get("/tickets/{ticket_id}")
@@ -191,8 +197,16 @@ async def get_ticket(request: Request, ticket_id: str) -> TicketStatusInfo:
 
 @app.post("/tickets/{ticket_id}/approval")
 async def submit_approval(
-    ticket_id: str, decision: ApprovalDecision
+    request: Request, ticket_id: str, decision: ApprovalDecision
 ) -> dict[str, TicketStatus]:
-    """Reject approvals until workflow signals are stored in Postgres."""
-    _ = ticket_id, decision
-    raise _orchestration_unavailable()
+    """Accept a human approval decision by writing a durable workflow signal."""
+    signal_id = db.add_pending_signal_if_waiting(
+        ticket_id,
+        APPROVAL_DECISION_SIGNAL,
+        decision.model_dump(mode="json"),
+        waiting_status=TicketStatus.AWAITING_APPROVAL,
+        pool=request.app.state.pool,
+    )
+    if signal_id is None:
+        raise _approval_conflict()
+    return {"status": TicketStatus.AWAITING_APPROVAL}

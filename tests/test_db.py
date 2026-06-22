@@ -35,11 +35,19 @@ CLAIMED_RUN_ROW = (
 
 
 class FakeCursor:
-    def __init__(self, row: tuple[object, ...] | None) -> None:
+    def __init__(
+        self,
+        row: tuple[object, ...] | None,
+        rows: list[tuple[object, ...]] | None = None,
+    ) -> None:
         self.row = row
+        self.rows = rows or []
 
     def fetchone(self) -> tuple[object, ...] | None:
         return self.row
+
+    def fetchall(self) -> list[tuple[object, ...]]:
+        return self.rows
 
 
 class FakeConnection:
@@ -48,14 +56,17 @@ class FakeConnection:
         self.params: list[tuple[str, ...]] = []
         self.commits = 0
         self.row = row
-        self.rows: list[tuple[object, ...] | None] = []
+        self.rows: list[tuple[object, ...] | list[tuple[object, ...]] | None] = []
 
     def execute(self, sql: str, params: tuple[str, ...] | None = None) -> FakeCursor:
         self.sql.append(sql)
         if params is not None:
             self.params.append(params)
         if self.rows:
-            return FakeCursor(self.rows.pop(0))
+            result = self.rows.pop(0)
+            if isinstance(result, list):
+                return FakeCursor(None, result)
+            return FakeCursor(result)
         return FakeCursor(self.row)
 
     def commit(self) -> None:
@@ -126,9 +137,9 @@ def test_bootstrap_creates_idempotent_migration_marker():
     # task_queue create, dispatch index, 001 marker, refunds create,
     # refund_attempts create, ticket_results create, 002 marker,
     # workflow_run create, status index, 003 marker, pending_signal create,
-    # signal lookup index, 004 marker.
+    # signal lookup index, 004 marker, unique signal index, 005 marker.
     assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 30
+    assert len(pool.connection_obj.sql) == 34
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
     assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
@@ -155,17 +166,23 @@ def test_bootstrap_creates_idempotent_migration_marker():
         "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed"
         in pool.connection_obj.sql[13]
     )
+    assert (
+        "CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind"
+        in pool.connection_obj.sql[15]
+    )
     assert pool.connection_obj.params == [
         ("000_bootstrap",),
         ("001_task_queue",),
         ("002_read_model",),
         ("003_workflow_run",),
         ("004_pending_signal",),
+        ("005_pending_signal_unique_unconsumed",),
         ("000_bootstrap",),
         ("001_task_queue",),
         ("002_read_model",),
         ("003_workflow_run",),
         ("004_pending_signal",),
+        ("005_pending_signal_unique_unconsumed",),
     ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
@@ -224,6 +241,18 @@ def test_bootstrap_creates_pending_signal_table():
     assert "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed" in sql
     assert "WHERE consumed = false" in sql
     assert ("004_pending_signal",) in pool.connection_obj.params
+
+
+def test_bootstrap_creates_unique_unconsumed_pending_signal_index():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind" in sql
+    assert "ON pending_signal (workflow_id, kind)" in sql
+    assert "WHERE consumed = false" in sql
+    assert ("005_pending_signal_unique_unconsumed",) in pool.connection_obj.params
 
 
 def test_bootstrap_leaves_injected_pool_unopened_to_caller():
@@ -546,6 +575,61 @@ def test_add_pending_signal_opens_and_closes_owned_pool(monkeypatch):
     assert pool.closed is True
 
 
+def test_list_runs_by_status_returns_ticket_ids_in_creation_order():
+    pool = FakePool(opened=True)
+    pool.connection_obj.rows = [[("ticket-1",), ("ticket-2",)]]
+
+    ticket_ids = db.list_runs_by_status("awaiting_approval", pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert ticket_ids == ["ticket-1", "ticket-2"]
+    assert "FROM workflow_run" in sql
+    assert "WHERE status = %s" in sql
+    assert "ORDER BY created_at, ticket_id" in sql
+    assert pool.connection_obj.params[-1] == ("awaiting_approval",)
+
+
+def test_add_pending_signal_if_waiting_inserts_signal_and_wakes_run():
+    pool = FakePool(opened=True, row=(42,))
+
+    signal_id = db.add_pending_signal_if_waiting(
+        "ticket-1",
+        "approval_decision",
+        {"approved": True, "approver": "sam@example.com"},
+        waiting_status="awaiting_approval",
+        pool=pool,
+    )
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert signal_id == 42
+    assert "WITH waiting AS" in sql
+    assert "status = %s" in sql
+    assert "ON CONFLICT (workflow_id, kind) WHERE consumed = false DO NOTHING" in sql
+    assert "UPDATE workflow_run" in sql
+    assert "wakeup_at = now()" in sql
+    assert pool.connection_obj.params[-1][0:3] == (
+        "ticket-1",
+        "awaiting_approval",
+        "approval_decision",
+    )
+    assert pool.connection_obj.commits == 1
+
+
+def test_add_pending_signal_if_waiting_returns_none_when_not_waiting():
+    pool = FakePool(opened=True, row=None)
+
+    signal_id = db.add_pending_signal_if_waiting(
+        "ticket-1",
+        "approval_decision",
+        {"approved": True, "approver": "sam@example.com"},
+        waiting_status="awaiting_approval",
+        pool=pool,
+    )
+
+    assert signal_id is None
+    assert pool.connection_obj.commits == 1
+
+
 @pytest.mark.integration
 def test_save_run_round_trips_status_and_lease_against_real_postgres():
     pool = _open_clean_run_pool()
@@ -799,14 +883,112 @@ def test_bootstrap_creates_workflow_run_against_real_postgres():
 
 
 def _open_clean_run_pool() -> db.ConnectionPool:
-    """Bootstrap, open a pool, and truncate ``workflow_run`` for isolation."""
+    """Bootstrap, open a pool, and truncate run/signal state for isolation."""
     db.bootstrap()
     pool = db.make_pool()
     pool.open()
     with pool.connection() as conn:
+        conn.execute("DELETE FROM pending_signal")
         conn.execute("DELETE FROM workflow_run")
         conn.commit()
     return pool
+
+
+@pytest.mark.integration
+def test_list_runs_by_status_against_real_postgres():
+    pool = _open_clean_run_pool()
+    try:
+        with pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, created_at) "
+                "VALUES ('older', 'awaiting_approval', now() - interval '10 seconds')"
+            )
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, created_at) "
+                "VALUES ('newer', 'awaiting_approval', now())"
+            )
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, created_at) "
+                "VALUES ('other', 'classifying', now() - interval '20 seconds')"
+            )
+            conn.commit()
+
+        assert db.list_runs_by_status("awaiting_approval", pool=pool) == [
+            "older",
+            "newer",
+        ]
+    finally:
+        pool.close()
+
+
+@pytest.mark.integration
+def test_add_pending_signal_if_waiting_against_real_postgres():
+    pool = _open_clean_run_pool()
+    try:
+        with pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                "VALUES ('waiting', 'awaiting_approval', now() + interval '1 hour')"
+            )
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status) "
+                "VALUES ('busy', 'classifying')"
+            )
+            conn.commit()
+
+        accepted = db.add_pending_signal_if_waiting(
+            "waiting",
+            "approval_decision",
+            {"approved": True, "approver": "sam@example.com"},
+            waiting_status="awaiting_approval",
+            pool=pool,
+        )
+        duplicate = db.add_pending_signal_if_waiting(
+            "waiting",
+            "approval_decision",
+            {"approved": False, "approver": "sam@example.com"},
+            waiting_status="awaiting_approval",
+            pool=pool,
+        )
+        wrong_status = db.add_pending_signal_if_waiting(
+            "busy",
+            "approval_decision",
+            {"approved": True, "approver": "sam@example.com"},
+            waiting_status="awaiting_approval",
+            pool=pool,
+        )
+        missing = db.add_pending_signal_if_waiting(
+            "missing",
+            "approval_decision",
+            {"approved": True, "approver": "sam@example.com"},
+            waiting_status="awaiting_approval",
+            pool=pool,
+        )
+
+        with pool.connection() as conn:
+            row = conn.execute(
+                """
+                SELECT payload, consumed
+                FROM pending_signal
+                WHERE workflow_id = 'waiting'
+                """
+            ).fetchone()
+            run = conn.execute(
+                "SELECT wakeup_at <= now() FROM workflow_run "
+                "WHERE ticket_id = 'waiting'"
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert accepted is not None
+    assert duplicate is None
+    assert wrong_status is None
+    assert missing is None
+    assert row is not None
+    assert row[0] == {"approved": True, "approver": "sam@example.com"}
+    assert row[1] is False
+    assert run is not None
+    assert run[0] is True
 
 
 @pytest.mark.integration
