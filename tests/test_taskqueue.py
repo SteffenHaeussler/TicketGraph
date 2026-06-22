@@ -95,10 +95,21 @@ def test_fail_retries_with_exponential_backoff() -> None:
     status = taskqueue.fail(conn, 7, error="boom")
 
     assert status == "pending"
-    assert "attempts < max_attempts AND NOT permanent" in conn.sql[0]
+    assert "attempts < max_attempts AND NOT (permanent OR %s)" in conn.sql[0]
     assert "power(2, attempts)" in conn.sql[0]
     assert "WHERE id = %s AND status = 'leased'" in conn.sql[0]
-    assert conn.params[0] == ("boom", 7)
+    assert conn.params[0] == (False, False, "boom", False, 7)
+
+
+def test_fail_permanent_argument_sets_flag_and_skips_retry() -> None:
+    conn = FakeConnection(rows=[("failed", datetime(2026, 6, 16, 12, 0, tzinfo=UTC))])
+
+    status = taskqueue.fail(conn, 7, error="invalid ticket", permanent=True)
+
+    assert status == "failed"
+    assert "permanent = permanent OR %s" in conn.sql[0]
+    assert "NOT (permanent OR %s)" in conn.sql[0]
+    assert conn.params[0] == (True, True, "invalid ticket", True, 7)
 
 
 def test_fail_gives_up_returns_failed_status() -> None:

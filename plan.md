@@ -128,7 +128,7 @@ RETURNING *;
 - [x] **5.2 Fallback worker.** Unthrottled consumer of `ticketflow-agent-fallback`.
 - [ ] **5.3 Side-effect worker.** Default-queue consumer for `send_reply` / `execute_refund` /
   `record_result` with retries.
-- [ ] **5.4 Permanent failures.** Map `AgentPermanentError` → `permanent=True` task result
+- [x] **5.4 Permanent failures.** Map `AgentPermanentError` → `permanent=True` task result
   (non-retryable; workflow escalates).
 
 ## Milestone 6 — API rewire (contract unchanged)

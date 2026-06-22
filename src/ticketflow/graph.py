@@ -43,7 +43,9 @@ from ticketflow.models import (
     ApprovalDecision,
     Classification,
     DraftReply,
+    ProposedAction,
     Ticket,
+    TicketCategory,
     TicketResult,
     TicketStatus,
 )
@@ -63,6 +65,28 @@ def _is_timeout(resume: Any) -> bool:
     timeout envelope when the schedule-to-start timer fires.
     """
     return isinstance(resume, dict) and resume.get("kind") == "timeout"
+
+
+def _is_task_failed(resume: Any) -> bool:
+    """True if a queued task failed finally and the workflow should escalate."""
+    return isinstance(resume, dict) and resume.get("kind") == "task_failed"
+
+
+def _failure_classification() -> Classification:
+    """Synthetic classification used only to complete escalation bookkeeping."""
+    return Classification(
+        category=TicketCategory.GENERAL, confidence=0.0, model="failed-agent"
+    )
+
+
+def _failure_draft() -> DraftReply:
+    """Synthetic draft used only to route failed agent work to finalization."""
+    return DraftReply(
+        reply_text=ESCALATION_REPLY,
+        action=ProposedAction(type=ActionType.REPLY_ONLY),
+        confidence=0.0,
+        model="failed-agent",
+    )
 
 
 class TicketState(TypedDict, total=False):
@@ -186,6 +210,14 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
             payload={"ticket": ticket.model_dump(mode="json")},
             wakeup_at=state.get("wakeup_at"),
         )
+        if _is_task_failed(result):
+            return {
+                "classification": _failure_classification(),
+                "draft": _failure_draft(),
+                "needs_approval": False,
+                "status": TicketStatus.ESCALATED,
+                "wakeup_at": None,
+            }
         classification = Classification.model_validate(result)
         return {
             "classification": classification,
@@ -220,6 +252,13 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
             },
             wakeup_at=state.get("wakeup_at"),
         )
+        if _is_task_failed(result):
+            return {
+                "draft": _failure_draft(),
+                "needs_approval": False,
+                "status": TicketStatus.ESCALATED,
+                "wakeup_at": None,
+            }
         reply = DraftReply.model_validate(result)
         return {"draft": reply, "status": TicketStatus.DRAFTING, "wakeup_at": None}
 
@@ -332,6 +371,18 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
     ) -> Literal["prepare_approval", "execute"]:
         return "prepare_approval" if state.get("needs_approval") else "execute"
 
+    def route_after_classify(
+        state: TicketState,
+    ) -> Literal["dispatch_draft", "execute"]:
+        if state.get("status") == TicketStatus.ESCALATED:
+            return "execute"
+        return "dispatch_draft"
+
+    def route_after_draft(state: TicketState) -> Literal["decide_approval", "execute"]:
+        if state.get("status") == TicketStatus.ESCALATED:
+            return "execute"
+        return "decide_approval"
+
     builder: StateGraph = StateGraph(TicketState)
     builder.add_node("dispatch_classify", dispatch_classify)
     builder.add_node("await_classify", await_classify)
@@ -344,9 +395,17 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
 
     builder.add_edge(START, "dispatch_classify")
     builder.add_edge("dispatch_classify", "await_classify")
-    builder.add_edge("await_classify", "dispatch_draft")
+    builder.add_conditional_edges(
+        "await_classify",
+        route_after_classify,
+        {"dispatch_draft": "dispatch_draft", "execute": "execute"},
+    )
     builder.add_edge("dispatch_draft", "await_draft")
-    builder.add_edge("await_draft", "decide_approval")
+    builder.add_conditional_edges(
+        "await_draft",
+        route_after_draft,
+        {"decide_approval": "decide_approval", "execute": "execute"},
+    )
     builder.add_conditional_edges(
         "decide_approval",
         route_after_decide,

@@ -99,33 +99,36 @@ def complete(conn: Any, task_id: int, *, result: Mapping[str, Any]) -> str | Non
     return row[0]
 
 
-def fail(conn: Any, task_id: int, *, error: str) -> str | None:
+def fail(conn: Any, task_id: int, *, error: str, permanent: bool = False) -> str | None:
     """Retry a leased task with exponential backoff, or mark it failed.
 
-    If ``attempts < max_attempts`` and the task is not ``permanent`` the row
-    returns to ``pending`` with ``available_at = now() + 2^attempts`` seconds;
-    otherwise it becomes ``failed`` with ``error`` recorded. Returns the
-    resulting status, or ``None`` when no leased row matched.
+    If ``attempts < max_attempts`` and neither the task row nor this failure is
+    ``permanent`` the row returns to ``pending`` with
+    ``available_at = now() + 2^attempts`` seconds; otherwise it becomes
+    ``failed`` with ``error`` recorded. Returns the resulting status, or
+    ``None`` when no leased row matched.
     """
     row = conn.execute(
         """
         UPDATE task_queue
         SET status = CASE
-                WHEN attempts < max_attempts AND NOT permanent THEN 'pending'
+                WHEN attempts < max_attempts AND NOT (permanent OR %s)
+                THEN 'pending'
                 ELSE 'failed'
             END,
             available_at = CASE
-                WHEN attempts < max_attempts AND NOT permanent
+                WHEN attempts < max_attempts AND NOT (permanent OR %s)
                 THEN now() + interval '1 second' * power(2, attempts)
                 ELSE available_at
             END,
             error = %s,
+            permanent = permanent OR %s,
             lease_owner = NULL,
             lease_expires_at = NULL
         WHERE id = %s AND status = 'leased'
         RETURNING status, available_at
         """,
-        (error, task_id),
+        (permanent, permanent, error, permanent, task_id),
     ).fetchone()
     if row is None:
         return None
