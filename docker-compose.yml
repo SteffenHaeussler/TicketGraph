@@ -31,12 +31,11 @@ services:
       postgres:
         condition: service_healthy
 
-  llm-worker:
+  fallback-worker:
     build: .
-    command: python -m ticketflow.llm_worker
+    command: python -m ticketflow.fallback_worker
     environment:
       DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
-      MOCK_AGENT_LATENCY_MAX_S: "3"
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     depends_on:
