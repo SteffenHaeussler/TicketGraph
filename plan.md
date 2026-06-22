@@ -133,10 +133,10 @@ RETURNING *;
 
 ## Milestone 6 — API rewire (contract unchanged)
 
-- [ ] **6.1 `POST /tickets`** inserts a `workflow_run` (and initial outbox); returns same response.
-- [ ] **6.2 `GET /tickets/{id}`** reads graph state from checkpoint with read-model fallback.
-- [ ] **6.3 `POST /tickets/{id}/approval`** writes a signal; returns **409** if not awaiting approval.
-- [ ] **6.4 `GET /tickets?status=`** queries the `workflow_run.status` secondary index.
+- [x] **6.1 `POST /tickets`** inserts a `workflow_run` (and initial outbox); returns same response.
+- [x] **6.2 `GET /tickets/{id}`** reads graph state from checkpoint with read-model fallback.
+- [x] **6.3 `POST /tickets/{id}/approval`** writes a signal; returns **409** if not awaiting approval.
+- [x] **6.4 `GET /tickets?status=`** queries the `workflow_run.status` secondary index.
 
 ## Milestone 7 — Tests & tooling
 
