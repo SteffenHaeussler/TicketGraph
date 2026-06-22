@@ -268,6 +268,74 @@ async def test_agent_dispatch_updates_visible_status_before_interrupt() -> None:
     assert snapshot.values["status"] == TicketStatus.DRAFTING
 
 
+async def test_classify_task_failure_escalates_without_draft_dispatch() -> None:
+    pool = FakePool(opened=True, row=(1,))
+    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    ticket = make_ticket("t-classify-failed")
+    cfg = config_for(ticket.id)
+
+    out = await compiled.ainvoke(
+        {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+    )
+    assert "__interrupt__" in out
+
+    out = await compiled.ainvoke(
+        Command(
+            resume={
+                "kind": "task_failed",
+                "error": "invalid ticket input",
+                "permanent": True,
+            }
+        ),
+        cfg,
+    )
+
+    payload = terminal_interrupt_payload(out, ticket)
+    assert payload["result"]["status"] == TicketStatus.ESCALATED
+    assert payload["result"]["reply_text"] == ESCALATION_REPLY
+    keys = idempotency_keys(pool)
+    assert f"{ticket.id}:draft" not in keys
+    assert f"{ticket.id}:finalize" in keys
+    snapshot = await compiled.aget_state(cfg)
+    assert snapshot.values["status"] == TicketStatus.ESCALATED
+    assert snapshot.values["needs_approval"] is False
+
+
+async def test_draft_task_failure_escalates_without_approval() -> None:
+    pool = FakePool(opened=True, row=(1,))
+    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    ticket = make_ticket("t-draft-failed")
+    cfg = config_for(ticket.id)
+
+    out = await compiled.ainvoke(
+        {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+    )
+    assert "__interrupt__" in out
+    out = await compiled.ainvoke(
+        Command(resume=make_classification().model_dump(mode="json")), cfg
+    )
+    assert "__interrupt__" in out
+
+    out = await compiled.ainvoke(
+        Command(
+            resume={
+                "kind": "task_failed",
+                "error": "drafting failed permanently",
+                "permanent": True,
+            }
+        ),
+        cfg,
+    )
+
+    payload = terminal_interrupt_payload(out, ticket)
+    assert payload["result"]["status"] == TicketStatus.ESCALATED
+    assert payload["result"]["reply_text"] == ESCALATION_REPLY
+    snapshot = await compiled.aget_state(cfg)
+    assert snapshot.values["status"] == TicketStatus.ESCALATED
+    assert snapshot.values["needs_approval"] is False
+    assert snapshot.next == ("execute",)
+
+
 async def test_schedule_to_start_timeout_redispatches_to_fallback() -> None:
     pool = FakePool(opened=True, row=(1,))
     compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)

@@ -14,7 +14,7 @@ from tests.helpers import (
 )
 from ticketflow import agent_worker, config, db, taskqueue
 from ticketflow.activities import TicketActivities
-from ticketflow.agent.base import AgentOverloadedError
+from ticketflow.agent.base import AgentOverloadedError, AgentPermanentError
 from ticketflow.models import Classification, Ticket, TicketStatus
 
 
@@ -171,17 +171,19 @@ async def test_process_one_task_completes_draft_and_wakes_run(monkeypatch) -> No
     assert woken == ["ticket-123"]
 
 
-async def test_process_one_task_fails_unknown_task_without_waking(monkeypatch) -> None:
+async def test_process_one_task_fails_unknown_task_and_wakes_run(monkeypatch) -> None:
     task = queued_task(task_type="finalize_ticket", payload={"ticket": {}})
     pool = FakePool()
-    failures: list[tuple[int, str]] = []
+    failures: list[tuple[int, str, bool]] = []
     woken: list[str] = []
 
     monkeypatch.setattr(agent_worker.db, "dequeue", lambda *args, **kwargs: task)
     monkeypatch.setattr(
         agent_worker.taskqueue,
         "fail",
-        lambda conn, task_id, *, error: failures.append((task_id, error)) or "failed",
+        lambda conn, task_id, *, error, permanent=False: (
+            failures.append((task_id, error, permanent)) or "failed"
+        ),
     )
 
     def wake_run(ticket_id: str, *, pool: object) -> None:
@@ -195,9 +197,9 @@ async def test_process_one_task_fails_unknown_task_without_waking(monkeypatch) -
     )
 
     assert processed is True
-    assert failures == [(7, "unexpected agent task_type 'finalize_ticket'")]
+    assert failures == [(7, "unexpected agent task_type 'finalize_ticket'", False)]
     assert pool.connection_obj.commits == 1
-    assert woken == []
+    assert woken == ["ticket-123"]
 
 
 async def test_agent_exception_fails_without_waking(monkeypatch) -> None:
@@ -210,14 +212,16 @@ async def test_agent_exception_fails_without_waking(monkeypatch) -> None:
         task_type="classify", payload={"ticket": ticket.model_dump(mode="json")}
     )
     pool = FakePool()
-    failures: list[tuple[int, str]] = []
+    failures: list[tuple[int, str, bool]] = []
     woken: list[str] = []
 
     monkeypatch.setattr(agent_worker.db, "dequeue", lambda *args, **kwargs: task)
     monkeypatch.setattr(
         agent_worker.taskqueue,
         "fail",
-        lambda conn, task_id, *, error: failures.append((task_id, error)) or "pending",
+        lambda conn, task_id, *, error, permanent=False: (
+            failures.append((task_id, error, permanent)) or "pending"
+        ),
     )
 
     def wake_run(ticket_id: str, *, pool: object) -> None:
@@ -232,9 +236,84 @@ async def test_agent_exception_fails_without_waking(monkeypatch) -> None:
     )
 
     assert processed is True
-    assert failures == [(7, "backend overloaded")]
+    assert failures == [(7, "backend overloaded", False)]
     assert pool.connection_obj.commits == 1
     assert woken == []
+
+
+async def test_agent_permanent_error_marks_task_permanent_and_wakes_run(
+    monkeypatch,
+) -> None:
+    class FailingAgent(ScriptedAgent):
+        async def classify(self, ticket: Ticket) -> Classification:
+            raise AgentPermanentError("invalid ticket input")
+
+    ticket = make_ticket(id="ticket-123")
+    task = queued_task(
+        task_type="classify", payload={"ticket": ticket.model_dump(mode="json")}
+    )
+    pool = FakePool()
+    failures: list[tuple[int, str, bool]] = []
+    woken: list[str] = []
+
+    monkeypatch.setattr(agent_worker.db, "dequeue", lambda *args, **kwargs: task)
+    monkeypatch.setattr(
+        agent_worker.taskqueue,
+        "fail",
+        lambda conn, task_id, *, error, permanent=False: (
+            failures.append((task_id, error, permanent)) or "failed"
+        ),
+    )
+
+    def wake_run(ticket_id: str, *, pool: object) -> None:
+        _ = pool
+        woken.append(ticket_id)
+
+    monkeypatch.setattr(agent_worker.db, "wake_run", wake_run)
+
+    processed = await agent_worker.process_one_task(
+        pool,
+        TicketActivities(FailingAgent(billing_classification(), refund_draft())),
+    )
+
+    assert processed is True
+    assert failures == [(7, "invalid ticket input", True)]
+    assert pool.connection_obj.commits == 1
+    assert woken == ["ticket-123"]
+
+
+async def test_agent_exception_wakes_run_when_retries_exhausted(monkeypatch) -> None:
+    class FailingAgent(ScriptedAgent):
+        async def classify(self, ticket: Ticket) -> Classification:
+            raise AgentOverloadedError("backend overloaded")
+
+    ticket = make_ticket(id="ticket-123")
+    task = queued_task(
+        task_type="classify", payload={"ticket": ticket.model_dump(mode="json")}
+    )
+    pool = FakePool()
+    woken: list[str] = []
+
+    monkeypatch.setattr(agent_worker.db, "dequeue", lambda *args, **kwargs: task)
+    monkeypatch.setattr(
+        agent_worker.taskqueue,
+        "fail",
+        lambda conn, task_id, *, error, permanent=False: "failed",
+    )
+
+    def wake_run(ticket_id: str, *, pool: object) -> None:
+        _ = pool
+        woken.append(ticket_id)
+
+    monkeypatch.setattr(agent_worker.db, "wake_run", wake_run)
+
+    processed = await agent_worker.process_one_task(
+        pool,
+        TicketActivities(FailingAgent(billing_classification(), refund_draft())),
+    )
+
+    assert processed is True
+    assert woken == ["ticket-123"]
 
 
 async def test_token_bucket_allows_first_token_then_waits_for_next() -> None:

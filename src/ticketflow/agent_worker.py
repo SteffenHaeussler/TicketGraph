@@ -12,6 +12,7 @@ from typing import Any
 
 from ticketflow import config, db, taskqueue
 from ticketflow.activities import TicketActivities
+from ticketflow.agent.base import AgentPermanentError
 from ticketflow.agent.mock import MockAgent
 from ticketflow.db import _Pool
 from ticketflow.logging import setup_logging
@@ -66,9 +67,11 @@ def _complete_task(pool: _Pool, task_id: int, result: dict[str, Any]) -> str | N
     return status
 
 
-def _fail_task(pool: _Pool, task_id: int, error: str) -> str | None:
+def _fail_task(
+    pool: _Pool, task_id: int, error: str, permanent: bool = False
+) -> str | None:
     with pool.connection() as conn:
-        status = taskqueue.fail(conn, task_id, error=error)
+        status = taskqueue.fail(conn, task_id, error=error, permanent=permanent)
         conn.commit()
     return status
 
@@ -96,9 +99,25 @@ async def process_one_task(
         return False
 
     try:
-        result = await run_activity(task, activities)
+        result = await _run_activity(task, activities)
+    except AgentPermanentError as exc:
+        status = await asyncio.to_thread(_fail_task, pool, task.id, str(exc), True)
+        if status == "failed":
+            await asyncio.to_thread(db.wake_run, task.workflow_id, pool=pool)
+        logger.exception(
+            "agent task failed permanently",
+            extra={
+                "ticket_id": task.workflow_id,
+                "task_queue": queue_name,
+                "task_type": task.task_type,
+                "task_status": status,
+            },
+        )
+        return True
     except Exception as exc:
         status = await asyncio.to_thread(_fail_task, pool, task.id, str(exc))
+        if status == "failed":
+            await asyncio.to_thread(db.wake_run, task.workflow_id, pool=pool)
         logger.exception(
             "agent task failed",
             extra={

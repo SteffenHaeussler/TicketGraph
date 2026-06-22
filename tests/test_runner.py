@@ -71,12 +71,28 @@ def test_pending_envelope_returns_none_without_interrupts():
 
 
 def test_resume_value_returns_stored_task_result():
-    conn = FakeConnection(row=({"category": "billing"},))
+    conn = FakeConnection(row=("done", {"category": "billing"}, None, False))
 
     value = runner._resume_value(conn, {"idempotency_key": "t-1:classify"})
 
     assert value == runner._ResumeValue(payload={"category": "billing"})
     assert "FROM task_queue" in conn.sql[-1]
+    assert conn.params[-1] == ("t-1:classify",)
+
+
+def test_resume_value_returns_failed_task_envelope():
+    conn = FakeConnection(row=("failed", None, "invalid ticket input", True))
+
+    value = runner._resume_value(conn, {"idempotency_key": "t-1:classify"})
+
+    assert value == runner._ResumeValue(
+        payload={
+            "kind": "task_failed",
+            "error": "invalid ticket input",
+            "permanent": True,
+        }
+    )
+    assert "status = 'failed'" in conn.sql[-1]
     assert conn.params[-1] == ("t-1:classify",)
 
 
@@ -132,7 +148,7 @@ async def test_step_resumes_when_result_is_ready(monkeypatch):
     compiled = FakeCompiled(
         snapshot, invoke_result={"status": "drafting", "wakeup_at": None}
     )
-    pool = FakePool(opened=True, row=({"category": "billing"},))
+    pool = FakePool(opened=True, row=("done", {"category": "billing"}, None, False))
 
     monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
     saved: list[dict] = []
@@ -151,6 +167,38 @@ async def test_step_resumes_when_result_is_ready(monkeypatch):
     assert advanced is True
     assert len(compiled.invoked_with) == 1
     assert saved == [{"ticket_id": "t-1", "status": "drafting", "wakeup_at": None}]
+
+
+async def test_step_resumes_when_task_failed(monkeypatch):
+    run = make_run()
+    snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
+    compiled = FakeCompiled(
+        snapshot, invoke_result={"status": "escalated", "wakeup_at": None}
+    )
+    pool = FakePool(opened=True, row=("failed", None, "invalid ticket input", True))
+
+    monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        db,
+        "save_run",
+        lambda ticket_id, *, status, wakeup_at, pool, consumed_signal_id=None: (
+            saved.append(
+                {"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at}
+            )
+        ),
+    )
+
+    advanced = await runner.step(compiled, pool, "runner-1")
+
+    assert advanced is True
+    assert len(compiled.invoked_with) == 1
+    assert compiled.invoked_with[0].resume == {
+        "kind": "task_failed",
+        "error": "invalid ticket input",
+        "permanent": True,
+    }
+    assert saved == [{"ticket_id": "t-1", "status": "escalated", "wakeup_at": None}]
 
 
 async def test_step_resumes_due_run_with_timeout_when_result_not_ready(monkeypatch):
@@ -232,7 +280,7 @@ async def test_step_prefers_ready_result_over_due_timeout(monkeypatch):
     compiled = FakeCompiled(
         snapshot, invoke_result={"status": "drafting", "wakeup_at": None}
     )
-    pool = FakePool(opened=True, row=({"category": "billing"},))
+    pool = FakePool(opened=True, row=("done", {"category": "billing"}, None, False))
 
     monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
     saved: list[dict] = []

@@ -137,11 +137,26 @@ def _resume_value(conn: Any, envelope: dict[str, Any]) -> _ResumeValue | None:
     if key is None:
         return None
     row = conn.execute(
-        "SELECT result FROM task_queue "
-        "WHERE idempotency_key = %s AND result IS NOT NULL",
+        """
+        SELECT status, result, error, permanent
+        FROM task_queue
+        WHERE idempotency_key = %s
+          AND (result IS NOT NULL OR status = 'failed')
+        """,
         (key,),
     ).fetchone()
-    return _ResumeValue(row[0]) if row is not None else None
+    if row is None:
+        return None
+    status, result, error, permanent = row
+    if status == "failed":
+        return _ResumeValue(
+            {
+                "kind": "task_failed",
+                "error": error,
+                "permanent": permanent,
+            }
+        )
+    return _ResumeValue(result)
 
 
 def _resume_for_run(
