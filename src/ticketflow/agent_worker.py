@@ -99,7 +99,7 @@ async def process_one_task(
         return False
 
     try:
-        result = await _run_activity(task, activities)
+        result = await run_activity(task, activities)
     except AgentPermanentError as exc:
         status = await asyncio.to_thread(_fail_task, pool, task.id, str(exc), True)
         if status == "failed":
