@@ -285,6 +285,77 @@ async def test_run_forever_limits_concurrent_processing(monkeypatch) -> None:
     assert max_active <= 2
 
 
+async def test_run_forever_unthrottled_skips_token_bucket(monkeypatch) -> None:
+    stop = asyncio.Event()
+    active = 0
+    max_active = 0
+    starts = 0
+
+    def reject_token_bucket(*args: object, **kwargs: object) -> object:
+        raise AssertionError("TokenBucket must not be built when unthrottled")
+
+    monkeypatch.setattr(agent_worker, "TokenBucket", reject_token_bucket)
+
+    async def fake_process_one_task(*args: object, **kwargs: object) -> bool:
+        nonlocal active, max_active, starts
+        active += 1
+        starts += 1
+        max_active = max(max_active, active)
+        if starts >= 5:
+            stop.set()
+        await asyncio.sleep(0.01)
+        active -= 1
+        return True
+
+    monkeypatch.setattr(agent_worker, "process_one_task", fake_process_one_task)
+
+    await agent_worker.run_forever(
+        FakePool(),
+        TicketActivities(ScriptedAgent(billing_classification(), refund_draft())),
+        worker_id="fallback-1",
+        max_per_second=None,
+        max_concurrent=2,
+        poll_interval=0,
+        stop=stop,
+    )
+
+    assert starts >= 5
+    assert max_active <= 2
+
+
+async def test_run_forever_unthrottled_backs_off_when_idle(monkeypatch) -> None:
+    stop = asyncio.Event()
+    sleeps: list[float] = []
+    calls = 0
+
+    monkeypatch.setattr(agent_worker, "TokenBucket", None)
+
+    async def empty_process_one_task(*args: object, **kwargs: object) -> bool:
+        nonlocal calls
+        calls += 1
+        return False
+
+    async def fake_sleep(delay: float) -> None:
+        sleeps.append(delay)
+        if len(sleeps) >= 3:
+            stop.set()
+
+    monkeypatch.setattr(agent_worker, "process_one_task", empty_process_one_task)
+    monkeypatch.setattr(agent_worker.asyncio, "sleep", fake_sleep)
+
+    await agent_worker.run_forever(
+        FakePool(),
+        TicketActivities(ScriptedAgent(billing_classification(), refund_draft())),
+        worker_id="fallback-1",
+        max_per_second=None,
+        max_concurrent=2,
+        poll_interval=0.5,
+        stop=stop,
+    )
+
+    assert sleeps and all(delay == 0.5 for delay in sleeps)
+
+
 async def test_main_creates_primary_mock_agent_worker(monkeypatch) -> None:
     pool = FakePool()
     captured: dict[str, Any] = {}

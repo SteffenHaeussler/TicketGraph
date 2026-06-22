@@ -125,7 +125,7 @@ RETURNING *;
 - [ ] **5.1 Primary agent worker.** `agent_worker.py` consumes `ticketflow-agent` with a token
   bucket (`AGENT_MAX_PER_SECOND`) + bounded concurrency (`AGENT_MAX_CONCURRENT`), calls
   `TicketActivities` → `MockAgent`, writes result, wakes the run.
-- [ ] **5.2 Fallback worker.** Unthrottled consumer of `ticketflow-agent-fallback`.
+- [x] **5.2 Fallback worker.** Unthrottled consumer of `ticketflow-agent-fallback`.
 - [ ] **5.3 Side-effect worker.** Default-queue consumer for `send_reply` / `execute_refund` /
   `record_result` with retries.
 - [ ] **5.4 Permanent failures.** Map `AgentPermanentError` → `permanent=True` task result

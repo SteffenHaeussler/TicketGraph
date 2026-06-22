@@ -129,17 +129,21 @@ async def run_forever(
     *,
     worker_id: str | None = None,
     queue_name: str = config.AGENT_TASK_QUEUE,
-    max_per_second: float = config.AGENT_MAX_PER_SECOND,
+    max_per_second: float | None = config.AGENT_MAX_PER_SECOND,
     max_concurrent: int = config.AGENT_MAX_CONCURRENT,
     poll_interval: float = 0.1,
     stop: asyncio.Event | None = None,
 ) -> None:
-    """Continuously drain primary agent tasks with rate and concurrency limits."""
+    """Continuously drain agent tasks with bounded concurrency.
+
+    Passing ``max_per_second=None`` runs unthrottled (no token bucket), as the
+    fallback worker does; otherwise acquisitions are spaced at that rate.
+    """
     if max_concurrent <= 0:
         raise ValueError("max_concurrent must be greater than zero")
 
     resolved_worker_id = worker_id or _default_worker_id()
-    bucket = TokenBucket(max_per_second)
+    bucket = TokenBucket(max_per_second) if max_per_second is not None else None
     in_flight: set[asyncio.Task[bool]] = set()
 
     async def _wait_for_one() -> bool:
@@ -155,7 +159,8 @@ async def run_forever(
             while len(in_flight) < max_concurrent and (
                 stop is None or not stop.is_set()
             ):
-                await bucket.acquire()
+                if bucket is not None:
+                    await bucket.acquire()
                 in_flight.add(
                     asyncio.create_task(
                         process_one_task(
@@ -167,9 +172,13 @@ async def run_forever(
                     )
                 )
 
-            if in_flight and await _wait_for_one():
+            processed = await _wait_for_one() if in_flight else False
+            if processed:
                 continue
-            if not in_flight:
+            # Unthrottled mode has no token bucket to pace empty-queue polling,
+            # so back off explicitly; the throttled path keeps relying on the
+            # bucket and only sleeps when there is nothing in flight.
+            if bucket is None or not in_flight:
                 await asyncio.sleep(poll_interval)
     except asyncio.CancelledError:
         if in_flight:
