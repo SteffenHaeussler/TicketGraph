@@ -122,12 +122,13 @@ def test_bootstrap_creates_idempotent_migration_marker():
     db.bootstrap(pool=pool)
     db.bootstrap(pool=pool)
 
-    # Each call issues 12 statements: schema_migrations create + 000 marker,
+    # Each call issues 15 statements: schema_migrations create + 000 marker,
     # task_queue create, dispatch index, 001 marker, refunds create,
     # refund_attempts create, ticket_results create, 002 marker,
-    # workflow_run create, status index, 003 marker.
+    # workflow_run create, status index, 003 marker, pending_signal create,
+    # signal lookup index, 004 marker.
     assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 24
+    assert len(pool.connection_obj.sql) == 30
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
     assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
@@ -149,15 +150,22 @@ def test_bootstrap_creates_idempotent_migration_marker():
         "CREATE INDEX IF NOT EXISTS ix_workflow_run_status"
         in pool.connection_obj.sql[10]
     )
+    assert "CREATE TABLE IF NOT EXISTS pending_signal" in pool.connection_obj.sql[12]
+    assert (
+        "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed"
+        in pool.connection_obj.sql[13]
+    )
     assert pool.connection_obj.params == [
         ("000_bootstrap",),
         ("001_task_queue",),
         ("002_read_model",),
         ("003_workflow_run",),
+        ("004_pending_signal",),
         ("000_bootstrap",),
         ("001_task_queue",),
         ("002_read_model",),
         ("003_workflow_run",),
+        ("004_pending_signal",),
     ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
@@ -200,6 +208,22 @@ def test_bootstrap_creates_workflow_run_table():
     assert "'awaiting_approval', 'resolved', 'rejected', 'escalated'))" in sql
     assert "CREATE INDEX IF NOT EXISTS ix_workflow_run_status" in sql
     assert ("003_workflow_run",) in pool.connection_obj.params
+
+
+def test_bootstrap_creates_pending_signal_table():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE TABLE IF NOT EXISTS pending_signal" in sql
+    assert "workflow_id text        NOT NULL" in sql
+    assert "kind        text        NOT NULL" in sql
+    assert "payload     jsonb       NOT NULL" in sql
+    assert "consumed    boolean     NOT NULL DEFAULT false" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed" in sql
+    assert "WHERE consumed = false" in sql
+    assert ("004_pending_signal",) in pool.connection_obj.params
 
 
 def test_bootstrap_leaves_injected_pool_unopened_to_caller():
@@ -353,6 +377,27 @@ def test_save_run_persists_status_and_releases_lease():
     assert pool.connection_obj.commits == 1
 
 
+def test_save_run_can_mark_signal_consumed_with_lease_release():
+    pool = FakePool(opened=True)
+
+    db.save_run(
+        "ticket-1",
+        status="awaiting_approval",
+        wakeup_at=None,
+        consumed_signal_id=7,
+        pool=pool,
+    )
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "UPDATE workflow_run" in sql
+    assert "UPDATE pending_signal" in sql
+    assert "consumed = true" in sql
+    assert "WHERE id = %s" in sql
+    assert pool.connection_obj.params[-2] == ("awaiting_approval", None, "ticket-1")
+    assert pool.connection_obj.params[-1] == (7,)
+    assert pool.connection_obj.commits == 1
+
+
 def test_save_run_accepts_null_wakeup_at():
     pool = FakePool(opened=True)
 
@@ -399,6 +444,36 @@ def test_wake_run_opens_and_closes_owned_pool(monkeypatch):
     monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
 
     db.wake_run("ticket-1")
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
+def test_add_pending_signal_inserts_signal_and_wakes_run():
+    pool = FakePool(opened=True, row=(42,))
+
+    signal_id = db.add_pending_signal(
+        "ticket-1",
+        "approval_decision",
+        {"approved": True, "approver": "sam@example.com"},
+        pool=pool,
+    )
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert signal_id == 42
+    assert "INSERT INTO pending_signal" in sql
+    assert "UPDATE workflow_run" in sql
+    assert "wakeup_at = now()" in sql
+    assert pool.connection_obj.params[0][0:2] == ("ticket-1", "approval_decision")
+    assert pool.connection_obj.params[1] == ("ticket-1",)
+    assert pool.connection_obj.commits == 1
+
+
+def test_add_pending_signal_opens_and_closes_owned_pool(monkeypatch):
+    pool = FakePool(row=(42,))
+    monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
+
+    db.add_pending_signal("ticket-1", "approval_decision", {"approved": True})
 
     assert pool.opened is True
     assert pool.closed is True

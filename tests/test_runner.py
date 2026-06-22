@@ -73,7 +73,7 @@ def test_resume_value_returns_stored_task_result():
 
     value = runner._resume_value(conn, {"idempotency_key": "t-1:classify"})
 
-    assert value == {"category": "billing"}
+    assert value == runner._ResumeValue(payload={"category": "billing"})
     assert "FROM task_queue" in conn.sql[-1]
     assert conn.params[-1] == ("t-1:classify",)
 
@@ -84,12 +84,44 @@ def test_resume_value_is_none_when_result_not_ready():
     assert runner._resume_value(conn, {"idempotency_key": "t-1:classify"}) is None
 
 
-def test_resume_value_is_none_for_approval_envelope():
-    conn = FakeConnection(row=({"should": "not be read"},))
+def test_resume_value_is_none_for_approval_envelope_without_signal():
+    conn = FakeConnection(row=None)
 
-    # An approval envelope carries no idempotency_key; it resumes from a signal
-    # (M4.4), so the runner never treats it as ready in M4.2.
-    assert runner._resume_value(conn, {"kind": "approval_required"}) is None
+    assert (
+        runner._resume_value(
+            conn,
+            {"kind": "approval_required", "ticket_id": "t-1"},
+        )
+        is None
+    )
+    assert "FROM pending_signal" in conn.sql[-1]
+    assert conn.params[-1] == ("t-1", "approval_decision")
+
+
+def test_resume_value_returns_decision_for_pending_approval_signal():
+    conn = FakeConnection(
+        row=(7, {"approved": True, "approver": "sam@example.com", "note": None})
+    )
+
+    value = runner._resume_value(
+        conn,
+        {"kind": "approval_required", "ticket_id": "t-1"},
+    )
+
+    assert value == runner._ResumeValue(
+        payload={
+            "kind": "decision",
+            "decision": {
+                "approved": True,
+                "approver": "sam@example.com",
+                "note": None,
+            },
+        },
+        consumed_signal_id=7,
+    )
+    assert "FROM pending_signal" in conn.sql[-1]
+    assert "ORDER BY created_at, id" in conn.sql[-1]
+    assert conn.params[-1] == ("t-1", "approval_decision")
 
 
 async def test_step_resumes_when_result_is_ready(monkeypatch):
@@ -105,8 +137,10 @@ async def test_step_resumes_when_result_is_ready(monkeypatch):
     monkeypatch.setattr(
         db,
         "save_run",
-        lambda ticket_id, *, status, wakeup_at, pool: saved.append(
-            {"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at}
+        lambda ticket_id, *, status, wakeup_at, pool, consumed_signal_id=None: (
+            saved.append(
+                {"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at}
+            )
         ),
     )
 
@@ -115,6 +149,49 @@ async def test_step_resumes_when_result_is_ready(monkeypatch):
     assert advanced is True
     assert len(compiled.invoked_with) == 1
     assert saved == [{"ticket_id": "t-1", "status": "drafting", "wakeup_at": None}]
+
+
+async def test_step_resumes_approval_signal_and_marks_it_consumed(monkeypatch):
+    run = make_run(status="awaiting_approval")
+    envelope = {"kind": "approval_required", "ticket_id": "t-1"}
+    snapshot = FakeSnapshot([FakeInterrupt(envelope)])
+    compiled = FakeCompiled(
+        snapshot, invoke_result={"status": "resolved", "wakeup_at": None}
+    )
+    pool = FakePool(
+        opened=True,
+        row=(7, {"approved": True, "approver": "sam@example.com", "note": None}),
+    )
+
+    monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        db,
+        "save_run",
+        lambda ticket_id, *, status, wakeup_at, pool, consumed_signal_id=None: (
+            saved.append(
+                {
+                    "ticket_id": ticket_id,
+                    "status": status,
+                    "wakeup_at": wakeup_at,
+                    "consumed_signal_id": consumed_signal_id,
+                }
+            )
+        ),
+    )
+
+    advanced = await runner.step(compiled, pool, "runner-1")
+
+    assert advanced is True
+    assert len(compiled.invoked_with) == 1
+    assert saved == [
+        {
+            "ticket_id": "t-1",
+            "status": "resolved",
+            "wakeup_at": None,
+            "consumed_signal_id": 7,
+        }
+    ]
 
 
 async def test_step_releases_without_advancing_when_result_not_ready(monkeypatch):
@@ -235,3 +312,84 @@ async def test_runner_drives_a_seeded_run_to_resolved_through_postgres():
     assert row[1] is None  # wakeup_at cleared at the terminal step
     assert row[2] is None  # lease released
     assert row[3] is None
+
+
+@pytest.mark.integration
+async def test_runner_delivers_approval_signal_through_postgres():
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from tests.helpers import ScriptedAgent, billing_classification, refund_draft
+    from ticketflow import graph
+    from ticketflow.activities import TicketActivities
+    from ticketflow.models import ApprovalDecision, Ticket, TicketStatus
+
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    ticket = Ticket(
+        id="t-runner-approval",
+        customer_email="customer@example.com",
+        subject="Refund request",
+        body="I was charged twice and need a refund.",
+    )
+    activities = TicketActivities(
+        ScriptedAgent(billing_classification(), refund_draft())
+    )
+    cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
+    decision = ApprovalDecision(approved=True, approver="sam@example.com")
+
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM task_queue WHERE workflow_id = %s", (ticket.id,))
+            conn.execute(
+                "DELETE FROM pending_signal WHERE workflow_id = %s", (ticket.id,)
+            )
+            conn.execute("DELETE FROM workflow_run")
+            conn.commit()
+
+        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
+            await saver.setup()
+            compiled = graph.compile_ticket_graph(activities, saver, pool)
+
+            out = await compiled.ainvoke(
+                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+            )
+            assert "__interrupt__" in out
+            snapshot = await compiled.aget_state(cfg)
+            with pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                    "VALUES (%s, %s, %s)",
+                    (
+                        ticket.id,
+                        snapshot.values["status"],
+                        snapshot.values.get("wakeup_at"),
+                    ),
+                )
+                conn.commit()
+
+            await drive_until_quiescent(compiled, pool, activities, ticket.id)
+            awaiting = await compiled.aget_state(cfg)
+            assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
+
+            signal_id = db.add_pending_signal(
+                ticket.id,
+                "approval_decision",
+                decision.model_dump(mode="json"),
+                pool=pool,
+            )
+            await drive_until_quiescent(compiled, pool, activities, ticket.id)
+            final = await compiled.aget_state(cfg)
+
+        with pool.connection() as conn:
+            row = conn.execute(
+                "SELECT consumed FROM pending_signal WHERE id = %s", (signal_id,)
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert final.values["status"] == TicketStatus.RESOLVED
+    assert final.values["decision"] == decision
+    assert row is not None
+    assert row[0] is True

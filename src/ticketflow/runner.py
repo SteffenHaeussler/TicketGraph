@@ -13,9 +13,9 @@ dispatch nodes) each commit in their own transaction, while the runner's own
 Crash-safety comes from idempotency keys (re-enqueue is a no-op) and lease
 re-claim re-deriving state from the durable checkpoint.
 
-M4.2 resumes only when the awaited result is *ready*. Resuming on an elapsed
-timer (``{"kind": "timeout"}``) is Milestone 4.3 and approval signals are
-Milestone 4.4; until then a claimed-but-not-ready run is released as a no-op.
+The runner resumes only when the awaited task result or approval signal is
+*ready*. Resuming on an elapsed timer (``{"kind": "timeout"}``) is Milestone
+4.3; until then a claimed-but-not-ready run is released as a no-op.
 """
 
 from __future__ import annotations
@@ -25,6 +25,7 @@ import logging
 import socket
 import uuid
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import Any, Callable, Protocol
 
 from langchain_core.runnables import RunnableConfig
@@ -38,6 +39,7 @@ from ticketflow.logging import setup_logging
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 1.0
+APPROVAL_DECISION_SIGNAL = "approval_decision"
 
 
 class _Interrupt(Protocol):
@@ -55,6 +57,14 @@ class _Graph(Protocol):
     async def aget_state(self, config: Any) -> _Snapshot: ...
 
     async def ainvoke(self, input: Any, config: Any) -> dict[str, Any]: ...
+
+
+@dataclass(frozen=True)
+class _ResumeValue:
+    """A graph resume payload plus the signal row to consume, if any."""
+
+    payload: Any
+    consumed_signal_id: int | None = None
 
 
 def _thread_config(ticket_id: str) -> RunnableConfig:
@@ -75,14 +85,46 @@ def _pending_envelope(snapshot: _Snapshot) -> dict[str, Any] | None:
     return value if isinstance(value, dict) else None
 
 
-def _resume_value(conn: Any, envelope: dict[str, Any]) -> Any | None:
+def _approval_resume_value(conn: Any, envelope: dict[str, Any]) -> _ResumeValue | None:
+    """Return the oldest unconsumed approval decision signal, if one is ready."""
+    if envelope.get("kind") != "approval_required":
+        return None
+    workflow_id = envelope.get("ticket_id") or envelope.get("workflow_id")
+    if not isinstance(workflow_id, str):
+        return None
+
+    row = conn.execute(
+        """
+        SELECT id, payload
+        FROM pending_signal
+        WHERE workflow_id = %s
+          AND kind = %s
+          AND consumed = false
+        ORDER BY created_at, id
+        LIMIT 1
+        """,
+        (workflow_id, APPROVAL_DECISION_SIGNAL),
+    ).fetchone()
+    if row is None:
+        return None
+    return _ResumeValue(
+        payload={"kind": "decision", "decision": row[1]},
+        consumed_signal_id=row[0],
+    )
+
+
+def _resume_value(conn: Any, envelope: dict[str, Any]) -> _ResumeValue | None:
     """The value to resume the graph with, or ``None`` if it is not ready yet.
 
     Dispatch (``classify``/``draft``) and terminal (``finalize_ticket``)
     envelopes carry an ``idempotency_key``; their resume value is the worker's
     stored task result. Approval envelopes (``kind == "approval_required"``)
-    resume from a signal -- deferred to M4.4 -- so they are never ready here.
+    resume from the oldest unconsumed ``approval_decision`` signal.
     """
+    approval = _approval_resume_value(conn, envelope)
+    if approval is not None:
+        return approval
+
     key = envelope.get("idempotency_key")
     if key is None:
         return None
@@ -91,7 +133,7 @@ def _resume_value(conn: Any, envelope: dict[str, Any]) -> Any | None:
         "WHERE idempotency_key = %s AND result IS NOT NULL",
         (key,),
     ).fetchone()
-    return row[0] if row is not None else None
+    return _ResumeValue(row[0]) if row is not None else None
 
 
 async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
@@ -109,14 +151,14 @@ async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
     snapshot = await compiled.aget_state(cfg)
     envelope = _pending_envelope(snapshot)
 
-    resume: Any | None = None
+    resume: _ResumeValue | None = None
     if envelope is not None:
         with pool.connection() as conn:
             resume = _resume_value(conn, envelope)
 
     if envelope is None or resume is None:
-        # Not actionable yet (no result, or an approval signal we do not handle
-        # in M4.2). Release the lease, leaving status/wakeup_at untouched.
+        # Not actionable yet (no task result or approval signal). Release the
+        # lease, leaving status/wakeup_at untouched.
         db.save_run(
             run.ticket_id,
             status=run.status,
@@ -125,11 +167,12 @@ async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
         )
         return False
 
-    out = await compiled.ainvoke(Command(resume=resume), cfg)
+    out = await compiled.ainvoke(Command(resume=resume.payload), cfg)
     db.save_run(
         run.ticket_id,
         status=out["status"],
         wakeup_at=out.get("wakeup_at"),
+        consumed_signal_id=resume.consumed_signal_id,
         pool=pool,
     )
     logger.info(
