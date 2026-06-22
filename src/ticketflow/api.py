@@ -1,15 +1,17 @@
-"""HTTP layer for Milestone 0 scaffolding."""
+"""HTTP layer that drives the durable LangGraph/Postgres workflow engine."""
 
 import logging
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from uuid import uuid4
 
 from fastapi import FastAPI, HTTPException, Request
+from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import BaseModel
 
-from ticketflow import config
+from ticketflow import config, db, graph
 from ticketflow.logging import reset_ticket_context, set_ticket_context, setup_logging
-from ticketflow.models import ApprovalDecision, TicketStatus
+from ticketflow.models import ApprovalDecision, Ticket, TicketStatus
 from ticketflow.tracing import instrument_fastapi_app, setup_tracing_components
 
 setup_logging()
@@ -21,9 +23,25 @@ ORCHESTRATION_UNAVAILABLE_DETAIL = "LangGraph/Postgres orchestration is not wire
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    """Reserve a lifecycle hook for future Postgres/LangGraph startup."""
-    _ = app
-    yield
+    """Open the Postgres pool and compile the durable graph for request handlers.
+
+    Mirrors ``runner.main``: bootstrap the schema, open a connection pool, set up
+    the checkpointer, and compile the workflow graph. Handlers read ``compiled``
+    and ``pool`` from ``app.state``.
+    """
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    try:
+        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
+            await saver.setup()
+            app.state.pool = pool
+            app.state.compiled = graph.compile_ticket_graph(
+                graph.default_activities(), saver, pool
+            )
+            yield
+    finally:
+        pool.close()
 
 
 app = FastAPI(title="Ticketflow", lifespan=lifespan)
@@ -100,11 +118,32 @@ async def ready() -> dict[str, object]:
 
 
 @app.post("/tickets", status_code=201)
-async def create_ticket(request: CreateTicketRequest) -> CreateTicketResponse:
-    """Reject ticket creation until the LangGraph runner exists."""
-    _ = request
-    logger.info("Ticket creation requested before orchestration is wired")
-    raise _orchestration_unavailable()
+async def create_ticket(
+    request: Request, body: CreateTicketRequest
+) -> CreateTicketResponse:
+    """Start a durable ticket workflow and return its generated id.
+
+    Seeds the graph checkpoint with one ``ainvoke`` (which enqueues the initial
+    ``classify`` outbox task and parks at ``await_classify``), then records the
+    ``workflow_run`` projection so the runner can lease and advance it.
+    """
+    ticket = Ticket(
+        id=uuid4().hex,
+        customer_email=body.customer_email,
+        subject=body.subject,
+        body=body.body,
+    )
+    compiled = request.app.state.compiled
+    pool = request.app.state.pool
+    cfg = {"configurable": {"thread_id": ticket.id}}
+    out = await compiled.ainvoke(
+        {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+    )
+    db.create_run(
+        ticket.id, status=out["status"], wakeup_at=out.get("wakeup_at"), pool=pool
+    )
+    logger.info("ticket workflow started", extra={"ticket_id": ticket.id})
+    return CreateTicketResponse(ticket_id=ticket.id)
 
 
 @app.get("/tickets")

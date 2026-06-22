@@ -483,6 +483,39 @@ def test_wake_run_opens_and_closes_owned_pool(monkeypatch):
     assert pool.closed is True
 
 
+def test_create_run_inserts_initial_workflow_run():
+    pool = FakePool(opened=True)
+    wakeup_at = datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+
+    db.create_run("ticket-1", status="classifying", wakeup_at=wakeup_at, pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "INSERT INTO workflow_run" in sql
+    assert "ticket_id" in sql
+    assert "status" in sql
+    assert "wakeup_at" in sql
+    assert pool.connection_obj.params[-1] == ("ticket-1", "classifying", wakeup_at)
+    assert pool.connection_obj.commits == 1
+
+
+def test_create_run_accepts_null_wakeup_at():
+    pool = FakePool(opened=True)
+
+    db.create_run("ticket-1", status="received", wakeup_at=None, pool=pool)
+
+    assert pool.connection_obj.params[-1] == ("ticket-1", "received", None)
+
+
+def test_create_run_opens_and_closes_owned_pool(monkeypatch):
+    pool = FakePool()
+    monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
+
+    db.create_run("ticket-1", status="classifying", wakeup_at=None)
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
 def test_add_pending_signal_inserts_signal_and_wakes_run():
     pool = FakePool(opened=True, row=(42,))
 
