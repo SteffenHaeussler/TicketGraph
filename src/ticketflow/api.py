@@ -9,9 +9,14 @@ from fastapi import FastAPI, HTTPException, Request
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from pydantic import BaseModel
 
-from ticketflow import config, db, graph
+from ticketflow import config, db, graph, readmodel
 from ticketflow.logging import reset_ticket_context, set_ticket_context, setup_logging
-from ticketflow.models import ApprovalDecision, Ticket, TicketStatus
+from ticketflow.models import (
+    ApprovalDecision,
+    Ticket,
+    TicketStatus,
+    TicketStatusInfo,
+)
 from ticketflow.tracing import instrument_fastapi_app, setup_tracing_components
 
 setup_logging()
@@ -154,10 +159,34 @@ async def list_tickets(status: TicketStatus) -> ListTicketsResponse:
 
 
 @app.get("/tickets/{ticket_id}")
-async def get_ticket(ticket_id: str):
-    """Reject ticket status queries until workflow runs are stored in Postgres."""
-    _ = ticket_id
-    raise _orchestration_unavailable()
+async def get_ticket(request: Request, ticket_id: str) -> TicketStatusInfo:
+    """Return a ticket's current state from the checkpoint, or the read model.
+
+    The durable LangGraph checkpoint is the live source of truth: a non-empty
+    snapshot yields the full in-flight state. When no checkpoint exists (an
+    unknown thread returns empty ``values``), fall back to the read model's
+    terminal ``ticket_results`` row, and ``404`` when neither knows the ticket.
+    """
+    compiled = request.app.state.compiled
+    pool = request.app.state.pool
+    cfg = {"configurable": {"thread_id": ticket_id}}
+    snapshot = await compiled.aget_state(cfg)
+    values = snapshot.values
+    if values:
+        return TicketStatusInfo(
+            ticket_id=ticket_id,
+            status=values["status"],
+            classification=values.get("classification"),
+            draft=values.get("draft"),
+            decision=values.get("decision"),
+            result=values.get("result"),
+        )
+    result = readmodel.load_result(ticket_id, pool=pool)
+    if result is not None:
+        return TicketStatusInfo(
+            ticket_id=ticket_id, status=result.status, result=result
+        )
+    raise HTTPException(status_code=404, detail="ticket not found")
 
 
 @app.post("/tickets/{ticket_id}/approval")
