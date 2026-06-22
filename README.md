@@ -39,7 +39,7 @@ make install
 Start Postgres:
 
 ```bash
-docker compose up postgres
+make server
 ```
 
 Run the API:
@@ -93,7 +93,12 @@ TICKETFLOW_TRACE_EXPORTER=otlp docker compose --profile tracing up --build
 make check
 make test
 make coverage
+make smoke
 ```
+
+`make smoke` starts the Docker stack, waits for the API, runs the smoke tests,
+and tears the stack down. Use `API_PORT=8010 make smoke` if another local
+service already owns port 8000.
 
 `make check` runs Ruff formatting check, Ruff linting, Pyright, and the normal
 test suite. `make install` also installs a pre-push hook that runs `make check`

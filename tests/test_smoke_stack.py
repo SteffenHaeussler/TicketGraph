@@ -1,4 +1,4 @@
-"""Smoke checks for the Milestone 0 Docker stack.
+"""Smoke checks for the Docker stack.
 
 Excluded from the default `make test` run via the `smoke` marker.
 """
@@ -21,7 +21,7 @@ async def client():
         yield client
 
 
-async def test_health_and_ready_report_milestone_zero(client: httpx.AsyncClient):
+async def test_health_and_ready_report_stack_status(client: httpx.AsyncClient):
     health = await client.get("/health")
     assert health.status_code == 200
 
@@ -32,7 +32,7 @@ async def test_health_and_ready_report_milestone_zero(client: httpx.AsyncClient)
     assert body["orchestration"]["status"] == "not_implemented"
 
 
-async def test_ticket_creation_is_explicitly_unavailable(client: httpx.AsyncClient):
+async def test_ticket_creation_returns_ticket_id(client: httpx.AsyncClient):
     created = await client.post(
         "/tickets",
         json={
@@ -41,7 +41,5 @@ async def test_ticket_creation_is_explicitly_unavailable(client: httpx.AsyncClie
             "body": "I need a refund because my card shows the same charge twice.",
         },
     )
-    assert created.status_code == 503
-    assert created.json()["detail"] == (
-        "LangGraph/Postgres orchestration is not wired yet."
-    )
+    assert created.status_code == 201
+    assert created.json()["ticket_id"]
