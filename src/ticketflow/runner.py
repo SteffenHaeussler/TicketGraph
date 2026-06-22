@@ -35,11 +35,11 @@ from langgraph.types import Command
 from ticketflow import config, db, graph, taskqueue
 from ticketflow.db import _Pool
 from ticketflow.logging import setup_logging
+from ticketflow.signals import APPROVAL_DECISION_SIGNAL
 
 logger = logging.getLogger(__name__)
 
 POLL_INTERVAL_S = 1.0
-APPROVAL_DECISION_SIGNAL = "approval_decision"
 
 
 class _Interrupt(Protocol):

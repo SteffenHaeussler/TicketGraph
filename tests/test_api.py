@@ -8,6 +8,7 @@ from ticketflow import config, db, graph, readmodel
 from ticketflow.api import app
 from ticketflow.models import (
     ActionType,
+    ApprovalDecision,
     Classification,
     DraftReply,
     ProposedAction,
@@ -132,14 +133,23 @@ async def test_create_ticket_seeds_run_and_returns_ticket_id(monkeypatch):
     assert created == [(ticket_id, TicketStatus.CLASSIFYING, wakeup_at, sentinel_pool)]
 
 
-async def test_list_tickets_reports_orchestration_unavailable():
+async def test_list_tickets_queries_workflow_run_status(monkeypatch):
+    sentinel_pool = object()
+    monkeypatch.setattr(app.state, "pool", sentinel_pool, raising=False)
+    calls: list[tuple[object, object]] = []
+
+    def fake_list_runs_by_status(status, *, pool=None, database_url=None):
+        calls.append((status, pool))
+        return ["ticket-1", "ticket-2"]
+
+    monkeypatch.setattr(db, "list_runs_by_status", fake_list_runs_by_status)
+
     async with http_client() as http:
         response = await http.get("/tickets?status=awaiting_approval")
 
-    assert response.status_code == 503
-    assert response.json() == {
-        "detail": "LangGraph/Postgres orchestration is not wired yet."
-    }
+    assert response.status_code == 200
+    assert response.json() == {"ticket_ids": ["ticket-1", "ticket-2"]}
+    assert calls == [(TicketStatus.AWAITING_APPROVAL, sentinel_pool)]
 
 
 async def test_get_ticket_reads_state_from_checkpoint(monkeypatch):
@@ -222,17 +232,68 @@ async def test_get_ticket_returns_404_when_unknown(monkeypatch):
     assert response.json() == {"detail": "ticket not found"}
 
 
-async def test_submit_approval_reports_orchestration_unavailable():
+async def test_submit_approval_writes_pending_signal(monkeypatch):
+    sentinel_pool = object()
+    monkeypatch.setattr(app.state, "pool", sentinel_pool, raising=False)
+    calls: list[tuple[object, ...]] = []
+
+    def fake_add_pending_signal_if_waiting(
+        workflow_id,
+        kind,
+        payload,
+        *,
+        waiting_status,
+        pool=None,
+        database_url=None,
+    ):
+        calls.append((workflow_id, kind, payload, waiting_status, pool))
+        return 42
+
+    monkeypatch.setattr(
+        db, "add_pending_signal_if_waiting", fake_add_pending_signal_if_waiting
+    )
+
+    async with http_client() as http:
+        response = await http.post(
+            "/tickets/ticket-123/approval",
+            json={
+                "approved": True,
+                "approver": "sam@example.com",
+                "note": "Looks good.",
+            },
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {"status": "awaiting_approval"}
+    assert calls == [
+        (
+            "ticket-123",
+            "approval_decision",
+            ApprovalDecision(
+                approved=True, approver="sam@example.com", note="Looks good."
+            ).model_dump(mode="json"),
+            TicketStatus.AWAITING_APPROVAL,
+            sentinel_pool,
+        )
+    ]
+
+
+async def test_submit_approval_returns_409_when_not_awaiting_approval(monkeypatch):
+    monkeypatch.setattr(app.state, "pool", object(), raising=False)
+    monkeypatch.setattr(
+        db,
+        "add_pending_signal_if_waiting",
+        lambda *args, **kwargs: None,
+    )
+
     async with http_client() as http:
         response = await http.post(
             "/tickets/does-not-exist/approval",
             json={"approved": True, "approver": "sam@example.com"},
         )
 
-    assert response.status_code == 503
-    assert response.json() == {
-        "detail": "LangGraph/Postgres orchestration is not wired yet."
-    }
+    assert response.status_code == 409
+    assert response.json() == {"detail": "ticket is not awaiting approval"}
 
 
 @pytest.mark.integration
@@ -374,3 +435,89 @@ async def test_get_ticket_falls_back_to_read_model_through_postgres():
     assert body["ticket_id"] == "terminal-ticket"
     assert body["status"] == "resolved"
     assert body["result"] == result.model_dump(mode="json")
+
+
+@pytest.mark.integration
+async def test_submit_approval_signal_is_consumed_through_postgres():
+    from langchain_core.runnables import RunnableConfig
+
+    from tests.helpers import (
+        ScriptedAgent,
+        billing_classification,
+        drive_until_quiescent,
+        refund_draft,
+    )
+    from ticketflow.activities import TicketActivities
+
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    activities = TicketActivities(
+        ScriptedAgent(billing_classification(), refund_draft())
+    )
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM task_queue")
+            conn.execute("DELETE FROM pending_signal")
+            conn.execute("DELETE FROM workflow_run")
+            conn.commit()
+
+        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
+            await saver.setup()
+            app.state.pool = pool
+            app.state.compiled = graph.compile_ticket_graph(activities, saver, pool)
+
+            async with http_client() as http:
+                created = await http.post(
+                    "/tickets",
+                    json={
+                        "customer_email": "jo@example.com",
+                        "subject": "refund please",
+                        "body": "I was double charged.",
+                    },
+                )
+                ticket_id = created.json()["ticket_id"]
+                cfg: RunnableConfig = {"configurable": {"thread_id": ticket_id}}
+
+                await drive_until_quiescent(
+                    app.state.compiled, pool, activities, ticket_id
+                )
+                awaiting = await app.state.compiled.aget_state(cfg)
+                assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
+
+                approved = await http.post(
+                    f"/tickets/{ticket_id}/approval",
+                    json={
+                        "approved": True,
+                        "approver": "sam@example.com",
+                        "note": "approved in API integration test",
+                    },
+                )
+                await drive_until_quiescent(
+                    app.state.compiled, pool, activities, ticket_id
+                )
+                final = await app.state.compiled.aget_state(cfg)
+
+        with pool.connection() as conn:
+            signal_row = conn.execute(
+                """
+                SELECT consumed, payload
+                FROM pending_signal
+                WHERE workflow_id = %s
+                """,
+                (ticket_id,),
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert approved.status_code == 200
+    assert approved.json() == {"status": "awaiting_approval"}
+    assert final.values["status"] == TicketStatus.RESOLVED
+    assert final.values["decision"] == ApprovalDecision(
+        approved=True,
+        approver="sam@example.com",
+        note="approved in API integration test",
+    )
+    assert signal_row is not None
+    assert signal_row[0] is True
+    assert signal_row[1]["approved"] is True

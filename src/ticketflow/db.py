@@ -16,6 +16,7 @@ TASK_QUEUE_MIGRATION = "001_task_queue"
 READ_MODEL_MIGRATION = "002_read_model"
 WORKFLOW_RUN_MIGRATION = "003_workflow_run"
 PENDING_SIGNAL_MIGRATION = "004_pending_signal"
+PENDING_SIGNAL_UNIQUE_MIGRATION = "005_pending_signal_unique_unconsumed"
 
 
 @dataclass(frozen=True)
@@ -55,6 +56,8 @@ class WorkflowRun:
 
 class _Cursor(Protocol):
     def fetchone(self) -> tuple[Any, ...] | None: ...
+
+    def fetchall(self) -> list[tuple[Any, ...]]: ...
 
 
 class _Connection(Protocol):
@@ -411,6 +414,92 @@ def add_pending_signal(
     return int(row[0])
 
 
+def list_runs_by_status(
+    status: str,
+    *,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> list[str]:
+    """Return workflow ids whose projected run status matches ``status``."""
+    owned_pool = pool is None
+    active_pool = pool or make_pool(database_url)
+    try:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT ticket_id
+                FROM workflow_run
+                WHERE status = %s
+                ORDER BY created_at, ticket_id
+                """,
+                (status,),
+            ).fetchall()
+            conn.commit()
+    finally:
+        if owned_pool:
+            active_pool.close()
+
+    return [str(row[0]) for row in rows]
+
+
+def add_pending_signal_if_waiting(
+    workflow_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    waiting_status: str,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> int | None:
+    """Persist a signal only when its workflow is in ``waiting_status``.
+
+    The conditional insert and wake run in one transaction. A partial unique
+    index on unconsumed signals makes duplicate submissions lose the race and
+    return ``None`` instead of inserting another pending decision.
+    """
+    owned_pool = pool is None
+    active_pool = pool or make_pool(database_url)
+    try:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            row = conn.execute(
+                """
+                WITH waiting AS (
+                    SELECT ticket_id
+                    FROM workflow_run
+                    WHERE ticket_id = %s
+                      AND status = %s
+                    FOR UPDATE
+                ),
+                inserted AS (
+                    INSERT INTO pending_signal (workflow_id, kind, payload)
+                    SELECT ticket_id, %s, %s
+                    FROM waiting
+                    ON CONFLICT (workflow_id, kind) WHERE consumed = false DO NOTHING
+                    RETURNING id, workflow_id
+                ),
+                woken AS (
+                    UPDATE workflow_run
+                    SET wakeup_at = now(),
+                        updated_at = now()
+                    WHERE ticket_id IN (SELECT workflow_id FROM inserted)
+                    RETURNING ticket_id
+                )
+                SELECT id FROM inserted
+                """,
+                (workflow_id, waiting_status, kind, Jsonb(payload)),
+            ).fetchone()
+            conn.commit()
+    finally:
+        if owned_pool:
+            active_pool.close()
+
+    return int(row[0]) if row is not None else None
+
+
 def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> None:
     """Create the migration marker and durable workflow support tables.
 
@@ -571,6 +660,21 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 ON CONFLICT (version) DO NOTHING
                 """,
                 (PENDING_SIGNAL_MIGRATION,),
+            )
+            conn.execute(
+                """
+                CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind
+                ON pending_signal (workflow_id, kind)
+                WHERE consumed = false
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations (version)
+                VALUES (%s)
+                ON CONFLICT (version) DO NOTHING
+                """,
+                (PENDING_SIGNAL_UNIQUE_MIGRATION,),
             )
             conn.commit()
     finally:
