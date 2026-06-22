@@ -25,6 +25,7 @@ dev = [
     "ruff>=0.15.16",
     "pre-commit>=4.6.0",
     "pyright>=1.1.410",
+    "testcontainers[postgres]>=4.14.2",
 ]
 
 [build-system]

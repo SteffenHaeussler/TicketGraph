@@ -140,7 +140,7 @@ RETURNING *;
 
 ## Milestone 7 — Tests & tooling
 
-- [ ] **7.1 Postgres test fixture** (testcontainers or `pytest-postgresql`, isolated schema/test).
+- [x] **7.1 Postgres test fixture** (testcontainers or `pytest-postgresql`, isolated schema/test).
 - [ ] **7.2 Injectable clock** so 24h approval + 30s schedule-to-start fire deterministically.
 - [ ] **7.3 Drive-until-quiescent helper** (in-process runner+worker steps), analogous to today's
   `make_worker`.
