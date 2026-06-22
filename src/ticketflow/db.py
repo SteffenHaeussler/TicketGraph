@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
+from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from ticketflow import config
@@ -14,6 +15,7 @@ BOOTSTRAP_MIGRATION = "000_bootstrap"
 TASK_QUEUE_MIGRATION = "001_task_queue"
 READ_MODEL_MIGRATION = "002_read_model"
 WORKFLOW_RUN_MIGRATION = "003_workflow_run"
+PENDING_SIGNAL_MIGRATION = "004_pending_signal"
 
 
 @dataclass(frozen=True)
@@ -215,6 +217,7 @@ def save_run(
     *,
     status: str,
     wakeup_at: datetime | None,
+    consumed_signal_id: int | None = None,
     database_url: str | None = None,
     pool: _Pool | None = None,
 ) -> None:
@@ -243,6 +246,16 @@ def save_run(
                 """,
                 (status, wakeup_at, ticket_id),
             )
+            if consumed_signal_id is not None:
+                conn.execute(
+                    """
+                    UPDATE pending_signal
+                    SET consumed = true,
+                        consumed_at = now()
+                    WHERE id = %s
+                    """,
+                    (consumed_signal_id,),
+                )
             conn.commit()
     finally:
         if owned_pool:
@@ -283,11 +296,55 @@ def wake_run(
             active_pool.close()
 
 
-def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> None:
-    """Create the migration marker and task queue tables.
+def add_pending_signal(
+    workflow_id: str,
+    kind: str,
+    payload: dict[str, Any],
+    *,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> int:
+    """Persist an unconsumed workflow signal and wake the target run.
 
-    Later milestones add the workflow run table. This function is intentionally
-    idempotent so startup can call it safely.
+    The insert and wake happen in one transaction so a caller cannot commit a
+    signal without making its workflow run claimable.
+    """
+    owned_pool = pool is None
+    active_pool = pool or make_pool(database_url)
+    try:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            row = conn.execute(
+                """
+                INSERT INTO pending_signal (workflow_id, kind, payload)
+                VALUES (%s, %s, %s)
+                RETURNING id
+                """,
+                (workflow_id, kind, Jsonb(payload)),
+            ).fetchone()
+            assert row is not None
+            conn.execute(
+                """
+                UPDATE workflow_run
+                SET wakeup_at = now(),
+                    updated_at = now()
+                WHERE ticket_id = %s
+                """,
+                (workflow_id,),
+            )
+            conn.commit()
+    finally:
+        if owned_pool:
+            active_pool.close()
+
+    return int(row[0])
+
+
+def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> None:
+    """Create the migration marker and durable workflow support tables.
+
+    This function is intentionally idempotent so startup can call it safely.
 
     When no ``pool`` is supplied this owns the pool's lifecycle: it opens it
     before use and closes it afterwards. An injected ``pool`` is assumed to be
@@ -416,6 +473,34 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 ON CONFLICT (version) DO NOTHING
                 """,
                 (WORKFLOW_RUN_MIGRATION,),
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS pending_signal (
+                    id          bigserial   PRIMARY KEY,
+                    workflow_id text        NOT NULL,
+                    kind        text        NOT NULL,
+                    payload     jsonb       NOT NULL,
+                    consumed    boolean     NOT NULL DEFAULT false,
+                    created_at  timestamptz NOT NULL DEFAULT now(),
+                    consumed_at timestamptz
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed
+                ON pending_signal (workflow_id, kind, created_at, id)
+                WHERE consumed = false
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations (version)
+                VALUES (%s)
+                ON CONFLICT (version) DO NOTHING
+                """,
+                (PENDING_SIGNAL_MIGRATION,),
             )
             conn.commit()
     finally:
