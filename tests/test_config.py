@@ -12,6 +12,7 @@ def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
     monkeypatch.setenv("AGENT_MAX_CONCURRENT", "7")
     monkeypatch.setenv("AGENT_SCHEDULE_TO_START_S", "4.5")
     monkeypatch.setenv("MOCK_AGENT_LATENCY_MAX_S", "3.25")
+    monkeypatch.setenv("TICKETFLOW_JANITOR_INTERVAL_S", "2.5")
     monkeypatch.setenv("TICKETFLOW_LOG_FORMAT", "json")
     monkeypatch.setenv("TICKETFLOW_LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("TICKETFLOW_LOG_FIELDS", "level,message,task_queue")
@@ -28,6 +29,7 @@ def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
     assert reloaded.AGENT_MAX_CONCURRENT == 7
     assert reloaded.AGENT_SCHEDULE_TO_START_S == 4.5
     assert reloaded.MOCK_AGENT_LATENCY_MAX_S == 3.25
+    assert reloaded.JANITOR_INTERVAL_S == 2.5
     assert reloaded.LOG_FORMAT == "json"
     assert reloaded.LOG_LEVEL == "DEBUG"
     assert reloaded.LOG_FIELDS == ["level", "message", "task_queue"]
@@ -42,6 +44,7 @@ def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
     monkeypatch.delenv("AGENT_MAX_CONCURRENT")
     monkeypatch.delenv("AGENT_SCHEDULE_TO_START_S")
     monkeypatch.delenv("MOCK_AGENT_LATENCY_MAX_S")
+    monkeypatch.delenv("TICKETFLOW_JANITOR_INTERVAL_S")
     monkeypatch.delenv("TICKETFLOW_LOG_FORMAT")
     monkeypatch.delenv("TICKETFLOW_LOG_LEVEL")
     monkeypatch.delenv("TICKETFLOW_LOG_FIELDS")
@@ -69,6 +72,10 @@ def test_config_agent_settings_default_to_local_demo_values():
     assert config.AGENT_MAX_CONCURRENT == 20
     assert config.AGENT_SCHEDULE_TO_START_S == 30.0
     assert config.MOCK_AGENT_LATENCY_MAX_S == 0.0
+
+
+def test_config_janitor_interval_defaults_to_five_seconds():
+    assert config.JANITOR_INTERVAL_S == 5.0
 
 
 def test_config_reads_postgres_settings_from_dotenv(tmp_path, monkeypatch):

@@ -212,6 +212,41 @@ def claim_run(
     return _run_from_row(row) if row is not None else None
 
 
+def reclaim_expired_runs(
+    *,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> int:
+    """Clear expired workflow-run leases so another runner can claim them."""
+    owned_pool = pool is None
+    active_pool = pool or make_pool(database_url)
+    try:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            row = conn.execute(
+                """
+                WITH reclaimed AS (
+                    UPDATE workflow_run
+                    SET lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        updated_at = now()
+                    WHERE lease_expires_at < now()
+                    RETURNING ticket_id
+                )
+                SELECT count(*) FROM reclaimed
+                """,
+                (),
+            ).fetchone()
+            conn.commit()
+    finally:
+        if owned_pool:
+            active_pool.close()
+
+    assert row is not None
+    return int(row[0])
+
+
 def save_run(
     ticket_id: str,
     *,

@@ -32,7 +32,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import Command
 
-from ticketflow import config, db, graph
+from ticketflow import config, db, graph, taskqueue
 from ticketflow.db import _Pool
 from ticketflow.logging import setup_logging
 
@@ -65,6 +65,14 @@ class _ResumeValue:
 
     payload: Any
     consumed_signal_id: int | None = None
+
+
+@dataclass(frozen=True)
+class JanitorResult:
+    """Counts of expired leases reclaimed by one janitor pass."""
+
+    tasks: int
+    runs: int
 
 
 def _thread_config(ticket_id: str) -> RunnableConfig:
@@ -233,12 +241,29 @@ async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
     return True
 
 
+def reclaim_expired_leases(pool: _Pool) -> JanitorResult:
+    """Reclaim expired task and workflow-run leases."""
+    with pool.connection() as conn:
+        tasks = taskqueue.reclaim_expired(conn)
+        conn.commit()
+
+    runs = db.reclaim_expired_runs(pool=pool)
+    result = JanitorResult(tasks=tasks, runs=runs)
+    if tasks or runs:
+        logger.info(
+            "reclaimed expired leases",
+            extra={"tasks_reclaimed": tasks, "runs_reclaimed": runs},
+        )
+    return result
+
+
 async def run_forever(
     compiled: _Graph,
     pool: _Pool,
     worker_id: str,
     *,
     poll_interval: float = POLL_INTERVAL_S,
+    janitor_interval: float = config.JANITOR_INTERVAL_S,
     stop: Callable[[], bool] | None = None,
 ) -> None:
     """Poll for runnable runs, advancing them until ``stop`` (or cancellation).
@@ -246,7 +271,14 @@ async def run_forever(
     Sleeps ``poll_interval`` whenever a tick finds no work so an idle runner does
     not spin. A claimed-but-not-ready run also counts as no work.
     """
+    loop = asyncio.get_running_loop()
+    next_janitor_at = 0.0
     while stop is None or not stop():
+        now = loop.time()
+        if now >= next_janitor_at:
+            reclaim_expired_leases(pool)
+            next_janitor_at = now + janitor_interval
+
         advanced = await step(compiled, pool, worker_id)
         if not advanced:
             await asyncio.sleep(poll_interval)
