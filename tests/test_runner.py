@@ -6,12 +6,13 @@ integration test drives a seeded run ``received -> resolved`` purely through
 ``runner.step`` interleaved with the worker stub, against real Postgres.
 """
 
-from datetime import UTC, datetime
+import uuid
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 import pytest
 
-from tests.helpers import drive_until_quiescent
+from tests.helpers import billing_classification, drive_until_quiescent, refund_draft
 from tests.test_db import FakeConnection, FakePool
 from ticketflow import config, db, runner
 from ticketflow.db import WorkflowRun
@@ -151,6 +152,35 @@ async def test_step_resumes_when_result_is_ready(monkeypatch):
     assert saved == [{"ticket_id": "t-1", "status": "drafting", "wakeup_at": None}]
 
 
+async def test_step_resumes_due_run_with_timeout_when_result_not_ready(monkeypatch):
+    due_at = datetime(2026, 6, 16, 12, 0, tzinfo=UTC)
+    run = make_run(wakeup_at=due_at)
+    snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
+    compiled = FakeCompiled(
+        snapshot, invoke_result={"status": "classifying", "wakeup_at": due_at}
+    )
+    pool = FakePool(opened=True, row=None)  # no stored task result yet
+
+    monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        db,
+        "save_run",
+        lambda ticket_id, *, status, wakeup_at, pool, consumed_signal_id=None: (
+            saved.append(
+                {"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at}
+            )
+        ),
+    )
+
+    advanced = await runner.step(compiled, pool, "runner-1")
+
+    assert advanced is True
+    assert len(compiled.invoked_with) == 1
+    assert compiled.invoked_with[0].resume == {"kind": "timeout"}
+    assert saved == [{"ticket_id": "t-1", "status": "classifying", "wakeup_at": due_at}]
+
+
 async def test_step_resumes_approval_signal_and_marks_it_consumed(monkeypatch):
     run = make_run(status="awaiting_approval")
     envelope = {"kind": "approval_required", "ticket_id": "t-1"}
@@ -194,8 +224,78 @@ async def test_step_resumes_approval_signal_and_marks_it_consumed(monkeypatch):
     ]
 
 
+async def test_step_prefers_ready_result_over_due_timeout(monkeypatch):
+    due_at = datetime(2026, 6, 16, 12, 0, tzinfo=UTC)
+    run = make_run(wakeup_at=due_at)
+    snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
+    compiled = FakeCompiled(
+        snapshot, invoke_result={"status": "drafting", "wakeup_at": None}
+    )
+    pool = FakePool(opened=True, row=({"category": "billing"},))
+
+    monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        db,
+        "save_run",
+        lambda ticket_id, *, status, wakeup_at, pool, consumed_signal_id=None: (
+            saved.append(
+                {"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at}
+            )
+        ),
+    )
+
+    advanced = await runner.step(compiled, pool, "runner-1")
+
+    assert advanced is True
+    assert compiled.invoked_with[0].resume == {"category": "billing"}
+    assert saved == [{"ticket_id": "t-1", "status": "drafting", "wakeup_at": None}]
+
+
+async def test_step_clears_stale_wakeup_after_timeout_reinterrupt(monkeypatch):
+    due_at = datetime(2026, 6, 16, 12, 0, tzinfo=UTC)
+    run = make_run(wakeup_at=due_at)
+    snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
+    compiled = FakeCompiled(
+        snapshot,
+        invoke_result={
+            "status": "classifying",
+            "wakeup_at": due_at,
+            "__interrupt__": [
+                FakeInterrupt(
+                    {
+                        "idempotency_key": "t-1:classify:fallback",
+                        "task_type": "classify",
+                        "workflow_id": "t-1",
+                        "queue": "ticketflow-agent-fallback",
+                    }
+                )
+            ],
+        },
+    )
+    pool = FakePool(opened=True, row=None)
+
+    monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
+    saved: list[dict] = []
+    monkeypatch.setattr(
+        db,
+        "save_run",
+        lambda ticket_id, *, status, wakeup_at, pool, consumed_signal_id=None: (
+            saved.append(
+                {"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at}
+            )
+        ),
+    )
+
+    advanced = await runner.step(compiled, pool, "runner-1")
+
+    assert advanced is True
+    assert compiled.invoked_with[0].resume == {"kind": "timeout"}
+    assert saved == [{"ticket_id": "t-1", "status": "classifying", "wakeup_at": None}]
+
+
 async def test_step_releases_without_advancing_when_result_not_ready(monkeypatch):
-    run = make_run(wakeup_at=datetime(2026, 6, 16, 12, 0, tzinfo=UTC))
+    run = make_run(wakeup_at=datetime.now(UTC) + timedelta(hours=1))
     snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
     compiled = FakeCompiled(snapshot)
     pool = FakePool(opened=True, row=None)  # no stored task result yet
@@ -255,7 +355,7 @@ async def test_runner_drives_a_seeded_run_to_resolved_through_postgres():
         )
     )
     ticket = Ticket(
-        id="t-runner",
+        id=f"t-runner-{uuid.uuid4().hex}",
         customer_email="customer@example.com",
         subject="Need help",
         body="My login keeps failing and I want it fixed.",
@@ -264,9 +364,9 @@ async def test_runner_drives_a_seeded_run_to_resolved_through_postgres():
 
     try:
         with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue WHERE workflow_id = %s", (ticket.id,))
+            conn.execute("DELETE FROM task_queue")
             # claim_run leases the oldest claimable run table-wide, so isolate
-            # this run from any leftover rows other tests left behind.
+            # this run and its tasks from leftover rows other tests left behind.
             conn.execute("DELETE FROM workflow_run")
             conn.commit()
 
@@ -328,7 +428,7 @@ async def test_runner_delivers_approval_signal_through_postgres():
     pool = db.make_pool()
     pool.open()
     ticket = Ticket(
-        id="t-runner-approval",
+        id=f"t-runner-approval-{uuid.uuid4().hex}",
         customer_email="customer@example.com",
         subject="Refund request",
         body="I was charged twice and need a refund.",
@@ -341,7 +441,7 @@ async def test_runner_delivers_approval_signal_through_postgres():
 
     try:
         with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue WHERE workflow_id = %s", (ticket.id,))
+            conn.execute("DELETE FROM task_queue")
             conn.execute(
                 "DELETE FROM pending_signal WHERE workflow_id = %s", (ticket.id,)
             )
@@ -393,3 +493,156 @@ async def test_runner_delivers_approval_signal_through_postgres():
     assert final.values["decision"] == decision
     assert row is not None
     assert row[0] is True
+
+
+@pytest.mark.integration
+async def test_runner_timeout_redispatches_due_agent_task_to_fallback():
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from ticketflow import graph
+    from ticketflow.activities import TicketActivities
+    from ticketflow.agent.mock import MockAgent
+    from ticketflow.models import Ticket, TicketStatus
+
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    activities = TicketActivities(MockAgent(seed=1, failure_rate=0.0))
+    ticket = Ticket(
+        id=f"t-runner-timeout-fallback-{uuid.uuid4().hex}",
+        customer_email="customer@example.com",
+        subject="Need help",
+        body="My login keeps failing and I want it fixed.",
+    )
+    cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
+
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM task_queue")
+            conn.execute("DELETE FROM workflow_run")
+            conn.commit()
+
+        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
+            await saver.setup()
+            compiled = graph.compile_ticket_graph(activities, saver, pool)
+
+            out = await compiled.ainvoke(
+                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+            )
+            assert "__interrupt__" in out
+            with pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                    "VALUES (%s, %s, now() - interval '1 second')",
+                    (ticket.id, TicketStatus.CLASSIFYING),
+                )
+                conn.commit()
+
+            advanced = await runner.step(compiled, pool, "runner-1")
+            snapshot = await compiled.aget_state(cfg)
+
+        with pool.connection() as conn:
+            run_row = conn.execute(
+                "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+                "FROM workflow_run WHERE ticket_id = %s",
+                (ticket.id,),
+            ).fetchone()
+            fallback_row = conn.execute(
+                "SELECT queue_name, status FROM task_queue "
+                "WHERE workflow_id = %s AND idempotency_key = %s",
+                (ticket.id, f"{ticket.id}:classify:fallback"),
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert advanced is True
+    assert snapshot.interrupts[0].value["queue"] == config.FALLBACK_TASK_QUEUE
+    assert run_row is not None
+    assert run_row[0] == "classifying"
+    assert run_row[1] is None
+    assert run_row[2] is None
+    assert run_row[3] is None
+    assert fallback_row == (config.FALLBACK_TASK_QUEUE, "pending")
+
+
+@pytest.mark.integration
+async def test_runner_timeout_escalates_due_approval_and_clears_wakeup():
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+    from langgraph.types import Command
+
+    from ticketflow import graph
+    from ticketflow.activities import TicketActivities
+    from ticketflow.agent.mock import MockAgent
+    from ticketflow.models import Ticket, TicketStatus
+
+    db.bootstrap()
+    pool = db.make_pool()
+    pool.open()
+    activities = TicketActivities(MockAgent(seed=1, failure_rate=0.0))
+    ticket = Ticket(
+        id=f"t-runner-timeout-approval-{uuid.uuid4().hex}",
+        customer_email="customer@example.com",
+        subject="Refund request",
+        body="I want a refund.",
+    )
+    cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
+
+    try:
+        with pool.connection() as conn:
+            conn.execute("DELETE FROM task_queue")
+            conn.execute("DELETE FROM workflow_run")
+            conn.commit()
+
+        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
+            await saver.setup()
+            compiled = graph.compile_ticket_graph(activities, saver, pool)
+
+            await compiled.ainvoke(
+                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+            )
+            await compiled.ainvoke(
+                Command(resume=billing_classification().model_dump(mode="json")),
+                cfg,
+            )
+            out = await compiled.ainvoke(
+                Command(resume=refund_draft().model_dump(mode="json")),
+                cfg,
+            )
+            assert "__interrupt__" in out
+            assert out["__interrupt__"][0].value["kind"] == "approval_required"
+            with pool.connection() as conn:
+                conn.execute(
+                    "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                    "VALUES (%s, %s, now() - interval '1 second')",
+                    (ticket.id, TicketStatus.AWAITING_APPROVAL),
+                )
+                conn.commit()
+
+            advanced = await runner.step(compiled, pool, "runner-1")
+            snapshot = await compiled.aget_state(cfg)
+
+        with pool.connection() as conn:
+            run_row = conn.execute(
+                "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+                "FROM workflow_run WHERE ticket_id = %s",
+                (ticket.id,),
+            ).fetchone()
+            terminal_row = conn.execute(
+                "SELECT queue_name, task_type, status FROM task_queue "
+                "WHERE workflow_id = %s AND idempotency_key = %s",
+                (ticket.id, f"{ticket.id}:finalize"),
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert advanced is True
+    assert snapshot.interrupts[0].value["kind"] == "terminal_task"
+    assert snapshot.values["status"] == TicketStatus.ESCALATED
+    assert run_row is not None
+    assert run_row[0] == "escalated"
+    assert run_row[1] is None
+    assert run_row[2] is None
+    assert run_row[3] is None
+    assert terminal_row == (config.TASK_QUEUE, "finalize_ticket", "pending")

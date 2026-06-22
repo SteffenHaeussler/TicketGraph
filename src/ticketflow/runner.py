@@ -13,9 +13,8 @@ dispatch nodes) each commit in their own transaction, while the runner's own
 Crash-safety comes from idempotency keys (re-enqueue is a no-op) and lease
 re-claim re-deriving state from the durable checkpoint.
 
-The runner resumes only when the awaited task result or approval signal is
-*ready*. Resuming on an elapsed timer (``{"kind": "timeout"}``) is Milestone
-4.3; until then a claimed-but-not-ready run is released as a no-op.
+The runner resumes when the awaited task result or approval signal is ready, or
+when a durable timer is due and should resume with ``{"kind": "timeout"}``.
 """
 
 from __future__ import annotations
@@ -26,6 +25,7 @@ import socket
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Callable, Protocol
 
 from langchain_core.runnables import RunnableConfig
@@ -136,6 +136,58 @@ def _resume_value(conn: Any, envelope: dict[str, Any]) -> _ResumeValue | None:
     return _ResumeValue(row[0]) if row is not None else None
 
 
+def _resume_for_run(
+    conn: Any, envelope: dict[str, Any], wakeup_at: datetime | None
+) -> _ResumeValue | None:
+    """Return a ready task/signal value, a due timer envelope, or ``None``.
+
+    ``db.claim_run`` should only return rows whose ``wakeup_at`` is null or due,
+    and the explicit due check keeps this helper correct for tests and defensive
+    callers. A stored task result wins that race so a late-but-ready primary
+    result is not needlessly redispatched to fallback.
+    """
+    resume = _resume_value(conn, envelope)
+    if resume is not None:
+        return resume
+    if _timer_is_due(wakeup_at):
+        return _ResumeValue({"kind": "timeout"})
+    return None
+
+
+def _timer_is_due(wakeup_at: datetime | None) -> bool:
+    """Whether a durable timer should resume the parked graph now."""
+    if wakeup_at is None:
+        return False
+    return wakeup_at <= datetime.now(wakeup_at.tzinfo)
+
+
+def _interrupt_envelope_from_output(output: dict[str, Any]) -> dict[str, Any] | None:
+    """Return the first interrupt envelope emitted by ``ainvoke`` if present."""
+    interrupts = output.get("__interrupt__")
+    if not interrupts:
+        return None
+    value = interrupts[0].value
+    return value if isinstance(value, dict) else None
+
+
+def _parse_wakeup_at(value: Any) -> datetime | None:
+    """Parse an interrupt ``wakeup_at`` value from the graph output."""
+    if value is None or isinstance(value, datetime):
+        return value
+    if isinstance(value, str):
+        return datetime.fromisoformat(value)
+    raise TypeError(f"unexpected wakeup_at value: {value!r}")
+
+
+def _next_wakeup_at(output: dict[str, Any], resume: _ResumeValue) -> datetime | None:
+    """The ``workflow_run.wakeup_at`` value to persist after a graph step."""
+    if resume.payload == {"kind": "timeout"}:
+        envelope = _interrupt_envelope_from_output(output)
+        if envelope is not None:
+            return _parse_wakeup_at(envelope.get("wakeup_at"))
+    return output.get("wakeup_at")
+
+
 async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
     """Advance at most one runnable workflow run by one resume.
 
@@ -154,11 +206,11 @@ async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
     resume: _ResumeValue | None = None
     if envelope is not None:
         with pool.connection() as conn:
-            resume = _resume_value(conn, envelope)
+            resume = _resume_for_run(conn, envelope, run.wakeup_at)
 
     if envelope is None or resume is None:
-        # Not actionable yet (no task result or approval signal). Release the
-        # lease, leaving status/wakeup_at untouched.
+        # Not actionable yet (no task result, approval signal, or due timer).
+        # Release the lease, leaving status/wakeup_at untouched.
         db.save_run(
             run.ticket_id,
             status=run.status,
@@ -171,7 +223,7 @@ async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
     db.save_run(
         run.ticket_id,
         status=out["status"],
-        wakeup_at=out.get("wakeup_at"),
+        wakeup_at=_next_wakeup_at(out, resume),
         consumed_signal_id=resume.consumed_signal_id,
         pool=pool,
     )
