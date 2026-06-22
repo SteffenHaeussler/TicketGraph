@@ -15,7 +15,7 @@ from tests.helpers import (
 from ticketflow import agent_worker, config, db, taskqueue
 from ticketflow.activities import TicketActivities
 from ticketflow.agent.base import AgentOverloadedError, AgentPermanentError
-from ticketflow.models import Classification, Ticket, TicketStatus
+from ticketflow.models import Classification, Ticket, TicketResult, TicketStatus
 
 
 class FakeConnection:
@@ -198,6 +198,67 @@ async def test_process_one_task_fails_unknown_task_and_wakes_run(monkeypatch) ->
 
     assert processed is True
     assert failures == [(7, "unexpected agent task_type 'finalize_ticket'", False)]
+    assert pool.connection_obj.commits == 1
+    assert woken == ["ticket-123"]
+
+
+async def test_process_one_task_uses_custom_activity_router(monkeypatch) -> None:
+    task = queued_task(task_type="finalize_ticket", payload={"ticket": {}})
+    pool = FakePool()
+    routed: list[str] = []
+    completed: list[dict[str, Any]] = []
+    failures: list[str] = []
+    woken: list[str] = []
+
+    async def run_activity(
+        task: db.QueuedTask, activities: TicketActivities
+    ) -> TicketResult:
+        _ = activities
+        routed.append(task.task_type)
+        return TicketResult(
+            ticket_id=task.workflow_id,
+            status=TicketStatus.RESOLVED,
+            reply_text="handled by custom router",
+        )
+
+    monkeypatch.setattr(agent_worker.db, "dequeue", lambda *args, **kwargs: task)
+    monkeypatch.setattr(
+        agent_worker.taskqueue,
+        "complete",
+        lambda conn, task_id, *, result: completed.append(result) or "done",
+    )
+    monkeypatch.setattr(
+        agent_worker.taskqueue,
+        "fail",
+        lambda conn, task_id, *, error, permanent=False: (
+            failures.append(error) or "failed"
+        ),
+    )
+
+    def wake_run(ticket_id: str, *, pool: object) -> None:
+        _ = pool
+        woken.append(ticket_id)
+
+    monkeypatch.setattr(agent_worker.db, "wake_run", wake_run)
+
+    processed = await agent_worker.process_one_task(
+        pool,
+        TicketActivities(ScriptedAgent(billing_classification(), refund_draft())),
+        run_activity=run_activity,
+    )
+
+    assert processed is True
+    assert routed == ["finalize_ticket"]
+    assert completed == [
+        {
+            "ticket_id": "ticket-123",
+            "status": "resolved",
+            "reply_text": "handled by custom router",
+            "refund_executed": False,
+            "model_path": "primary/primary",
+        }
+    ]
+    assert failures == []
     assert pool.connection_obj.commits == 1
     assert woken == ["ticket-123"]
 
