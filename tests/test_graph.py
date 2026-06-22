@@ -15,7 +15,7 @@ from langgraph.types import Command
 
 from tests.helpers import process_one_task
 from tests.test_db import FakePool
-from ticketflow import config, graph
+from ticketflow import config, db, graph
 from ticketflow.activities import TicketActivities
 from ticketflow.agent.mock import MockAgent
 from ticketflow.models import (
@@ -594,14 +594,11 @@ async def test_timeout_resume_sends_and_records_escalation_reply() -> None:
 
 
 @pytest.mark.integration
-async def test_dispatch_loop_resolves_through_real_postgres() -> None:
+async def test_dispatch_loop_resolves_through_real_postgres(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+) -> None:
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-    from ticketflow import db
-
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
     activities = TicketActivities(
         MockAgent(
             seed=1, failure_rate=0.0, refund_rate=0.0, confidence_range=(0.8, 1.0)
@@ -610,40 +607,33 @@ async def test_dispatch_loop_resolves_through_real_postgres() -> None:
     ticket = make_ticket("t-dispatch")
     cfg = config_for(ticket.id)
 
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue WHERE workflow_id = %s", (ticket.id,))
-            conn.commit()
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            compiled = graph.compile_ticket_graph(activities, saver, pool)
+        out = await compiled.ainvoke(
+            {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        )
+        # The graph suspended after enqueueing the classify task.
+        assert "__interrupt__" in out
+        assert _pending_keys(postgres_pool, ticket.id) == [f"{ticket.id}:classify"]
 
-            out = await compiled.ainvoke(
-                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        # Drive the dispatch -> worker -> resume loop to completion.
+        while "__interrupt__" in out:
+            interrupt = out["__interrupt__"][0].value
+            key = interrupt["idempotency_key"]
+            assert await process_one_task(
+                postgres_pool, activities, queue_name=interrupt["queue"]
             )
-            # The graph suspended after enqueueing the classify task.
-            assert "__interrupt__" in out
-            assert _pending_keys(pool, ticket.id) == [f"{ticket.id}:classify"]
+            result = _task_result(postgres_pool, key)
+            out = await compiled.ainvoke(Command(resume=result), cfg)
 
-            # Drive the dispatch -> worker -> resume loop to completion.
-            while "__interrupt__" in out:
-                interrupt = out["__interrupt__"][0].value
-                key = interrupt["idempotency_key"]
-                assert await process_one_task(
-                    pool, activities, queue_name=interrupt["queue"]
-                )
-                result = _task_result(pool, key)
-                out = await compiled.ainvoke(Command(resume=result), cfg)
+        assert out["status"] == TicketStatus.RESOLVED
 
-            assert out["status"] == TicketStatus.RESOLVED
-
-        # A fresh saver (new connection) proves the run is durable in Postgres.
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as fresh:
-            reopened = graph.compile_ticket_graph(activities, fresh, pool)
-            snapshot = await reopened.aget_state(cfg)
-    finally:
-        pool.close()
+    # A fresh saver (new connection) proves the run is durable in Postgres.
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as fresh:
+        reopened = graph.compile_ticket_graph(activities, fresh, postgres_pool)
+        snapshot = await reopened.aget_state(cfg)
 
     state = snapshot.values
     assert state["status"] == TicketStatus.RESOLVED
@@ -653,14 +643,11 @@ async def test_dispatch_loop_resolves_through_real_postgres() -> None:
 
 
 @pytest.mark.integration
-async def test_schedule_to_start_timeout_routes_to_fallback_through_postgres() -> None:
+async def test_schedule_to_start_timeout_routes_to_fallback_through_postgres(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+) -> None:
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-    from ticketflow import db
-
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
     activities = TicketActivities(
         MockAgent(
             seed=1, failure_rate=0.0, refund_rate=0.0, confidence_range=(0.8, 1.0)
@@ -669,54 +656,51 @@ async def test_schedule_to_start_timeout_routes_to_fallback_through_postgres() -
     ticket = make_ticket("t-fb")
     cfg = config_for(ticket.id)
 
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue WHERE workflow_id = %s", (ticket.id,))
-            conn.commit()
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            compiled = graph.compile_ticket_graph(activities, saver, pool)
+        out = await compiled.ainvoke(
+            {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        )
+        # Suspended at the classify dispatch with only the primary task pending.
+        assert "__interrupt__" in out
+        assert _pending_keys(postgres_pool, ticket.id) == [f"{ticket.id}:classify"]
 
-            out = await compiled.ainvoke(
-                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
-            )
-            # Suspended at the classify dispatch with only the primary task pending.
-            assert "__interrupt__" in out
-            assert _pending_keys(pool, ticket.id) == [f"{ticket.id}:classify"]
+        # No primary worker picked it up; the schedule-to-start timer fires.
+        out = await compiled.ainvoke(Command(resume={"kind": "timeout"}), cfg)
+        assert "__interrupt__" in out
+        assert out["__interrupt__"][0].value["queue"] == config.FALLBACK_TASK_QUEUE
+        assert _pending_keys(postgres_pool, ticket.id) == [
+            f"{ticket.id}:classify:fallback"
+        ]
 
-            # No primary worker picked it up; the schedule-to-start timer fires.
-            out = await compiled.ainvoke(Command(resume={"kind": "timeout"}), cfg)
-            assert "__interrupt__" in out
-            assert out["__interrupt__"][0].value["queue"] == config.FALLBACK_TASK_QUEUE
-            assert _pending_keys(pool, ticket.id) == [f"{ticket.id}:classify:fallback"]
+        # The unthrottled fallback worker drains it; resume with its result.
+        assert await process_one_task(
+            postgres_pool, activities, queue_name=config.FALLBACK_TASK_QUEUE
+        )
+        out = await compiled.ainvoke(
+            Command(
+                resume=_task_result(postgres_pool, f"{ticket.id}:classify:fallback")
+            ),
+            cfg,
+        )
 
-            # The unthrottled fallback worker drains it; resume with its result.
-            assert await process_one_task(
-                pool, activities, queue_name=config.FALLBACK_TASK_QUEUE
-            )
-            out = await compiled.ainvoke(
-                Command(resume=_task_result(pool, f"{ticket.id}:classify:fallback")),
-                cfg,
-            )
-
-            # Drive the remaining dispatch(es) to completion through the primary
-            # queue. An orphaned primary copy of the classify task may also be
-            # pending, so drain until the awaited task has produced its result.
-            while "__interrupt__" in out:
-                interrupt = out["__interrupt__"][0].value
-                key = interrupt["idempotency_key"]
-                while _result_for(pool, key) is None:
-                    assert await process_one_task(
-                        pool, activities, queue_name=interrupt["queue"]
-                    )
-                out = await compiled.ainvoke(
-                    Command(resume=_result_for(pool, key)), cfg
+        # Drive the remaining dispatch(es) to completion through the primary
+        # queue. An orphaned primary copy of the classify task may also be
+        # pending, so drain until the awaited task has produced its result.
+        while "__interrupt__" in out:
+            interrupt = out["__interrupt__"][0].value
+            key = interrupt["idempotency_key"]
+            while _result_for(postgres_pool, key) is None:
+                assert await process_one_task(
+                    postgres_pool, activities, queue_name=interrupt["queue"]
                 )
+            out = await compiled.ainvoke(
+                Command(resume=_result_for(postgres_pool, key)), cfg
+            )
 
-            assert out["status"] == TicketStatus.RESOLVED
-    finally:
-        pool.close()
+        assert out["status"] == TicketStatus.RESOLVED
 
 
 def _pending_keys(pool: object, workflow_id: str) -> list[str]:

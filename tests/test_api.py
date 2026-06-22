@@ -297,50 +297,41 @@ async def test_submit_approval_returns_409_when_not_awaiting_approval(monkeypatc
 
 
 @pytest.mark.integration
-async def test_create_ticket_persists_workflow_run_and_outbox_through_postgres():
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue")
-            conn.execute("DELETE FROM workflow_run")
-            conn.commit()
+async def test_create_ticket_persists_workflow_run_and_outbox_through_postgres(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        app.state.pool = postgres_pool
+        app.state.compiled = graph.compile_ticket_graph(
+            graph.default_activities(), saver, postgres_pool
+        )
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            app.state.pool = pool
-            app.state.compiled = graph.compile_ticket_graph(
-                graph.default_activities(), saver, pool
+        async with http_client() as http:
+            response = await http.post(
+                "/tickets",
+                json={
+                    "customer_email": "jo@example.com",
+                    "subject": "refund please",
+                    "body": "I was double charged.",
+                },
             )
 
-            async with http_client() as http:
-                response = await http.post(
-                    "/tickets",
-                    json={
-                        "customer_email": "jo@example.com",
-                        "subject": "refund please",
-                        "body": "I was double charged.",
-                    },
-                )
+    assert response.status_code == 201
+    ticket_id = response.json()["ticket_id"]
+    assert ticket_id
 
-        assert response.status_code == 201
-        ticket_id = response.json()["ticket_id"]
-        assert ticket_id
-
-        with pool.connection() as conn:
-            run = conn.execute(
-                "SELECT status, wakeup_at, lease_owner FROM workflow_run "
-                "WHERE ticket_id = %s",
-                (ticket_id,),
-            ).fetchone()
-            task = conn.execute(
-                "SELECT queue_name, task_type, status, idempotency_key "
-                "FROM task_queue WHERE workflow_id = %s",
-                (ticket_id,),
-            ).fetchone()
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        run = conn.execute(
+            "SELECT status, wakeup_at, lease_owner FROM workflow_run "
+            "WHERE ticket_id = %s",
+            (ticket_id,),
+        ).fetchone()
+        task = conn.execute(
+            "SELECT queue_name, task_type, status, idempotency_key "
+            "FROM task_queue WHERE workflow_id = %s",
+            (ticket_id,),
+        ).fetchone()
 
     # workflow_run projection: parked at classifying with a future timer, unleased.
     assert run is not None
@@ -357,40 +348,31 @@ async def test_create_ticket_persists_workflow_run_and_outbox_through_postgres()
 
 
 @pytest.mark.integration
-async def test_get_ticket_reads_state_through_postgres_checkpoint():
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue")
-            conn.execute("DELETE FROM workflow_run")
-            conn.commit()
+async def test_get_ticket_reads_state_through_postgres_checkpoint(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        app.state.pool = postgres_pool
+        app.state.compiled = graph.compile_ticket_graph(
+            graph.default_activities(), saver, postgres_pool
+        )
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            app.state.pool = pool
-            app.state.compiled = graph.compile_ticket_graph(
-                graph.default_activities(), saver, pool
+        async with http_client() as http:
+            created = await http.post(
+                "/tickets",
+                json={
+                    "customer_email": "jo@example.com",
+                    "subject": "refund please",
+                    "body": "I was double charged.",
+                },
             )
+            ticket_id = created.json()["ticket_id"]
 
-            async with http_client() as http:
-                created = await http.post(
-                    "/tickets",
-                    json={
-                        "customer_email": "jo@example.com",
-                        "subject": "refund please",
-                        "body": "I was double charged.",
-                    },
-                )
-                ticket_id = created.json()["ticket_id"]
+            response = await http.get(f"/tickets/{ticket_id}")
 
-                response = await http.get(f"/tickets/{ticket_id}")
-
-                # A ticket that never started has no checkpoint and no result.
-                missing = await http.get("/tickets/never-existed")
-    finally:
-        pool.close()
+            # A ticket that never started has no checkpoint and no result.
+            missing = await http.get("/tickets/never-existed")
 
     # The status is read straight from the durable checkpoint.
     assert response.status_code == 200
@@ -403,32 +385,27 @@ async def test_get_ticket_reads_state_through_postgres_checkpoint():
 
 
 @pytest.mark.integration
-async def test_get_ticket_falls_back_to_read_model_through_postgres():
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    try:
-        readmodel.clear(pool=pool)
-        result = TicketResult(
-            ticket_id="terminal-ticket",
-            status=TicketStatus.RESOLVED,
-            reply_text="Refund issued.",
-            refund_executed=True,
+async def test_get_ticket_falls_back_to_read_model_through_postgres(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
+    result = TicketResult(
+        ticket_id="terminal-ticket",
+        status=TicketStatus.RESOLVED,
+        reply_text="Refund issued.",
+        refund_executed=True,
+    )
+    readmodel.save_result(result, pool=postgres_pool)
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        app.state.pool = postgres_pool
+        app.state.compiled = graph.compile_ticket_graph(
+            graph.default_activities(), saver, postgres_pool
         )
-        readmodel.save_result(result, pool=pool)
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            app.state.pool = pool
-            app.state.compiled = graph.compile_ticket_graph(
-                graph.default_activities(), saver, pool
-            )
-
-            async with http_client() as http:
-                # No checkpoint exists for this ticket; the read model answers.
-                response = await http.get("/tickets/terminal-ticket")
-    finally:
-        pool.close()
+        async with http_client() as http:
+            # No checkpoint exists for this ticket; the read model answers.
+            response = await http.get("/tickets/terminal-ticket")
 
     assert response.status_code == 200
     body = response.json()
@@ -438,7 +415,9 @@ async def test_get_ticket_falls_back_to_read_model_through_postgres():
 
 
 @pytest.mark.integration
-async def test_submit_approval_signal_is_consumed_through_postgres():
+async def test_submit_approval_signal_is_consumed_through_postgres(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
     from langchain_core.runnables import RunnableConfig
 
     from tests.helpers import (
@@ -449,66 +428,57 @@ async def test_submit_approval_signal_is_consumed_through_postgres():
     )
     from ticketflow.activities import TicketActivities
 
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
     activities = TicketActivities(
         ScriptedAgent(billing_classification(), refund_draft())
     )
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue")
-            conn.execute("DELETE FROM pending_signal")
-            conn.execute("DELETE FROM workflow_run")
-            conn.commit()
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            app.state.pool = pool
-            app.state.compiled = graph.compile_ticket_graph(activities, saver, pool)
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        app.state.pool = postgres_pool
+        app.state.compiled = graph.compile_ticket_graph(
+            activities, saver, postgres_pool
+        )
 
-            async with http_client() as http:
-                created = await http.post(
-                    "/tickets",
-                    json={
-                        "customer_email": "jo@example.com",
-                        "subject": "refund please",
-                        "body": "I was double charged.",
-                    },
-                )
-                ticket_id = created.json()["ticket_id"]
-                cfg: RunnableConfig = {"configurable": {"thread_id": ticket_id}}
+        async with http_client() as http:
+            created = await http.post(
+                "/tickets",
+                json={
+                    "customer_email": "jo@example.com",
+                    "subject": "refund please",
+                    "body": "I was double charged.",
+                },
+            )
+            ticket_id = created.json()["ticket_id"]
+            cfg: RunnableConfig = {"configurable": {"thread_id": ticket_id}}
 
-                await drive_until_quiescent(
-                    app.state.compiled, pool, activities, ticket_id
-                )
-                awaiting = await app.state.compiled.aget_state(cfg)
-                assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
+            await drive_until_quiescent(
+                app.state.compiled, postgres_pool, activities, ticket_id
+            )
+            awaiting = await app.state.compiled.aget_state(cfg)
+            assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
 
-                approved = await http.post(
-                    f"/tickets/{ticket_id}/approval",
-                    json={
-                        "approved": True,
-                        "approver": "sam@example.com",
-                        "note": "approved in API integration test",
-                    },
-                )
-                await drive_until_quiescent(
-                    app.state.compiled, pool, activities, ticket_id
-                )
-                final = await app.state.compiled.aget_state(cfg)
+            approved = await http.post(
+                f"/tickets/{ticket_id}/approval",
+                json={
+                    "approved": True,
+                    "approver": "sam@example.com",
+                    "note": "approved in API integration test",
+                },
+            )
+            await drive_until_quiescent(
+                app.state.compiled, postgres_pool, activities, ticket_id
+            )
+            final = await app.state.compiled.aget_state(cfg)
 
-        with pool.connection() as conn:
-            signal_row = conn.execute(
-                """
-                SELECT consumed, payload
-                FROM pending_signal
-                WHERE workflow_id = %s
-                """,
-                (ticket_id,),
-            ).fetchone()
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        signal_row = conn.execute(
+            """
+            SELECT consumed, payload
+            FROM pending_signal
+            WHERE workflow_id = %s
+            """,
+            (ticket_id,),
+        ).fetchone()
 
     assert approved.status_code == 200
     assert approved.json() == {"status": "awaiting_approval"}

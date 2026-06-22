@@ -467,7 +467,9 @@ async def test_run_forever_runs_janitor_on_startup_and_interval(monkeypatch):
 
 
 @pytest.mark.integration
-async def test_runner_drives_a_seeded_run_to_resolved_through_postgres():
+async def test_runner_drives_a_seeded_run_to_resolved_through_postgres(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
     from langchain_core.runnables import RunnableConfig
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -476,9 +478,6 @@ async def test_runner_drives_a_seeded_run_to_resolved_through_postgres():
     from ticketflow.agent.mock import MockAgent
     from ticketflow.models import Ticket, TicketStatus
 
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
     activities = TicketActivities(
         MockAgent(
             seed=1, failure_rate=0.0, refund_rate=0.0, confidence_range=(0.8, 1.0)
@@ -492,49 +491,39 @@ async def test_runner_drives_a_seeded_run_to_resolved_through_postgres():
     )
     cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
 
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue")
-            # claim_run leases the oldest claimable run table-wide, so isolate
-            # this run and its tasks from leftover rows other tests left behind.
-            conn.execute("DELETE FROM workflow_run")
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+
+        # Seed: the initial invoke creates the checkpoint + classify outbox and
+        # parks at await_classify; the workflow_run row mirrors that state.
+        out = await compiled.ainvoke(
+            {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        )
+        assert "__interrupt__" in out
+        snapshot = await compiled.aget_state(cfg)
+        with postgres_pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                "VALUES (%s, %s, %s)",
+                (
+                    ticket.id,
+                    snapshot.values["status"],
+                    snapshot.values.get("wakeup_at"),
+                ),
+            )
             conn.commit()
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            compiled = graph.compile_ticket_graph(activities, saver, pool)
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
 
-            # Seed: the initial invoke creates the checkpoint + classify outbox and
-            # parks at await_classify; the workflow_run row mirrors that state.
-            out = await compiled.ainvoke(
-                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
-            )
-            assert "__interrupt__" in out
-            snapshot = await compiled.aget_state(cfg)
-            with pool.connection() as conn:
-                conn.execute(
-                    "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
-                    "VALUES (%s, %s, %s)",
-                    (
-                        ticket.id,
-                        snapshot.values["status"],
-                        snapshot.values.get("wakeup_at"),
-                    ),
-                )
-                conn.commit()
+        final = await compiled.aget_state(cfg)
 
-            await drive_until_quiescent(compiled, pool, activities, ticket.id)
-
-            final = await compiled.aget_state(cfg)
-
-        with pool.connection() as conn:
-            row = conn.execute(
-                "SELECT status, wakeup_at, lease_owner, lease_expires_at "
-                "FROM workflow_run WHERE ticket_id = %s",
-                (ticket.id,),
-            ).fetchone()
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        row = conn.execute(
+            "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+            "FROM workflow_run WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchone()
 
     assert final.values["status"] == TicketStatus.RESOLVED
     assert row is not None
@@ -545,7 +534,9 @@ async def test_runner_drives_a_seeded_run_to_resolved_through_postgres():
 
 
 @pytest.mark.integration
-async def test_runner_delivers_approval_signal_through_postgres():
+async def test_runner_delivers_approval_signal_through_postgres(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
     from langchain_core.runnables import RunnableConfig
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -554,9 +545,6 @@ async def test_runner_delivers_approval_signal_through_postgres():
     from ticketflow.activities import TicketActivities
     from ticketflow.models import ApprovalDecision, Ticket, TicketStatus
 
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
     ticket = Ticket(
         id=f"t-runner-approval-{uuid.uuid4().hex}",
         customer_email="customer@example.com",
@@ -569,55 +557,44 @@ async def test_runner_delivers_approval_signal_through_postgres():
     cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
     decision = ApprovalDecision(approved=True, approver="sam@example.com")
 
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue")
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+
+        out = await compiled.ainvoke(
+            {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        )
+        assert "__interrupt__" in out
+        snapshot = await compiled.aget_state(cfg)
+        with postgres_pool.connection() as conn:
             conn.execute(
-                "DELETE FROM pending_signal WHERE workflow_id = %s", (ticket.id,)
+                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                "VALUES (%s, %s, %s)",
+                (
+                    ticket.id,
+                    snapshot.values["status"],
+                    snapshot.values.get("wakeup_at"),
+                ),
             )
-            conn.execute("DELETE FROM workflow_run")
             conn.commit()
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            compiled = graph.compile_ticket_graph(activities, saver, pool)
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        awaiting = await compiled.aget_state(cfg)
+        assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
 
-            out = await compiled.ainvoke(
-                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
-            )
-            assert "__interrupt__" in out
-            snapshot = await compiled.aget_state(cfg)
-            with pool.connection() as conn:
-                conn.execute(
-                    "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
-                    "VALUES (%s, %s, %s)",
-                    (
-                        ticket.id,
-                        snapshot.values["status"],
-                        snapshot.values.get("wakeup_at"),
-                    ),
-                )
-                conn.commit()
+        signal_id = db.add_pending_signal(
+            ticket.id,
+            "approval_decision",
+            decision.model_dump(mode="json"),
+            pool=postgres_pool,
+        )
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        final = await compiled.aget_state(cfg)
 
-            await drive_until_quiescent(compiled, pool, activities, ticket.id)
-            awaiting = await compiled.aget_state(cfg)
-            assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
-
-            signal_id = db.add_pending_signal(
-                ticket.id,
-                "approval_decision",
-                decision.model_dump(mode="json"),
-                pool=pool,
-            )
-            await drive_until_quiescent(compiled, pool, activities, ticket.id)
-            final = await compiled.aget_state(cfg)
-
-        with pool.connection() as conn:
-            row = conn.execute(
-                "SELECT consumed FROM pending_signal WHERE id = %s", (signal_id,)
-            ).fetchone()
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        row = conn.execute(
+            "SELECT consumed FROM pending_signal WHERE id = %s", (signal_id,)
+        ).fetchone()
 
     assert final.values["status"] == TicketStatus.RESOLVED
     assert final.values["decision"] == decision
@@ -626,7 +603,9 @@ async def test_runner_delivers_approval_signal_through_postgres():
 
 
 @pytest.mark.integration
-async def test_runner_timeout_redispatches_due_agent_task_to_fallback():
+async def test_runner_timeout_redispatches_due_agent_task_to_fallback(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
     from langchain_core.runnables import RunnableConfig
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
@@ -635,9 +614,6 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback():
     from ticketflow.agent.mock import MockAgent
     from ticketflow.models import Ticket, TicketStatus
 
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
     activities = TicketActivities(MockAgent(seed=1, failure_rate=0.0))
     ticket = Ticket(
         id=f"t-runner-timeout-fallback-{uuid.uuid4().hex}",
@@ -647,44 +623,36 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback():
     )
     cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
 
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue")
-            conn.execute("DELETE FROM workflow_run")
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+
+        out = await compiled.ainvoke(
+            {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        )
+        assert "__interrupt__" in out
+        with postgres_pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                "VALUES (%s, %s, now() - interval '1 second')",
+                (ticket.id, TicketStatus.CLASSIFYING),
+            )
             conn.commit()
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            compiled = graph.compile_ticket_graph(activities, saver, pool)
+        advanced = await runner.step(compiled, postgres_pool, "runner-1")
+        snapshot = await compiled.aget_state(cfg)
 
-            out = await compiled.ainvoke(
-                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
-            )
-            assert "__interrupt__" in out
-            with pool.connection() as conn:
-                conn.execute(
-                    "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
-                    "VALUES (%s, %s, now() - interval '1 second')",
-                    (ticket.id, TicketStatus.CLASSIFYING),
-                )
-                conn.commit()
-
-            advanced = await runner.step(compiled, pool, "runner-1")
-            snapshot = await compiled.aget_state(cfg)
-
-        with pool.connection() as conn:
-            run_row = conn.execute(
-                "SELECT status, wakeup_at, lease_owner, lease_expires_at "
-                "FROM workflow_run WHERE ticket_id = %s",
-                (ticket.id,),
-            ).fetchone()
-            fallback_row = conn.execute(
-                "SELECT queue_name, status FROM task_queue "
-                "WHERE workflow_id = %s AND idempotency_key = %s",
-                (ticket.id, f"{ticket.id}:classify:fallback"),
-            ).fetchone()
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        run_row = conn.execute(
+            "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+            "FROM workflow_run WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchone()
+        fallback_row = conn.execute(
+            "SELECT queue_name, status FROM task_queue "
+            "WHERE workflow_id = %s AND idempotency_key = %s",
+            (ticket.id, f"{ticket.id}:classify:fallback"),
+        ).fetchone()
 
     assert advanced is True
     assert snapshot.interrupts[0].value["queue"] == config.FALLBACK_TASK_QUEUE
@@ -697,7 +665,9 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback():
 
 
 @pytest.mark.integration
-async def test_runner_timeout_escalates_due_approval_and_clears_wakeup():
+async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
     from langchain_core.runnables import RunnableConfig
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
     from langgraph.types import Command
@@ -707,9 +677,6 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup():
     from ticketflow.agent.mock import MockAgent
     from ticketflow.models import Ticket, TicketStatus
 
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
     activities = TicketActivities(MockAgent(seed=1, failure_rate=0.0))
     ticket = Ticket(
         id=f"t-runner-timeout-approval-{uuid.uuid4().hex}",
@@ -719,53 +686,43 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup():
     )
     cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
 
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue")
-            conn.execute("DELETE FROM workflow_run")
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+
+        await compiled.ainvoke({"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg)
+        await compiled.ainvoke(
+            Command(resume=billing_classification().model_dump(mode="json")),
+            cfg,
+        )
+        out = await compiled.ainvoke(
+            Command(resume=refund_draft().model_dump(mode="json")),
+            cfg,
+        )
+        assert "__interrupt__" in out
+        assert out["__interrupt__"][0].value["kind"] == "approval_required"
+        with postgres_pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                "VALUES (%s, %s, now() - interval '1 second')",
+                (ticket.id, TicketStatus.AWAITING_APPROVAL),
+            )
             conn.commit()
 
-        async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
-            await saver.setup()
-            compiled = graph.compile_ticket_graph(activities, saver, pool)
+        advanced = await runner.step(compiled, postgres_pool, "runner-1")
+        snapshot = await compiled.aget_state(cfg)
 
-            await compiled.ainvoke(
-                {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
-            )
-            await compiled.ainvoke(
-                Command(resume=billing_classification().model_dump(mode="json")),
-                cfg,
-            )
-            out = await compiled.ainvoke(
-                Command(resume=refund_draft().model_dump(mode="json")),
-                cfg,
-            )
-            assert "__interrupt__" in out
-            assert out["__interrupt__"][0].value["kind"] == "approval_required"
-            with pool.connection() as conn:
-                conn.execute(
-                    "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
-                    "VALUES (%s, %s, now() - interval '1 second')",
-                    (ticket.id, TicketStatus.AWAITING_APPROVAL),
-                )
-                conn.commit()
-
-            advanced = await runner.step(compiled, pool, "runner-1")
-            snapshot = await compiled.aget_state(cfg)
-
-        with pool.connection() as conn:
-            run_row = conn.execute(
-                "SELECT status, wakeup_at, lease_owner, lease_expires_at "
-                "FROM workflow_run WHERE ticket_id = %s",
-                (ticket.id,),
-            ).fetchone()
-            terminal_row = conn.execute(
-                "SELECT queue_name, task_type, status FROM task_queue "
-                "WHERE workflow_id = %s AND idempotency_key = %s",
-                (ticket.id, f"{ticket.id}:finalize"),
-            ).fetchone()
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        run_row = conn.execute(
+            "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+            "FROM workflow_run WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchone()
+        terminal_row = conn.execute(
+            "SELECT queue_name, task_type, status FROM task_queue "
+            "WHERE workflow_id = %s AND idempotency_key = %s",
+            (ticket.id, f"{ticket.id}:finalize"),
+        ).fetchone()
 
     assert advanced is True
     assert snapshot.interrupts[0].value["kind"] == "terminal_task"

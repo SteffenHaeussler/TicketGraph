@@ -54,25 +54,19 @@ def test_record_refund_logs_attempt_before_refund() -> None:
 
 
 @pytest.mark.integration
-def test_record_refund_is_at_most_once_against_real_postgres() -> None:
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM refunds")
-            conn.execute("DELETE FROM refund_attempts")
-            first = ledger.record_refund(conn, "t-1", 42.0, attempt=1)
-            second = ledger.record_refund(conn, "t-1", 42.0, attempt=2)
-            refunds = conn.execute(
-                "SELECT count(*) FROM refunds WHERE ticket_id = %s", ("t-1",)
-            ).fetchone()
-            attempts = conn.execute(
-                "SELECT count(*) FROM refund_attempts WHERE ticket_id = %s", ("t-1",)
-            ).fetchone()
-            conn.commit()
-    finally:
-        pool.close()
+def test_record_refund_is_at_most_once_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    with postgres_pool.connection() as conn:
+        first = ledger.record_refund(conn, "t-1", 42.0, attempt=1)
+        second = ledger.record_refund(conn, "t-1", 42.0, attempt=2)
+        refunds = conn.execute(
+            "SELECT count(*) FROM refunds WHERE ticket_id = %s", ("t-1",)
+        ).fetchone()
+        attempts = conn.execute(
+            "SELECT count(*) FROM refund_attempts WHERE ticket_id = %s", ("t-1",)
+        ).fetchone()
+        conn.commit()
 
     assert first is True
     assert second is False
@@ -81,19 +75,13 @@ def test_record_refund_is_at_most_once_against_real_postgres() -> None:
 
 
 @pytest.mark.integration
-def test_record_refund_different_tickets_both_execute() -> None:
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM refunds")
-            conn.execute("DELETE FROM refund_attempts")
-            first = ledger.record_refund(conn, "t-1", 42.0, attempt=1)
-            second = ledger.record_refund(conn, "t-2", 13.0, attempt=1)
-            conn.commit()
-    finally:
-        pool.close()
+def test_record_refund_different_tickets_both_execute(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    with postgres_pool.connection() as conn:
+        first = ledger.record_refund(conn, "t-1", 42.0, attempt=1)
+        second = ledger.record_refund(conn, "t-2", 13.0, attempt=1)
+        conn.commit()
 
     assert first is True
     assert second is True

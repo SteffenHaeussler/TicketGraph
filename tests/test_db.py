@@ -631,82 +631,76 @@ def test_add_pending_signal_if_waiting_returns_none_when_not_waiting():
 
 
 @pytest.mark.integration
-def test_save_run_round_trips_status_and_lease_against_real_postgres():
-    pool = _open_clean_run_pool()
-    try:
-        with pool.connection() as conn:
-            conn.execute(
-                "INSERT INTO workflow_run "
-                "(ticket_id, status, lease_owner, lease_expires_at) "
-                "VALUES ('saved', 'classifying', 'runner-1', now())"
-            )
-            conn.commit()
+def test_save_run_round_trips_status_and_lease_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run "
+            "(ticket_id, status, lease_owner, lease_expires_at) "
+            "VALUES ('saved', 'classifying', 'runner-1', now())"
+        )
+        conn.commit()
 
-        wakeup_at = datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
-        db.save_run("saved", status="awaiting_approval", wakeup_at=wakeup_at, pool=pool)
+    wakeup_at = datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+    db.save_run(
+        "saved", status="awaiting_approval", wakeup_at=wakeup_at, pool=postgres_pool
+    )
 
-        with pool.connection() as conn:
-            row = conn.execute(
-                "SELECT status, wakeup_at, lease_owner, lease_expires_at "
-                "FROM workflow_run WHERE ticket_id = 'saved'"
-            ).fetchone()
-        assert row is not None
-        assert row[0] == "awaiting_approval"
-        assert row[1] == wakeup_at
-        assert row[2] is None
-        assert row[3] is None
-    finally:
-        pool.close()
-
-
-@pytest.mark.integration
-def test_wake_run_makes_a_future_run_claimable_against_real_postgres():
-    pool = _open_clean_run_pool()
-    try:
-        with pool.connection() as conn:
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
-                "VALUES ('asleep', 'classifying', now() + interval '1 hour')"
-            )
-            conn.commit()
-
-        # Not yet due, so it cannot be claimed.
-        assert db.claim_run("runner-1", pool=pool) is None
-
-        db.wake_run("asleep", pool=pool)
-
-        claimed = db.claim_run("runner-1", pool=pool)
-        assert claimed is not None
-        assert claimed.ticket_id == "asleep"
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        row = conn.execute(
+            "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+            "FROM workflow_run WHERE ticket_id = 'saved'"
+        ).fetchone()
+    assert row is not None
+    assert row[0] == "awaiting_approval"
+    assert row[1] == wakeup_at
+    assert row[2] is None
+    assert row[3] is None
 
 
 @pytest.mark.integration
-def test_bootstrap_is_idempotent_against_real_postgres():
-    db.bootstrap()
-    db.bootstrap()
+def test_wake_run_makes_a_future_run_claimable_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+            "VALUES ('asleep', 'classifying', now() + interval '1 hour')"
+        )
+        conn.commit()
 
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            row = conn.execute(
-                "SELECT count(*) FROM schema_migrations WHERE version = %s",
-                (db.BOOTSTRAP_MIGRATION,),
-            ).fetchone()
-    finally:
-        pool.close()
+    # Not yet due, so it cannot be claimed.
+    assert db.claim_run("runner-1", pool=postgres_pool) is None
+
+    db.wake_run("asleep", pool=postgres_pool)
+
+    claimed = db.claim_run("runner-1", pool=postgres_pool)
+    assert claimed is not None
+    assert claimed.ticket_id == "asleep"
+
+
+@pytest.mark.integration
+def test_bootstrap_is_idempotent_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    db.bootstrap(pool=postgres_pool)
+
+    with postgres_pool.connection() as conn:
+        row = conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE version = %s",
+            (db.BOOTSTRAP_MIGRATION,),
+        ).fetchone()
 
     assert row is not None
     assert row[0] == 1
 
 
 @pytest.mark.integration
-def test_bootstrap_creates_task_queue_against_real_postgres():
-    db.bootstrap()
-    db.bootstrap()
-
+def test_bootstrap_creates_task_queue_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    db.bootstrap(pool=postgres_pool)
     expected_columns = {
         "id",
         "queue_name",
@@ -726,36 +720,31 @@ def test_bootstrap_creates_task_queue_against_real_postgres():
         "permanent",
     }
 
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            marker = conn.execute(
-                "SELECT count(*) FROM schema_migrations WHERE version = %s",
-                (db.TASK_QUEUE_MIGRATION,),
-            ).fetchone()
-            columns = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'task_queue'"
-                ).fetchall()
-            }
+    with postgres_pool.connection() as conn:
+        marker = conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE version = %s",
+            (db.TASK_QUEUE_MIGRATION,),
+        ).fetchone()
+        columns = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'task_queue'"
+            ).fetchall()
+        }
 
-            # The UNIQUE constraint on idempotency_key holds.
-            insert_dup = (
-                "INSERT INTO task_queue (queue_name, task_type, workflow_id, "
-                "idempotency_key) VALUES ('q', 't', 'w', 'dup-key')"
-            )
+        # The UNIQUE constraint on idempotency_key holds.
+        insert_dup = (
+            "INSERT INTO task_queue (queue_name, task_type, workflow_id, "
+            "idempotency_key) VALUES ('q', 't', 'w', 'dup-key')"
+        )
+        conn.execute(insert_dup)
+        duplicate_rejected = False
+        try:
             conn.execute(insert_dup)
-            duplicate_rejected = False
-            try:
-                conn.execute(insert_dup)
-            except Exception:
-                duplicate_rejected = True
-            conn.rollback()
-    finally:
-        pool.close()
+        except Exception:
+            duplicate_rejected = True
+        conn.rollback()
 
     assert marker is not None
     assert marker[0] == 1
@@ -764,27 +753,23 @@ def test_bootstrap_creates_task_queue_against_real_postgres():
 
 
 @pytest.mark.integration
-def test_bootstrap_creates_ticket_results_against_real_postgres():
-    db.bootstrap()
-    db.bootstrap()
+def test_bootstrap_creates_ticket_results_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    db.bootstrap(pool=postgres_pool)
 
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            marker = conn.execute(
-                "SELECT count(*) FROM schema_migrations WHERE version = %s",
-                (db.READ_MODEL_MIGRATION,),
-            ).fetchone()
-            columns = {
-                (row[0], row[1])
-                for row in conn.execute(
-                    "SELECT column_name, data_type FROM information_schema.columns "
-                    "WHERE table_name = 'ticket_results'"
-                ).fetchall()
-            }
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        marker = conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE version = %s",
+            (db.READ_MODEL_MIGRATION,),
+        ).fetchone()
+        columns = {
+            (row[0], row[1])
+            for row in conn.execute(
+                "SELECT column_name, data_type FROM information_schema.columns "
+                "WHERE table_name = 'ticket_results'"
+            ).fetchall()
+        }
 
     assert marker is not None
     assert marker[0] == 1
@@ -793,46 +778,40 @@ def test_bootstrap_creates_ticket_results_against_real_postgres():
 
 
 @pytest.mark.integration
-def test_dequeue_leases_one_due_pending_task_against_real_postgres():
-    db.bootstrap()
-
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue")
-            conn.execute(
-                """
-                INSERT INTO task_queue (
-                    queue_name, task_type, workflow_id, payload, idempotency_key
-                )
-                VALUES (
-                    'q', 'classify', 'workflow-1', '{"ticket_id": "workflow-1"}',
-                    'workflow-1:classify'
-                )
-                """
+def test_dequeue_leases_one_due_pending_task_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO task_queue (
+                queue_name, task_type, workflow_id, payload, idempotency_key
             )
-            conn.commit()
+            VALUES (
+                'q', 'classify', 'workflow-1', '{"ticket_id": "workflow-1"}',
+                'workflow-1:classify'
+            )
+            """
+        )
+        conn.commit()
 
-        task = db.dequeue("q", "worker-1", pool=pool)
-        second_task = db.dequeue("q", "worker-2", pool=pool)
+    task = db.dequeue("q", "worker-1", pool=postgres_pool)
+    second_task = db.dequeue("q", "worker-2", pool=postgres_pool)
 
-        assert task is not None
-        assert task.status == "leased"
-        assert task.lease_owner == "worker-1"
-        assert task.attempts == 1
-        assert task.lease_expires_at is not None
-        assert task.lease_expires_at > datetime.now(UTC) - timedelta(seconds=5)
-        assert second_task is None
-    finally:
-        pool.close()
+    assert task is not None
+    assert task.status == "leased"
+    assert task.lease_owner == "worker-1"
+    assert task.attempts == 1
+    assert task.lease_expires_at is not None
+    assert task.lease_expires_at > datetime.now(UTC) - timedelta(seconds=5)
+    assert second_task is None
 
 
 @pytest.mark.integration
-def test_bootstrap_creates_workflow_run_against_real_postgres():
-    db.bootstrap()
-    db.bootstrap()
-
+def test_bootstrap_creates_workflow_run_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    db.bootstrap(pool=postgres_pool)
     expected_columns = {
         "ticket_id",
         "status",
@@ -843,37 +822,30 @@ def test_bootstrap_creates_workflow_run_against_real_postgres():
         "updated_at",
     }
 
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            marker = conn.execute(
-                "SELECT count(*) FROM schema_migrations WHERE version = %s",
-                (db.WORKFLOW_RUN_MIGRATION,),
-            ).fetchone()
-            columns = {
-                row[0]
-                for row in conn.execute(
-                    "SELECT column_name FROM information_schema.columns "
-                    "WHERE table_name = 'workflow_run'"
-                ).fetchall()
-            }
-            index = conn.execute(
-                "SELECT count(*) FROM pg_indexes "
-                "WHERE indexname = 'ix_workflow_run_status'"
-            ).fetchone()
+    with postgres_pool.connection() as conn:
+        marker = conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE version = %s",
+            (db.WORKFLOW_RUN_MIGRATION,),
+        ).fetchone()
+        columns = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'workflow_run'"
+            ).fetchall()
+        }
+        index = conn.execute(
+            "SELECT count(*) FROM pg_indexes WHERE indexname = 'ix_workflow_run_status'"
+        ).fetchone()
 
-            # The ticket_id primary key rejects a duplicate run.
-            conn.execute("DELETE FROM workflow_run")
+        # The ticket_id primary key rejects a duplicate run.
+        conn.execute("INSERT INTO workflow_run (ticket_id) VALUES ('dup')")
+        duplicate_rejected = False
+        try:
             conn.execute("INSERT INTO workflow_run (ticket_id) VALUES ('dup')")
-            duplicate_rejected = False
-            try:
-                conn.execute("INSERT INTO workflow_run (ticket_id) VALUES ('dup')")
-            except Exception:
-                duplicate_rejected = True
-            conn.rollback()
-    finally:
-        pool.close()
+        except Exception:
+            duplicate_rejected = True
+        conn.rollback()
 
     assert marker is not None
     assert marker[0] == 1
@@ -882,103 +854,86 @@ def test_bootstrap_creates_workflow_run_against_real_postgres():
     assert duplicate_rejected is True
 
 
-def _open_clean_run_pool() -> db.ConnectionPool:
-    """Bootstrap, open a pool, and truncate run/signal state for isolation."""
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    with pool.connection() as conn:
-        conn.execute("DELETE FROM pending_signal")
-        conn.execute("DELETE FROM workflow_run")
+@pytest.mark.integration
+def test_list_runs_by_status_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, created_at) "
+            "VALUES ('older', 'awaiting_approval', now() - interval '10 seconds')"
+        )
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, created_at) "
+            "VALUES ('newer', 'awaiting_approval', now())"
+        )
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, created_at) "
+            "VALUES ('other', 'classifying', now() - interval '20 seconds')"
+        )
         conn.commit()
-    return pool
+
+    assert db.list_runs_by_status("awaiting_approval", pool=postgres_pool) == [
+        "older",
+        "newer",
+    ]
 
 
 @pytest.mark.integration
-def test_list_runs_by_status_against_real_postgres():
-    pool = _open_clean_run_pool()
-    try:
-        with pool.connection() as conn:
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, status, created_at) "
-                "VALUES ('older', 'awaiting_approval', now() - interval '10 seconds')"
-            )
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, status, created_at) "
-                "VALUES ('newer', 'awaiting_approval', now())"
-            )
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, status, created_at) "
-                "VALUES ('other', 'classifying', now() - interval '20 seconds')"
-            )
-            conn.commit()
-
-        assert db.list_runs_by_status("awaiting_approval", pool=pool) == [
-            "older",
-            "newer",
-        ]
-    finally:
-        pool.close()
-
-
-@pytest.mark.integration
-def test_add_pending_signal_if_waiting_against_real_postgres():
-    pool = _open_clean_run_pool()
-    try:
-        with pool.connection() as conn:
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
-                "VALUES ('waiting', 'awaiting_approval', now() + interval '1 hour')"
-            )
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, status) "
-                "VALUES ('busy', 'classifying')"
-            )
-            conn.commit()
-
-        accepted = db.add_pending_signal_if_waiting(
-            "waiting",
-            "approval_decision",
-            {"approved": True, "approver": "sam@example.com"},
-            waiting_status="awaiting_approval",
-            pool=pool,
+def test_add_pending_signal_if_waiting_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+            "VALUES ('waiting', 'awaiting_approval', now() + interval '1 hour')"
         )
-        duplicate = db.add_pending_signal_if_waiting(
-            "waiting",
-            "approval_decision",
-            {"approved": False, "approver": "sam@example.com"},
-            waiting_status="awaiting_approval",
-            pool=pool,
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status) "
+            "VALUES ('busy', 'classifying')"
         )
-        wrong_status = db.add_pending_signal_if_waiting(
-            "busy",
-            "approval_decision",
-            {"approved": True, "approver": "sam@example.com"},
-            waiting_status="awaiting_approval",
-            pool=pool,
-        )
-        missing = db.add_pending_signal_if_waiting(
-            "missing",
-            "approval_decision",
-            {"approved": True, "approver": "sam@example.com"},
-            waiting_status="awaiting_approval",
-            pool=pool,
-        )
+        conn.commit()
 
-        with pool.connection() as conn:
-            row = conn.execute(
-                """
-                SELECT payload, consumed
-                FROM pending_signal
-                WHERE workflow_id = 'waiting'
-                """
-            ).fetchone()
-            run = conn.execute(
-                "SELECT wakeup_at <= now() FROM workflow_run "
-                "WHERE ticket_id = 'waiting'"
-            ).fetchone()
-    finally:
-        pool.close()
+    accepted = db.add_pending_signal_if_waiting(
+        "waiting",
+        "approval_decision",
+        {"approved": True, "approver": "sam@example.com"},
+        waiting_status="awaiting_approval",
+        pool=postgres_pool,
+    )
+    duplicate = db.add_pending_signal_if_waiting(
+        "waiting",
+        "approval_decision",
+        {"approved": False, "approver": "sam@example.com"},
+        waiting_status="awaiting_approval",
+        pool=postgres_pool,
+    )
+    wrong_status = db.add_pending_signal_if_waiting(
+        "busy",
+        "approval_decision",
+        {"approved": True, "approver": "sam@example.com"},
+        waiting_status="awaiting_approval",
+        pool=postgres_pool,
+    )
+    missing = db.add_pending_signal_if_waiting(
+        "missing",
+        "approval_decision",
+        {"approved": True, "approver": "sam@example.com"},
+        waiting_status="awaiting_approval",
+        pool=postgres_pool,
+    )
+
+    with postgres_pool.connection() as conn:
+        row = conn.execute(
+            """
+            SELECT payload, consumed
+            FROM pending_signal
+            WHERE workflow_id = 'waiting'
+            """
+        ).fetchone()
+        run = conn.execute(
+            "SELECT wakeup_at <= now() FROM workflow_run WHERE ticket_id = 'waiting'"
+        ).fetchone()
 
     assert accepted is not None
     assert duplicate is None
@@ -992,36 +947,33 @@ def test_add_pending_signal_if_waiting_against_real_postgres():
 
 
 @pytest.mark.integration
-def test_claim_run_leases_runnable_runs_oldest_first_against_real_postgres():
-    pool = _open_clean_run_pool()
-    try:
-        with pool.connection() as conn:
-            # Two runnable runs (older first), one with a future timer, and one
-            # already held under a live lease -- only the runnable two qualify.
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, created_at) "
-                "VALUES ('older', now() - interval '10 seconds')"
-            )
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, created_at) "
-                "VALUES ('newer', now())"
-            )
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, wakeup_at) "
-                "VALUES ('future-timer', now() + interval '1 hour')"
-            )
-            conn.execute(
-                "INSERT INTO workflow_run "
-                "(ticket_id, lease_owner, lease_expires_at) "
-                "VALUES ('held', 'runner-9', now() + interval '30 seconds')"
-            )
-            conn.commit()
+def test_claim_run_leases_runnable_runs_oldest_first_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        # Two runnable runs (older first), one with a future timer, and one
+        # already held under a live lease -- only the runnable two qualify.
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, created_at) "
+            "VALUES ('older', now() - interval '10 seconds')"
+        )
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, created_at) VALUES ('newer', now())"
+        )
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, wakeup_at) "
+            "VALUES ('future-timer', now() + interval '1 hour')"
+        )
+        conn.execute(
+            "INSERT INTO workflow_run "
+            "(ticket_id, lease_owner, lease_expires_at) "
+            "VALUES ('held', 'runner-9', now() + interval '30 seconds')"
+        )
+        conn.commit()
 
-        first = db.claim_run("runner-1", pool=pool)
-        second = db.claim_run("runner-2", pool=pool)
-        third = db.claim_run("runner-3", pool=pool)
-    finally:
-        pool.close()
+    first = db.claim_run("runner-1", pool=postgres_pool)
+    second = db.claim_run("runner-2", pool=postgres_pool)
+    third = db.claim_run("runner-3", pool=postgres_pool)
 
     assert first is not None and first.ticket_id == "older"
     assert first.lease_owner == "runner-1"
@@ -1033,58 +985,54 @@ def test_claim_run_leases_runnable_runs_oldest_first_against_real_postgres():
 
 
 @pytest.mark.integration
-def test_claim_run_reclaims_expired_lease_against_real_postgres():
-    pool = _open_clean_run_pool()
-    try:
-        with pool.connection() as conn:
-            conn.execute(
-                "INSERT INTO workflow_run "
-                "(ticket_id, lease_owner, lease_expires_at) "
-                "VALUES ('stale', 'runner-dead', now() - interval '1 second')"
-            )
-            conn.commit()
+def test_claim_run_reclaims_expired_lease_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run "
+            "(ticket_id, lease_owner, lease_expires_at) "
+            "VALUES ('stale', 'runner-dead', now() - interval '1 second')"
+        )
+        conn.commit()
 
-        claimed = db.claim_run("runner-1", pool=pool)
-    finally:
-        pool.close()
+    claimed = db.claim_run("runner-1", pool=postgres_pool)
 
     assert claimed is not None and claimed.ticket_id == "stale"
     assert claimed.lease_owner == "runner-1"
 
 
 @pytest.mark.integration
-def test_reclaim_expired_runs_clears_only_expired_leases_against_real_postgres():
-    pool = _open_clean_run_pool()
-    try:
-        with pool.connection() as conn:
-            conn.execute(
-                "INSERT INTO workflow_run "
-                "(ticket_id, status, wakeup_at, lease_owner, lease_expires_at) "
-                "VALUES ("
-                "'stale', 'classifying', now() + interval '10 minutes', "
-                "'runner-dead', now() - interval '1 second'"
-                ")"
-            )
-            conn.execute(
-                "INSERT INTO workflow_run "
-                "(ticket_id, lease_owner, lease_expires_at) "
-                "VALUES ('live', 'runner-live', now() + interval '30 seconds')"
-            )
-            conn.commit()
+def test_reclaim_expired_runs_clears_only_expired_leases_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run "
+            "(ticket_id, status, wakeup_at, lease_owner, lease_expires_at) "
+            "VALUES ("
+            "'stale', 'classifying', now() + interval '10 minutes', "
+            "'runner-dead', now() - interval '1 second'"
+            ")"
+        )
+        conn.execute(
+            "INSERT INTO workflow_run "
+            "(ticket_id, lease_owner, lease_expires_at) "
+            "VALUES ('live', 'runner-live', now() + interval '30 seconds')"
+        )
+        conn.commit()
 
-        reclaimed = db.reclaim_expired_runs(pool=pool)
+    reclaimed = db.reclaim_expired_runs(pool=postgres_pool)
 
-        with pool.connection() as conn:
-            stale = conn.execute(
-                "SELECT status, wakeup_at IS NOT NULL, lease_owner, "
-                "lease_expires_at FROM workflow_run WHERE ticket_id = 'stale'"
-            ).fetchone()
-            live = conn.execute(
-                "SELECT lease_owner, lease_expires_at IS NOT NULL "
-                "FROM workflow_run WHERE ticket_id = 'live'"
-            ).fetchone()
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        stale = conn.execute(
+            "SELECT status, wakeup_at IS NOT NULL, lease_owner, "
+            "lease_expires_at FROM workflow_run WHERE ticket_id = 'stale'"
+        ).fetchone()
+        live = conn.execute(
+            "SELECT lease_owner, lease_expires_at IS NOT NULL "
+            "FROM workflow_run WHERE ticket_id = 'live'"
+        ).fetchone()
 
     assert reclaimed == 1
     assert stale == ("classifying", True, None, None)

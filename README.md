@@ -92,8 +92,18 @@ TICKETFLOW_TRACE_EXPORTER=otlp docker compose --profile tracing up --build
 ```bash
 make check
 make test
+make integration
 make coverage
 make smoke
+```
+
+`make integration` runs the Postgres integration tests. By default the pytest
+fixture starts a session-scoped `postgres:17-alpine` Testcontainers database and
+creates an isolated schema per test. To reuse an existing local or Compose
+database instead, set `TEST_DATABASE_URL`:
+
+```bash
+TEST_DATABASE_URL=postgresql://ticketflow:ticketflow@localhost:5432/ticketflow make integration
 ```
 
 `make smoke` starts the Docker stack, waits for the API, runs the smoke tests,

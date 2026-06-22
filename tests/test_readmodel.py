@@ -166,93 +166,65 @@ def test_record_refund_opens_and_closes_owned_pool(monkeypatch) -> None:
 
 
 @pytest.mark.integration
-def test_save_and_load_roundtrip_against_real_postgres() -> None:
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    try:
-        readmodel.clear(pool=pool)
+def test_save_and_load_roundtrip_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    result = make_result(refund_executed=True)
+    readmodel.save_result(result, pool=postgres_pool)
 
-        result = make_result(refund_executed=True)
-        readmodel.save_result(result, pool=pool)
-
-        assert readmodel.load_result("t-1", pool=pool) == result
-    finally:
-        pool.close()
+    assert readmodel.load_result("t-1", pool=postgres_pool) == result
 
 
 @pytest.mark.integration
-def test_save_result_overwrites_existing_result_against_real_postgres() -> None:
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    try:
-        readmodel.clear(pool=pool)
+def test_save_result_overwrites_existing_result_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    readmodel.save_result(make_result(reply_text="first"), pool=postgres_pool)
+    readmodel.save_result(make_result(reply_text="second"), pool=postgres_pool)
 
-        readmodel.save_result(make_result(reply_text="first"), pool=pool)
-        readmodel.save_result(make_result(reply_text="second"), pool=pool)
-
-        loaded = readmodel.load_result("t-1", pool=pool)
-    finally:
-        pool.close()
+    loaded = readmodel.load_result("t-1", pool=postgres_pool)
 
     assert loaded is not None
     assert loaded.reply_text == "second"
 
 
 @pytest.mark.integration
-def test_clear_removes_only_ticket_results_against_real_postgres() -> None:
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    try:
-        readmodel.clear(pool=pool)
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM refunds")
-            conn.execute("DELETE FROM refund_attempts")
-            conn.execute(
-                "INSERT INTO refunds (ticket_id, amount) VALUES (%s, %s)",
-                ("refund-only", 10.0),
-            )
-            conn.commit()
+def test_clear_removes_only_ticket_results_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO refunds (ticket_id, amount) VALUES (%s, %s)",
+            ("refund-only", 10.0),
+        )
+        conn.commit()
 
-        readmodel.save_result(make_result("a"), pool=pool)
-        readmodel.save_result(make_result("b"), pool=pool)
+    readmodel.save_result(make_result("a"), pool=postgres_pool)
+    readmodel.save_result(make_result("b"), pool=postgres_pool)
 
-        deleted = readmodel.clear(pool=pool)
+    deleted = readmodel.clear(pool=postgres_pool)
 
-        with pool.connection() as conn:
-            refund_count = conn.execute("SELECT count(*) FROM refunds").fetchone()
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        refund_count = conn.execute("SELECT count(*) FROM refunds").fetchone()
 
     assert deleted == 2
     assert refund_count == (1,)
 
 
 @pytest.mark.integration
-def test_record_refund_is_at_most_once_against_real_postgres() -> None:
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM refunds")
-            conn.execute("DELETE FROM refund_attempts")
-            conn.commit()
+def test_record_refund_is_at_most_once_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    first = readmodel.record_refund("t-1", 42.0, attempt=1, pool=postgres_pool)
+    second = readmodel.record_refund("t-1", 42.0, attempt=2, pool=postgres_pool)
 
-        first = readmodel.record_refund("t-1", 42.0, attempt=1, pool=pool)
-        second = readmodel.record_refund("t-1", 42.0, attempt=2, pool=pool)
-
-        with pool.connection() as conn:
-            refunds = conn.execute(
-                "SELECT count(*) FROM refunds WHERE ticket_id = %s", ("t-1",)
-            ).fetchone()
-            attempts = conn.execute(
-                "SELECT count(*) FROM refund_attempts WHERE ticket_id = %s", ("t-1",)
-            ).fetchone()
-    finally:
-        pool.close()
+    with postgres_pool.connection() as conn:
+        refunds = conn.execute(
+            "SELECT count(*) FROM refunds WHERE ticket_id = %s", ("t-1",)
+        ).fetchone()
+        attempts = conn.execute(
+            "SELECT count(*) FROM refund_attempts WHERE ticket_id = %s", ("t-1",)
+        ).fetchone()
 
     assert first is True
     assert second is False

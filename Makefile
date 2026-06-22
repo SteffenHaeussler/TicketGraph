@@ -1,4 +1,4 @@
-.PHONY: install install-hooks lint format-check format typecheck check test coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger worker fallback-worker side-effect-worker api doctor ticket status approve reject batch reset
+.PHONY: install install-hooks lint format-check format typecheck check test integration coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger worker fallback-worker side-effect-worker api doctor ticket status approve reject batch reset
 
 N ?= 100
 API_PORT ?= 8000
@@ -30,6 +30,9 @@ check: format-check lint typecheck test
 
 test:
 	uv run pytest
+
+integration:
+	uv run pytest -m integration -o addopts=
 
 coverage:
 	uv run pytest --cov=ticketflow --cov-report=term-missing

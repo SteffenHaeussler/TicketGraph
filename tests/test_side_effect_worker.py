@@ -166,10 +166,9 @@ async def test_run_finalize_rejects_unexpected_task_type() -> None:
 
 
 @pytest.mark.integration
-async def test_postgres_finalize_runs_side_effects_and_wakes_run() -> None:
-    db.bootstrap()
-    pool = db.make_pool()
-    pool.open()
+async def test_postgres_finalize_runs_side_effects_and_wakes_run(
+    postgres_pool: db.ConnectionPool,
+) -> None:
     ticket = make_ticket(id=f"t-side-effect-{uuid.uuid4().hex}")
     draft = refund_draft(amount=42.0)
     result = TicketResult(
@@ -180,58 +179,46 @@ async def test_postgres_finalize_runs_side_effects_and_wakes_run() -> None:
     activities = TicketActivities(MockAgent(), database_url=config.DATABASE_URL)
     future = datetime.now(UTC) + timedelta(hours=1)
 
-    try:
-        with pool.connection() as conn:
-            conn.execute("DELETE FROM task_queue WHERE workflow_id = %s", (ticket.id,))
-            conn.execute("DELETE FROM workflow_run WHERE ticket_id = %s", (ticket.id,))
-            conn.execute("DELETE FROM refunds WHERE ticket_id = %s", (ticket.id,))
-            conn.execute(
-                "DELETE FROM refund_attempts WHERE ticket_id = %s", (ticket.id,)
-            )
-            conn.execute(
-                "DELETE FROM ticket_results WHERE ticket_id = %s", (ticket.id,)
-            )
-            taskqueue.enqueue(
-                conn,
-                queue_name=config.TASK_QUEUE,
-                task_type="finalize_ticket",
-                workflow_id=ticket.id,
-                payload={
-                    "ticket": ticket.model_dump(mode="json"),
-                    "action": draft.action.model_dump(mode="json"),
-                    "result": result.model_dump(mode="json"),
-                },
-                idempotency_key=f"{ticket.id}:finalize",
-            )
-            conn.execute(
-                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
-                "VALUES (%s, %s, %s)",
-                (ticket.id, TicketStatus.RESOLVED, future),
-            )
-            conn.commit()
-
-        processed = await agent_worker.process_one_task(
-            pool,
-            activities,
+    with postgres_pool.connection() as conn:
+        taskqueue.enqueue(
+            conn,
             queue_name=config.TASK_QUEUE,
-            run_activity=side_effect_worker.run_finalize,
+            task_type="finalize_ticket",
+            workflow_id=ticket.id,
+            payload={
+                "ticket": ticket.model_dump(mode="json"),
+                "action": draft.action.model_dump(mode="json"),
+                "result": result.model_dump(mode="json"),
+            },
+            idempotency_key=f"{ticket.id}:finalize",
         )
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+            "VALUES (%s, %s, %s)",
+            (ticket.id, TicketStatus.RESOLVED, future),
+        )
+        conn.commit()
 
-        with pool.connection() as conn:
-            task_row = conn.execute(
-                "SELECT status, result FROM task_queue WHERE workflow_id = %s",
-                (ticket.id,),
-            ).fetchone()
-            refund_row = conn.execute(
-                "SELECT amount FROM refunds WHERE ticket_id = %s", (ticket.id,)
-            ).fetchone()
-            run_row = conn.execute(
-                "SELECT wakeup_at <= now() FROM workflow_run WHERE ticket_id = %s",
-                (ticket.id,),
-            ).fetchone()
-        stored = readmodel.load_result(ticket.id, database_url=config.DATABASE_URL)
-    finally:
-        pool.close()
+    processed = await agent_worker.process_one_task(
+        postgres_pool,
+        activities,
+        queue_name=config.TASK_QUEUE,
+        run_activity=side_effect_worker.run_finalize,
+    )
+
+    with postgres_pool.connection() as conn:
+        task_row = conn.execute(
+            "SELECT status, result FROM task_queue WHERE workflow_id = %s",
+            (ticket.id,),
+        ).fetchone()
+        refund_row = conn.execute(
+            "SELECT amount FROM refunds WHERE ticket_id = %s", (ticket.id,)
+        ).fetchone()
+        run_row = conn.execute(
+            "SELECT wakeup_at <= now() FROM workflow_run WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchone()
+    stored = readmodel.load_result(ticket.id, database_url=config.DATABASE_URL)
 
     assert processed is True
     assert task_row is not None
