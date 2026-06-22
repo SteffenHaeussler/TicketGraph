@@ -109,11 +109,11 @@ RETURNING *;
 ## Milestone 4 — Runner (the workflow driver)
 *DDIA: Ch 8 work distribution; outbox commit.*
 
-- [ ] **4.1 `workflow_run` table** `(ticket_id PK, status, wakeup_at, lease_owner,
+- [x] **4.1 `workflow_run` table** `(ticket_id PK, status, wakeup_at, lease_owner,
   lease_expires_at, …)` + a claim/lease helper.
 - [x] **4.2 Runner loop.** `runner.py`: lease a runnable run (result/signal ready OR `wakeup_at`
   due), resume its graph, persist **checkpoint + state + outbox tasks in one transaction**, release.
-- [ ] **4.3 Timers.** Resume runs whose `wakeup_at <= now()` with a "timeout" input (drives 24h
+- [x] **4.3 Timers.** Resume runs whose `wakeup_at <= now()` with a "timeout" input (drives 24h
   approval expiry and 30s fallback).
 - [ ] **4.4 Signals.** `pending_signal(workflow_id, kind, payload, consumed)`; deliver approval
   decisions into the resumed graph; mark consumed.
