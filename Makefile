@@ -1,4 +1,4 @@
-.PHONY: install install-hooks lint format-check format typecheck check test coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger worker fallback-worker api doctor ticket status approve reject batch reset
+.PHONY: install install-hooks lint format-check format typecheck check test coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger worker fallback-worker side-effect-worker api doctor ticket status approve reject batch reset
 
 N ?= 100
 API_URL ?= http://localhost:8000
@@ -75,6 +75,9 @@ worker:
 
 fallback-worker:
 	uv run python -m ticketflow.fallback_worker
+
+side-effect-worker:
+	uv run python -m ticketflow.side_effect_worker
 
 api:
 	uv run uvicorn ticketflow.api:app --reload

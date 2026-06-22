@@ -6,6 +6,7 @@ import asyncio
 import logging
 import os
 import socket
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -77,8 +78,15 @@ async def process_one_task(
     activities: TicketActivities,
     worker_id: str = "agent-worker",
     queue_name: str = config.AGENT_TASK_QUEUE,
+    run_activity: Callable[
+        [db.QueuedTask, TicketActivities], Awaitable[Any]
+    ] = _run_activity,
 ) -> bool:
-    """Lease and process one primary agent task.
+    """Lease and process one queued task.
+
+    ``run_activity`` selects how the leased task is turned into a result; it
+    defaults to the agent routing (``classify``/``draft``). Other workers pass
+    their own router (e.g. the side-effect worker handles ``finalize_ticket``).
 
     Returns ``True`` when a task was leased and completed or failed, and
     ``False`` when the queue had no due pending work.
@@ -88,7 +96,7 @@ async def process_one_task(
         return False
 
     try:
-        result = await _run_activity(task, activities)
+        result = await run_activity(task, activities)
     except Exception as exc:
         status = await asyncio.to_thread(_fail_task, pool, task.id, str(exc))
         logger.exception(
@@ -133,11 +141,16 @@ async def run_forever(
     max_concurrent: int = config.AGENT_MAX_CONCURRENT,
     poll_interval: float = 0.1,
     stop: asyncio.Event | None = None,
+    run_activity: Callable[
+        [db.QueuedTask, TicketActivities], Awaitable[Any]
+    ] = _run_activity,
 ) -> None:
-    """Continuously drain agent tasks with bounded concurrency.
+    """Continuously drain queued tasks with bounded concurrency.
 
     Passing ``max_per_second=None`` runs unthrottled (no token bucket), as the
-    fallback worker does; otherwise acquisitions are spaced at that rate.
+    fallback and side-effect workers do; otherwise acquisitions are spaced at
+    that rate. ``run_activity`` selects the per-task router (see
+    :func:`process_one_task`).
     """
     if max_concurrent <= 0:
         raise ValueError("max_concurrent must be greater than zero")
@@ -168,6 +181,7 @@ async def run_forever(
                             activities,
                             worker_id=resolved_worker_id,
                             queue_name=queue_name,
+                            run_activity=run_activity,
                         )
                     )
                 )
