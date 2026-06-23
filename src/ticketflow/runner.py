@@ -33,6 +33,7 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import Command
 
 from ticketflow import config, db, graph, taskqueue
+from ticketflow.clock import Clock, resolve_clock
 from ticketflow.db import _Pool
 from ticketflow.logging import setup_logging
 from ticketflow.signals import APPROVAL_DECISION_SIGNAL
@@ -160,7 +161,11 @@ def _resume_value(conn: Any, envelope: dict[str, Any]) -> _ResumeValue | None:
 
 
 def _resume_for_run(
-    conn: Any, envelope: dict[str, Any], wakeup_at: datetime | None
+    conn: Any,
+    envelope: dict[str, Any],
+    wakeup_at: datetime | None,
+    *,
+    clock: Clock | None = None,
 ) -> _ResumeValue | None:
     """Return a ready task/signal value, a due timer envelope, or ``None``.
 
@@ -172,16 +177,16 @@ def _resume_for_run(
     resume = _resume_value(conn, envelope)
     if resume is not None:
         return resume
-    if _timer_is_due(wakeup_at):
+    if _timer_is_due(wakeup_at, clock=clock):
         return _ResumeValue({"kind": "timeout"})
     return None
 
 
-def _timer_is_due(wakeup_at: datetime | None) -> bool:
+def _timer_is_due(wakeup_at: datetime | None, *, clock: Clock | None = None) -> bool:
     """Whether a durable timer should resume the parked graph now."""
     if wakeup_at is None:
         return False
-    return wakeup_at <= datetime.now(wakeup_at.tzinfo)
+    return wakeup_at <= resolve_clock(clock).now()
 
 
 def _interrupt_envelope_from_output(output: dict[str, Any]) -> dict[str, Any] | None:
@@ -211,14 +216,19 @@ def _next_wakeup_at(output: dict[str, Any], resume: _ResumeValue) -> datetime | 
     return output.get("wakeup_at")
 
 
-async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
+async def step(
+    compiled: _Graph, pool: _Pool, worker_id: str, *, clock: Clock | None = None
+) -> bool:
     """Advance at most one runnable workflow run by one resume.
 
     Returns ``True`` when a run was resumed and its new state persisted, ``False``
     when no run was claimable or the claimed run had no ready result (its lease is
     released without advancing).
     """
-    run = db.claim_run(worker_id, pool=pool)
+    if clock is None:
+        run = db.claim_run(worker_id, pool=pool)
+    else:
+        run = db.claim_run(worker_id, pool=pool, clock=clock)
     if run is None:
         return False
 
@@ -229,40 +239,62 @@ async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
     resume: _ResumeValue | None = None
     if envelope is not None:
         with pool.connection() as conn:
-            resume = _resume_for_run(conn, envelope, run.wakeup_at)
+            resume = _resume_for_run(conn, envelope, run.wakeup_at, clock=clock)
 
     if envelope is None or resume is None:
         # Not actionable yet (no task result, approval signal, or due timer).
         # Release the lease, leaving status/wakeup_at untouched.
-        db.save_run(
-            run.ticket_id,
-            status=run.status,
-            wakeup_at=run.wakeup_at,
-            pool=pool,
-        )
+        if clock is None:
+            db.save_run(
+                run.ticket_id,
+                status=run.status,
+                wakeup_at=run.wakeup_at,
+                pool=pool,
+            )
+        else:
+            db.save_run(
+                run.ticket_id,
+                status=run.status,
+                wakeup_at=run.wakeup_at,
+                pool=pool,
+                clock=clock,
+            )
         return False
 
     out = await compiled.ainvoke(Command(resume=resume.payload), cfg)
-    db.save_run(
-        run.ticket_id,
-        status=out["status"],
-        wakeup_at=_next_wakeup_at(out, resume),
-        consumed_signal_id=resume.consumed_signal_id,
-        pool=pool,
-    )
+    if clock is None:
+        db.save_run(
+            run.ticket_id,
+            status=out["status"],
+            wakeup_at=_next_wakeup_at(out, resume),
+            consumed_signal_id=resume.consumed_signal_id,
+            pool=pool,
+        )
+    else:
+        db.save_run(
+            run.ticket_id,
+            status=out["status"],
+            wakeup_at=_next_wakeup_at(out, resume),
+            consumed_signal_id=resume.consumed_signal_id,
+            pool=pool,
+            clock=clock,
+        )
     logger.info(
         "advanced run", extra={"ticket_id": run.ticket_id, "status": out["status"]}
     )
     return True
 
 
-def reclaim_expired_leases(pool: _Pool) -> JanitorResult:
+def reclaim_expired_leases(pool: _Pool, *, clock: Clock | None = None) -> JanitorResult:
     """Reclaim expired task and workflow-run leases."""
     with pool.connection() as conn:
         tasks = taskqueue.reclaim_expired(conn)
         conn.commit()
 
-    runs = db.reclaim_expired_runs(pool=pool)
+    if clock is None:
+        runs = db.reclaim_expired_runs(pool=pool)
+    else:
+        runs = db.reclaim_expired_runs(pool=pool, clock=clock)
     result = JanitorResult(tasks=tasks, runs=runs)
     if tasks or runs:
         logger.info(
@@ -280,6 +312,7 @@ async def run_forever(
     poll_interval: float = POLL_INTERVAL_S,
     janitor_interval: float = config.JANITOR_INTERVAL_S,
     stop: Callable[[], bool] | None = None,
+    clock: Clock | None = None,
 ) -> None:
     """Poll for runnable runs, advancing them until ``stop`` (or cancellation).
 
@@ -291,10 +324,16 @@ async def run_forever(
     while stop is None or not stop():
         now = loop.time()
         if now >= next_janitor_at:
-            reclaim_expired_leases(pool)
+            if clock is None:
+                reclaim_expired_leases(pool)
+            else:
+                reclaim_expired_leases(pool, clock=clock)
             next_janitor_at = now + janitor_interval
 
-        advanced = await step(compiled, pool, worker_id)
+        if clock is None:
+            advanced = await step(compiled, pool, worker_id)
+        else:
+            advanced = await step(compiled, pool, worker_id, clock=clock)
         if not advanced:
             await asyncio.sleep(poll_interval)
 

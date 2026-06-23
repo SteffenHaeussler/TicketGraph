@@ -10,6 +10,7 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import ConnectionPool
 
 from ticketflow import config
+from ticketflow.clock import Clock, resolve_clock
 
 BOOTSTRAP_MIGRATION = "000_bootstrap"
 TASK_QUEUE_MIGRATION = "001_task_queue"
@@ -61,7 +62,7 @@ class _Cursor(Protocol):
 
 
 class _Connection(Protocol):
-    def execute(self, sql: str, params: tuple[str, ...] | None = None) -> _Cursor: ...
+    def execute(self, sql: str, params: tuple[Any, ...] | None = None) -> _Cursor: ...
 
     def commit(self) -> None: ...
 
@@ -168,6 +169,7 @@ def claim_run(
     *,
     database_url: str | None = None,
     pool: _Pool | None = None,
+    clock: Clock | None = None,
 ) -> WorkflowRun | None:
     """Lease one runnable workflow run for ``worker_id``.
 
@@ -182,6 +184,7 @@ def claim_run(
     """
     owned_pool = pool is None
     active_pool = pool or make_pool(database_url)
+    now = resolve_clock(clock).now()
     try:
         if owned_pool:
             active_pool.open()
@@ -190,14 +193,14 @@ def claim_run(
                 """
                 UPDATE workflow_run
                 SET lease_owner = %s,
-                    lease_expires_at = now() + interval '30 seconds',
-                    updated_at = now()
+                    lease_expires_at = %s + interval '30 seconds',
+                    updated_at = %s
                 WHERE ticket_id = (
                     SELECT ticket_id
                     FROM workflow_run
                     WHERE status NOT IN ('resolved', 'rejected', 'escalated')
-                      AND (lease_expires_at IS NULL OR lease_expires_at < now())
-                      AND (wakeup_at IS NULL OR wakeup_at <= now())
+                      AND (lease_expires_at IS NULL OR lease_expires_at < %s)
+                      AND (wakeup_at IS NULL OR wakeup_at <= %s)
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -205,7 +208,7 @@ def claim_run(
                 RETURNING ticket_id, status, wakeup_at, lease_owner,
                           lease_expires_at, created_at, updated_at
                 """,
-                (worker_id,),
+                (worker_id, now, now, now, now),
             ).fetchone()
             conn.commit()
     finally:
@@ -219,10 +222,12 @@ def reclaim_expired_runs(
     *,
     database_url: str | None = None,
     pool: _Pool | None = None,
+    clock: Clock | None = None,
 ) -> int:
     """Clear expired workflow-run leases so another runner can claim them."""
     owned_pool = pool is None
     active_pool = pool or make_pool(database_url)
+    now = resolve_clock(clock).now()
     try:
         if owned_pool:
             active_pool.open()
@@ -233,13 +238,13 @@ def reclaim_expired_runs(
                     UPDATE workflow_run
                     SET lease_owner = NULL,
                         lease_expires_at = NULL,
-                        updated_at = now()
-                    WHERE lease_expires_at < now()
+                        updated_at = %s
+                    WHERE lease_expires_at < %s
                     RETURNING ticket_id
                 )
                 SELECT count(*) FROM reclaimed
                 """,
-                (),
+                (now, now),
             ).fetchone()
             conn.commit()
     finally:
@@ -258,6 +263,7 @@ def save_run(
     consumed_signal_id: int | None = None,
     database_url: str | None = None,
     pool: _Pool | None = None,
+    clock: Clock | None = None,
 ) -> None:
     """Persist a workflow run's new ``status``/``wakeup_at`` and release its lease.
 
@@ -268,6 +274,7 @@ def save_run(
     """
     owned_pool = pool is None
     active_pool = pool or make_pool(database_url)
+    now = resolve_clock(clock).now()
     try:
         if owned_pool:
             active_pool.open()
@@ -279,20 +286,20 @@ def save_run(
                     wakeup_at = %s,
                     lease_owner = NULL,
                     lease_expires_at = NULL,
-                    updated_at = now()
+                    updated_at = %s
                 WHERE ticket_id = %s
                 """,
-                (status, wakeup_at, ticket_id),
+                (status, wakeup_at, now, ticket_id),
             )
             if consumed_signal_id is not None:
                 conn.execute(
                     """
                     UPDATE pending_signal
                     SET consumed = true,
-                        consumed_at = now()
+                        consumed_at = %s
                     WHERE id = %s
                     """,
-                    (consumed_signal_id,),
+                    (now, consumed_signal_id),
                 )
             conn.commit()
     finally:
@@ -340,6 +347,7 @@ def wake_run(
     *,
     database_url: str | None = None,
     pool: _Pool | None = None,
+    clock: Clock | None = None,
 ) -> None:
     """Make a run claimable now by pulling its ``wakeup_at`` to the present.
 
@@ -350,6 +358,7 @@ def wake_run(
     """
     owned_pool = pool is None
     active_pool = pool or make_pool(database_url)
+    now = resolve_clock(clock).now()
     try:
         if owned_pool:
             active_pool.open()
@@ -357,11 +366,11 @@ def wake_run(
             conn.execute(
                 """
                 UPDATE workflow_run
-                SET wakeup_at = now(),
-                    updated_at = now()
+                SET wakeup_at = %s,
+                    updated_at = %s
                 WHERE ticket_id = %s
                 """,
-                (ticket_id,),
+                (now, now, ticket_id),
             )
             conn.commit()
     finally:
@@ -376,6 +385,7 @@ def add_pending_signal(
     *,
     database_url: str | None = None,
     pool: _Pool | None = None,
+    clock: Clock | None = None,
 ) -> int:
     """Persist an unconsumed workflow signal and wake the target run.
 
@@ -384,6 +394,7 @@ def add_pending_signal(
     """
     owned_pool = pool is None
     active_pool = pool or make_pool(database_url)
+    now = resolve_clock(clock).now()
     try:
         if owned_pool:
             active_pool.open()
@@ -400,11 +411,11 @@ def add_pending_signal(
             conn.execute(
                 """
                 UPDATE workflow_run
-                SET wakeup_at = now(),
-                    updated_at = now()
+                SET wakeup_at = %s,
+                    updated_at = %s
                 WHERE ticket_id = %s
                 """,
-                (workflow_id,),
+                (now, now, workflow_id),
             )
             conn.commit()
     finally:
@@ -452,6 +463,7 @@ def add_pending_signal_if_waiting(
     waiting_status: str,
     database_url: str | None = None,
     pool: _Pool | None = None,
+    clock: Clock | None = None,
 ) -> int | None:
     """Persist a signal only when its workflow is in ``waiting_status``.
 
@@ -461,6 +473,7 @@ def add_pending_signal_if_waiting(
     """
     owned_pool = pool is None
     active_pool = pool or make_pool(database_url)
+    now = resolve_clock(clock).now()
     try:
         if owned_pool:
             active_pool.open()
@@ -483,14 +496,14 @@ def add_pending_signal_if_waiting(
                 ),
                 woken AS (
                     UPDATE workflow_run
-                    SET wakeup_at = now(),
-                        updated_at = now()
+                    SET wakeup_at = %s,
+                        updated_at = %s
                     WHERE ticket_id IN (SELECT workflow_id FROM inserted)
                     RETURNING ticket_id
                 )
                 SELECT id FROM inserted
                 """,
-                (workflow_id, waiting_status, kind, Jsonb(payload)),
+                (workflow_id, waiting_status, kind, Jsonb(payload), now, now),
             ).fetchone()
             conn.commit()
     finally:

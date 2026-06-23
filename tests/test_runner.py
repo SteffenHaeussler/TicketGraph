@@ -13,7 +13,12 @@ from typing import Any
 
 import pytest
 
-from tests.helpers import billing_classification, drive_until_quiescent, refund_draft
+from tests.helpers import (
+    FrozenClock,
+    billing_classification,
+    drive_until_quiescent,
+    refund_draft,
+)
 from tests.test_db import FakeConnection, FakePool
 from ticketflow import config, db, runner, taskqueue
 from ticketflow.db import WorkflowRun
@@ -152,14 +157,22 @@ async def test_step_resumes_when_result_is_ready(monkeypatch):
 
     monkeypatch.setattr(db, "claim_run", lambda worker_id, pool: run)
     saved: list[dict] = []
+
+    def _save_run(
+        ticket_id,
+        *,
+        status,
+        wakeup_at,
+        pool,
+        consumed_signal_id=None,
+        clock=None,
+    ):
+        saved.append({"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at})
+
     monkeypatch.setattr(
         db,
         "save_run",
-        lambda ticket_id, *, status, wakeup_at, pool, consumed_signal_id=None: (
-            saved.append(
-                {"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at}
-            )
-        ),
+        _save_run,
     )
 
     advanced = await runner.step(compiled, pool, "runner-1")
@@ -367,6 +380,59 @@ async def test_step_releases_without_advancing_when_result_not_ready(monkeypatch
     assert saved == [
         {"ticket_id": "t-1", "status": "classifying", "wakeup_at": run.wakeup_at}
     ]
+
+
+async def test_step_uses_injected_clock_before_and_after_timer_due(monkeypatch):
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    clock = FrozenClock(now)
+    due_at = now + timedelta(minutes=5)
+    run = make_run(wakeup_at=due_at)
+    snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
+    compiled = FakeCompiled(
+        snapshot, invoke_result={"status": "classifying", "wakeup_at": due_at}
+    )
+    pool = FakePool(opened=True, row=None)
+
+    claim_calls: list[object] = []
+    monkeypatch.setattr(
+        db,
+        "claim_run",
+        lambda worker_id, *, pool, clock=None: claim_calls.append(clock) or run,
+    )
+    saved: list[dict] = []
+
+    def _save_run(
+        ticket_id,
+        *,
+        status,
+        wakeup_at,
+        pool,
+        consumed_signal_id=None,
+        clock=None,
+    ):
+        saved.append({"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at})
+
+    monkeypatch.setattr(
+        db,
+        "save_run",
+        _save_run,
+    )
+
+    advanced = await runner.step(compiled, pool, "runner-1", clock=clock)
+
+    assert advanced is False
+    assert compiled.invoked_with == []
+    assert claim_calls == [clock]
+    assert saved == [{"ticket_id": "t-1", "status": "classifying", "wakeup_at": due_at}]
+
+    clock.advance(timedelta(minutes=5))
+    saved.clear()
+
+    advanced = await runner.step(compiled, pool, "runner-1", clock=clock)
+
+    assert advanced is True
+    assert compiled.invoked_with[0].resume == {"kind": "timeout"}
+    assert saved == [{"ticket_id": "t-1", "status": "classifying", "wakeup_at": due_at}]
 
 
 async def test_step_returns_false_when_no_run_is_claimable(monkeypatch):
@@ -615,6 +681,7 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback(
     from ticketflow.models import Ticket, TicketStatus
 
     activities = TicketActivities(MockAgent(seed=1, failure_rate=0.0))
+    clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
     ticket = Ticket(
         id=f"t-runner-timeout-fallback-{uuid.uuid4().hex}",
         customer_email="customer@example.com",
@@ -625,21 +692,29 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(
+            activities, saver, postgres_pool, clock=clock
+        )
 
         out = await compiled.ainvoke(
             {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
         )
         assert "__interrupt__" in out
+        snapshot = await compiled.aget_state(cfg)
         with postgres_pool.connection() as conn:
             conn.execute(
                 "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
-                "VALUES (%s, %s, now() - interval '1 second')",
-                (ticket.id, TicketStatus.CLASSIFYING),
+                "VALUES (%s, %s, %s)",
+                (
+                    ticket.id,
+                    snapshot.values["status"],
+                    snapshot.values.get("wakeup_at"),
+                ),
             )
             conn.commit()
 
-        advanced = await runner.step(compiled, postgres_pool, "runner-1")
+        clock.advance(timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S))
+        advanced = await runner.step(compiled, postgres_pool, "runner-1", clock=clock)
         snapshot = await compiled.aget_state(cfg)
 
     with postgres_pool.connection() as conn:
@@ -678,6 +753,7 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
     from ticketflow.models import Ticket, TicketStatus
 
     activities = TicketActivities(MockAgent(seed=1, failure_rate=0.0))
+    clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
     ticket = Ticket(
         id=f"t-runner-timeout-approval-{uuid.uuid4().hex}",
         customer_email="customer@example.com",
@@ -688,7 +764,9 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(
+            activities, saver, postgres_pool, clock=clock
+        )
 
         await compiled.ainvoke({"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg)
         await compiled.ainvoke(
@@ -701,15 +779,23 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
         )
         assert "__interrupt__" in out
         assert out["__interrupt__"][0].value["kind"] == "approval_required"
+        snapshot = await compiled.aget_state(cfg)
         with postgres_pool.connection() as conn:
             conn.execute(
                 "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
-                "VALUES (%s, %s, now() - interval '1 second')",
-                (ticket.id, TicketStatus.AWAITING_APPROVAL),
+                "VALUES (%s, %s, %s)",
+                (
+                    ticket.id,
+                    snapshot.values["status"],
+                    snapshot.values.get("wakeup_at"),
+                ),
             )
             conn.commit()
 
-        advanced = await runner.step(compiled, postgres_pool, "runner-1")
+        wakeup_at = snapshot.values["wakeup_at"]
+        assert isinstance(wakeup_at, datetime)
+        clock.advance(wakeup_at - clock.now())
+        advanced = await runner.step(compiled, postgres_pool, "runner-1", clock=clock)
         snapshot = await compiled.aget_state(cfg)
 
     with postgres_pool.connection() as conn:

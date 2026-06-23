@@ -5,7 +5,7 @@ them with the agent result. Refund / low-confidence drafts then pause at the
 approval gate, which resumes from a human decision or a timer envelope.
 """
 
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
@@ -13,7 +13,7 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from tests.helpers import process_one_task
+from tests.helpers import FrozenClock, process_one_task
 from tests.test_db import FakePool
 from ticketflow import config, db, graph
 from ticketflow.activities import TicketActivities
@@ -268,6 +268,40 @@ async def test_agent_dispatch_updates_visible_status_before_interrupt() -> None:
     assert snapshot.values["status"] == TicketStatus.DRAFTING
 
 
+async def test_agent_dispatch_uses_injected_clock_for_schedule_to_start() -> None:
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
+    clock = FrozenClock(now)
+    pool = FakePool(opened=True, row=(1,))
+    compiled = graph.compile_ticket_graph(
+        recording_activities(), InMemorySaver(), pool, clock=clock
+    )
+    ticket = make_ticket("t-clock-dispatch")
+    cfg = config_for(ticket.id)
+
+    out = await compiled.ainvoke(
+        {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+    )
+
+    expected_classify_wakeup = now + timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S)
+    assert out["wakeup_at"] == expected_classify_wakeup
+    assert out["__interrupt__"][0].value["wakeup_at"] == (
+        expected_classify_wakeup.isoformat()
+    )
+
+    clock.advance(timedelta(minutes=5))
+    out = await compiled.ainvoke(
+        Command(resume=make_classification().model_dump(mode="json")), cfg
+    )
+
+    expected_draft_wakeup = clock.now() + timedelta(
+        seconds=config.AGENT_SCHEDULE_TO_START_S
+    )
+    assert out["wakeup_at"] == expected_draft_wakeup
+    assert out["__interrupt__"][0].value["wakeup_at"] == (
+        expected_draft_wakeup.isoformat()
+    )
+
+
 async def test_classify_task_failure_escalates_without_draft_dispatch() -> None:
     pool = FakePool(opened=True, row=(1,))
     compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
@@ -444,6 +478,28 @@ async def test_decide_approval_flags_low_confidence_drafts() -> None:
     draft = state.get("draft")
     assert draft is not None
     assert draft.confidence < 0.75
+
+
+async def test_prepare_approval_uses_injected_clock_for_timeout() -> None:
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
+    clock = FrozenClock(now)
+    pool = FakePool(opened=True, row=(1,))
+    compiled = graph.compile_ticket_graph(
+        recording_activities(), InMemorySaver(), pool, clock=clock
+    )
+    ticket = make_ticket("t-clock-approval")
+
+    out = await resume_through_agents(
+        compiled,
+        ticket,
+        classification=make_classification(),
+        draft=refund_draft(),
+    )
+    snapshot = await compiled.aget_state(config_for(ticket.id))
+
+    expected_wakeup = now + APPROVAL_TIMEOUT
+    assert snapshot.values["wakeup_at"] == expected_wakeup
+    assert out["__interrupt__"][0].value["wakeup_at"] == expected_wakeup.isoformat()
 
 
 async def test_approved_resume_continues_to_resolution() -> None:
