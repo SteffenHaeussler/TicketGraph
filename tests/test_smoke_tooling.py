@@ -33,6 +33,18 @@ def test_make_smoke_manages_stack_and_test_docker_delegates() -> None:
     assert "uv run pytest tests/test_smoke_stack.py -o addopts=" in makefile
     assert "trap 'docker compose down' EXIT" in makefile
     assert "test-docker: smoke" in makefile
+    assert "test-docker-tracing:\n\t@set -e;" in makefile
+    assert "trap 'COMPOSE_PROFILES=tracing docker compose down' EXIT" in makefile
+    tracing_up = (
+        "TICKETFLOW_TRACE_EXPORTER=otlp COMPOSE_PROFILES=tracing "
+        "docker compose up --build -d"
+    )
+    tracing_pytest = (
+        "API_URL=$(API_URL) JAEGER_URL=$(JAEGER_URL) "
+        "uv run pytest tests/test_tracing_stack.py -o addopts="
+    )
+    assert tracing_up in makefile
+    assert tracing_pytest in makefile
 
 
 @pytest.mark.asyncio

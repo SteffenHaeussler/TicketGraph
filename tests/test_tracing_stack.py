@@ -38,7 +38,7 @@ async def test_docker_stack_exports_api_traces_to_jaeger(
     while True:
         services_response = await jaeger_client.get("/api/services")
         services_response.raise_for_status()
-        services = set(services_response.json().get("data", []))
+        services = set(services_response.json().get("data") or [])
         if "ticketflow-api" in services:
             return
         if time.monotonic() >= deadline:

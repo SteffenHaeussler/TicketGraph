@@ -559,14 +559,12 @@ async def test_postgres_primary_task_completion_wakes_run(
             "SELECT status, result FROM task_queue WHERE workflow_id = %s",
             (ticket.id,),
         ).fetchone()
-        run_row = conn.execute(
-            "SELECT wakeup_at <= now() FROM workflow_run WHERE ticket_id = %s",
-            (ticket.id,),
-        ).fetchone()
+    claimed = db.claim_run("runner-assert", pool=postgres_pool)
 
     assert processed is True
     assert row == (
         "done",
         {"category": "billing", "confidence": 0.9, "model": "primary"},
     )
-    assert run_row == (True,)
+    assert claimed is not None
+    assert claimed.ticket_id == ticket.id
