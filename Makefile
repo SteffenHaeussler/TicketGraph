@@ -49,9 +49,11 @@ smoke:
 test-docker: smoke
 
 test-docker-tracing:
-	TICKETFLOW_TRACE_EXPORTER=otlp COMPOSE_PROFILES=tracing docker compose up --build -d
+	@set -e; \
+	trap 'COMPOSE_PROFILES=tracing docker compose down' EXIT; \
+	TICKETFLOW_TRACE_EXPORTER=otlp COMPOSE_PROFILES=tracing docker compose up --build -d; \
+	uv run python scripts/wait_for_api.py --base-url $(API_URL); \
 	API_URL=$(API_URL) JAEGER_URL=$(JAEGER_URL) uv run pytest tests/test_tracing_stack.py -o addopts=
-	COMPOSE_PROFILES=tracing docker compose down
 
 ## --- run the Milestone 0 stack ---
 

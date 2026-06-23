@@ -214,17 +214,15 @@ async def test_postgres_finalize_runs_side_effects_and_wakes_run(
         refund_row = conn.execute(
             "SELECT amount FROM refunds WHERE ticket_id = %s", (ticket.id,)
         ).fetchone()
-        run_row = conn.execute(
-            "SELECT wakeup_at <= now() FROM workflow_run WHERE ticket_id = %s",
-            (ticket.id,),
-        ).fetchone()
     stored = readmodel.load_result(ticket.id, database_url=config.DATABASE_URL)
+    claimed = db.claim_run("runner-assert", pool=postgres_pool)
 
     assert processed is True
     assert task_row is not None
     assert task_row[0] == "done"
     assert task_row[1]["refund_executed"] is True
     assert refund_row == (42.0,)
-    assert run_row == (True,)
+    assert claimed is not None
+    assert claimed.ticket_id == ticket.id
     assert stored is not None
     assert stored.refund_executed is True
