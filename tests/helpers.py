@@ -3,7 +3,7 @@
 import uuid
 from typing import Any
 
-from ticketflow import config, db, taskqueue
+from ticketflow import agent_worker, config, side_effect_worker
 from ticketflow.activities import TicketActivities
 from ticketflow.agent.base import AgentOverloadedError
 from ticketflow.db import _Pool
@@ -14,8 +14,6 @@ from ticketflow.models import (
     ProposedAction,
     Ticket,
     TicketCategory,
-    TicketResult,
-    TicketStatus,
 )
 
 
@@ -64,10 +62,9 @@ async def process_one_agent_task(
     worker_id: str = "w",
     queue_name: str = config.AGENT_TASK_QUEUE,
 ) -> bool:
-    """Lease one agent task from ``queue_name``, run it, and store the result.
+    """Drive one real agent worker step against ``queue_name``.
 
-    A stand-in for the real agent worker (Milestone 5) so M3.2 tests can drive a
-    dispatch -> queue -> resume loop end to end. Pass
+    Lets M3.2 tests run a dispatch -> queue -> resume loop end to end. Pass
     ``queue_name=config.FALLBACK_TASK_QUEUE`` to drain the schedule-to-start
     fallback queue (M3.4). Returns ``True`` if a task was processed, ``False`` if
     the queue was empty.
@@ -81,36 +78,27 @@ async def process_one_task(
     worker_id: str = "w",
     queue_name: str = config.AGENT_TASK_QUEUE,
 ) -> bool:
-    """Process one queued task from ``queue_name`` in graph integration tests."""
-    task = db.dequeue(queue_name, worker_id, pool=pool)
-    if task is None:
-        return False
+    """Drive one real in-process worker step for a queued task (plan M7.3).
 
-    ticket = Ticket.model_validate(task.payload["ticket"])
-    if task.task_type == "classify":
-        result = await activities.classify_ticket(ticket)
-    elif task.task_type == "draft":
-        classification = Classification.model_validate(task.payload["classification"])
-        result = await activities.draft_reply(ticket, classification)
-    elif task.task_type == "finalize_ticket":
-        action = ProposedAction.model_validate(task.payload["action"])
-        result = TicketResult.model_validate(task.payload["result"])
-        refund_executed = False
-        if result.status == TicketStatus.RESOLVED and action.type == ActionType.REFUND:
-            assert action.refund_amount is not None
-            refund_executed = await activities.execute_refund(
-                ticket.id, action.refund_amount, attempt=1
-            )
-        await activities.send_reply(ticket, result.reply_text)
-        result = result.model_copy(update={"refund_executed": refund_executed})
-        await activities.record_result(result)
-    else:  # pragma: no cover - defensive
-        raise ValueError(f"unexpected task_type {task.task_type!r}")
-
-    with pool.connection() as conn:
-        taskqueue.complete(conn, task.id, result=result.model_dump(mode="json"))
-        conn.commit()
-    return True
+    Delegates to :func:`agent_worker.process_one_task`, selecting the router by
+    queue exactly as the production workers wire it: the default ``TASK_QUEUE``
+    finalizes side effects via :func:`side_effect_worker.run_finalize`, while the
+    agent and fallback queues use the default classify/draft router.
+    """
+    if queue_name == config.TASK_QUEUE:
+        return await agent_worker.process_one_task(
+            pool,
+            activities,
+            worker_id=worker_id,
+            queue_name=queue_name,
+            run_activity=side_effect_worker.run_finalize,
+        )
+    return await agent_worker.process_one_task(
+        pool,
+        activities,
+        worker_id=worker_id,
+        queue_name=queue_name,
+    )
 
 
 async def drive_until_quiescent(
@@ -122,12 +110,13 @@ async def drive_until_quiescent(
     worker_id: str = "runner-1",
     max_iterations: int = 50,
 ) -> None:
-    """Interleave ``runner.step`` with the worker stub until no work remains.
+    """Interleave the real runner and worker steps until no work remains (M7.3).
 
-    Stands in for the real runner + worker processes (plan M7.3): each iteration
-    advances the graph by one ready resume, otherwise drains one queued task and
-    wakes the run so the next ``runner.step`` can pick up the fresh result. Raises
-    if quiescence is not reached within ``max_iterations``.
+    Stands in for the real runner + worker processes: each iteration advances the
+    graph by one ready ``runner.step`` resume, otherwise drains one queued task
+    through the real worker step (which wakes the run so the next ``runner.step``
+    picks up the fresh result). Raises if quiescence is not reached within
+    ``max_iterations``.
     """
     from ticketflow import runner
 
@@ -145,7 +134,6 @@ async def drive_until_quiescent(
                 break
         if not produced:
             return
-        db.wake_run(ticket_id, pool=pool)
     raise AssertionError(f"run {ticket_id} did not reach quiescence")
 
 
