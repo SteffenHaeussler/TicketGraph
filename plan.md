@@ -146,7 +146,7 @@ RETURNING *;
   `make_worker`.
 - [ ] **7.4 Retarget workflow tests:** happy path, fallback-on-timeout, transient retries succeed,
   exhausted retries → escalate, permanent error → no retry, refund idempotency.
-- [ ] **7.5 Retarget API tests:** create, list-by-status, status, approval, duplicate approval 409,
+- [x] **7.5 Retarget API tests:** create, list-by-status, status, approval, duplicate approval 409,
   late approval timeout → escalate.
 - [ ] **7.6 Makefile + docs:** rename `worker`/`llm-worker` targets to `runner`/`agent_worker`;
   update README run instructions. (Keep `test_mock_agent.py` & `test_models.py` unchanged.)
