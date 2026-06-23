@@ -48,6 +48,13 @@ Run the API:
 make api
 ```
 
+Run the workflow runner and agent worker (each in its own shell):
+
+```bash
+make runner
+make agent_worker
+```
+
 Check readiness:
 
 ```bash
@@ -68,8 +75,8 @@ make down
 make stack-reset
 ```
 
-The Compose stack includes Postgres, the API, and placeholder worker processes.
-The worker commands import and log cleanly, but do not process tickets yet.
+The Compose stack includes Postgres, the API, the workflow `runner`, and the
+`agent_worker`, `fallback-worker`, and `side-effect-worker` processes.
 
 ## Tracing
 

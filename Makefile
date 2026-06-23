@@ -1,4 +1,4 @@
-.PHONY: install install-hooks lint format-check format typecheck check test integration coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger worker fallback-worker side-effect-worker api doctor ticket status approve reject batch reset
+.PHONY: install install-hooks lint format-check format typecheck check test integration coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger runner agent_worker fallback-worker side-effect-worker api doctor ticket status approve reject batch reset
 
 N ?= 100
 API_PORT ?= 8000
@@ -76,8 +76,11 @@ stack-reset:
 jaeger:
 	docker compose up jaeger
 
-worker:
-	uv run python -m ticketflow.worker
+runner:
+	uv run python -m ticketflow.runner
+
+agent_worker:
+	uv run python -m ticketflow.agent_worker
 
 fallback-worker:
 	uv run python -m ticketflow.fallback_worker

@@ -1,5 +1,6 @@
-# One image for all three app services (api, worker, llm-worker); compose picks
-# the command per service. Same code, different runtime roles.
+# One image for all app services (api, runner, agent_worker, fallback-worker,
+# side-effect-worker); compose picks the command per service. Same code,
+# different runtime roles.
 FROM python:3.12-slim
 
 COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
