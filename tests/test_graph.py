@@ -5,6 +5,7 @@ them with the agent result. Refund / low-confidence drafts then pause at the
 approval gate, which resumes from a human decision or a timer envelope.
 """
 
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
@@ -13,10 +14,15 @@ from langchain_core.runnables import RunnableConfig
 from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
-from tests.helpers import FrozenClock, process_one_task
+from tests.helpers import (
+    FrozenClock,
+    drive_until_quiescent,
+    process_one_task,
+)
 from tests.test_db import FakePool
-from ticketflow import config, db, graph
+from ticketflow import config, db, graph, readmodel, runner
 from ticketflow.activities import TicketActivities
+from ticketflow.agent.base import AgentOverloadedError, AgentPermanentError
 from ticketflow.agent.mock import MockAgent
 from ticketflow.models import (
     ActionType,
@@ -29,6 +35,7 @@ from ticketflow.models import (
     TicketResult,
     TicketStatus,
 )
+from ticketflow.signals import APPROVAL_DECISION_SIGNAL
 from ticketflow.workflows import APPROVAL_TIMEOUT, ESCALATION_REPLY, REJECTION_REPLY
 
 
@@ -53,6 +60,77 @@ class RecordingActivities(TicketActivities):
 
     async def record_result(self, result: TicketResult) -> None:
         self.recorded_results.append(result)
+
+
+class ScriptedAgent:
+    """Agent test double with fixed classify/draft results and call counts."""
+
+    def __init__(self, classification: Classification, draft: DraftReply) -> None:
+        self.classification = classification
+        self.draft = draft
+        self.classify_calls = 0
+        self.draft_calls = 0
+
+    async def classify(self, ticket: Ticket) -> Classification:
+        _ = ticket
+        self.classify_calls += 1
+        return self.classification
+
+    async def draft_reply(
+        self, ticket: Ticket, classification: Classification
+    ) -> DraftReply:
+        _ = ticket, classification
+        self.draft_calls += 1
+        return self.draft
+
+
+class TransientFailureAgent(ScriptedAgent):
+    """Agent that fails a fixed number of classify calls, then succeeds."""
+
+    def __init__(
+        self, classification: Classification, draft: DraftReply, *, failures: int
+    ) -> None:
+        super().__init__(classification, draft)
+        self.remaining_failures = failures
+
+    async def classify(self, ticket: Ticket) -> Classification:
+        if self.remaining_failures > 0:
+            self.remaining_failures -= 1
+            self.classify_calls += 1
+            raise AgentOverloadedError("backend overloaded")
+        return await super().classify(ticket)
+
+
+class AlwaysOverloadedAgent(ScriptedAgent):
+    """Agent that always raises a transient overload while classifying."""
+
+    async def classify(self, ticket: Ticket) -> Classification:
+        _ = ticket
+        self.classify_calls += 1
+        raise AgentOverloadedError("backend overloaded")
+
+
+class PermanentFailureAgent(ScriptedAgent):
+    """Agent that raises a permanent classification error without retrying."""
+
+    async def classify(self, ticket: Ticket) -> Classification:
+        _ = ticket
+        self.classify_calls += 1
+        raise AgentPermanentError("invalid ticket input")
+
+
+class FailReplyOnceActivities(TicketActivities):
+    """Activities that fail the first reply after refunding, then succeed."""
+
+    def __init__(self, agent: ScriptedAgent, *, database_url: str) -> None:
+        super().__init__(agent, database_url=database_url)
+        self.reply_calls = 0
+
+    async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
+        _ = ticket, reply_text
+        self.reply_calls += 1
+        if self.reply_calls == 1:
+            raise RuntimeError("mail server down")
 
 
 def make_ticket(ticket_id: str = "t-1") -> Ticket:
@@ -757,6 +835,329 @@ async def test_schedule_to_start_timeout_routes_to_fallback_through_postgres(
             )
 
         assert out["status"] == TicketStatus.RESOLVED
+
+
+@pytest.mark.integration
+async def test_retargeted_workflow_happy_path_resolves_through_runner(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+) -> None:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    ticket = make_ticket(f"t-74-happy-{uuid.uuid4().hex}")
+    agent = ScriptedAgent(make_classification(), reply_draft())
+    activities = TicketActivities(agent, database_url=postgres_database_url)
+    cfg = config_for(ticket.id)
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        await _start_durable_run(compiled, postgres_pool, ticket, cfg)
+
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        snapshot = await compiled.aget_state(cfg)
+
+    assert snapshot.values["status"] == TicketStatus.RESOLVED
+    assert snapshot.values["result"].status == TicketStatus.RESOLVED
+    assert agent.classify_calls == 1
+    assert agent.draft_calls == 1
+    assert _require_task_row(postgres_pool, f"{ticket.id}:classify")["status"] == "done"
+    assert _require_task_row(postgres_pool, f"{ticket.id}:draft")["status"] == "done"
+    assert _require_task_row(postgres_pool, f"{ticket.id}:finalize")["status"] == "done"
+    assert (
+        readmodel.load_result(ticket.id, pool=postgres_pool)
+        == snapshot.values["result"]
+    )
+    assert _refund_counts(postgres_pool, ticket.id) == (0, 0)
+    _assert_terminal_run_clean(postgres_pool, ticket.id, TicketStatus.RESOLVED)
+
+
+@pytest.mark.integration
+async def test_retargeted_workflow_fallback_on_timeout_completes(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+) -> None:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc))
+    ticket = make_ticket(f"t-74-fallback-{uuid.uuid4().hex}")
+    agent = ScriptedAgent(make_classification(), reply_draft())
+    activities = TicketActivities(agent, database_url=postgres_database_url)
+    cfg = config_for(ticket.id)
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(
+            activities, saver, postgres_pool, clock=clock
+        )
+        await _start_durable_run(compiled, postgres_pool, ticket, cfg)
+
+        clock.advance(timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S))
+        advanced = await runner.step(compiled, postgres_pool, "runner-1", clock=clock)
+        fallback_row = _require_task_row(
+            postgres_pool, f"{ticket.id}:classify:fallback"
+        )
+
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        snapshot = await compiled.aget_state(cfg)
+
+    primary_row = _require_task_row(postgres_pool, f"{ticket.id}:classify")
+    assert advanced is True
+    assert primary_row["status"] == "failed"
+    assert primary_row["permanent"] is True
+    assert primary_row["error"] == "redispatched to fallback"
+    assert fallback_row["queue_name"] == config.FALLBACK_TASK_QUEUE
+    assert fallback_row["status"] == "pending"
+    assert (
+        _require_task_row(postgres_pool, f"{ticket.id}:classify:fallback")["status"]
+        == "done"
+    )
+    assert snapshot.values["status"] == TicketStatus.RESOLVED
+    _assert_terminal_run_clean(postgres_pool, ticket.id, TicketStatus.RESOLVED)
+
+
+@pytest.mark.integration
+async def test_retargeted_workflow_transient_retry_succeeds(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+) -> None:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    ticket = make_ticket(f"t-74-transient-{uuid.uuid4().hex}")
+    agent = TransientFailureAgent(make_classification(), reply_draft(), failures=1)
+    activities = TicketActivities(agent, database_url=postgres_database_url)
+    cfg = config_for(ticket.id)
+    key = f"{ticket.id}:classify"
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        await _start_durable_run(compiled, postgres_pool, ticket, cfg)
+
+        assert await process_one_task(postgres_pool, activities)
+        first_row = _require_task_row(postgres_pool, key)
+        assert first_row["status"] == "pending"
+        assert first_row["attempts"] == 1
+
+        _force_task_due(postgres_pool, key)
+        assert await process_one_task(postgres_pool, activities)
+        second_row = _require_task_row(postgres_pool, key)
+        assert second_row["status"] == "done"
+        assert second_row["attempts"] == 2
+
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        snapshot = await compiled.aget_state(cfg)
+
+    assert agent.classify_calls == 2
+    assert snapshot.values["status"] == TicketStatus.RESOLVED
+    _assert_terminal_run_clean(postgres_pool, ticket.id, TicketStatus.RESOLVED)
+
+
+@pytest.mark.integration
+async def test_retargeted_workflow_exhausted_retries_escalate(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+) -> None:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    ticket = make_ticket(f"t-74-exhausted-{uuid.uuid4().hex}")
+    agent = AlwaysOverloadedAgent(make_classification(), reply_draft())
+    activities = TicketActivities(agent, database_url=postgres_database_url)
+    cfg = config_for(ticket.id)
+    key = f"{ticket.id}:classify"
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        await _start_durable_run(compiled, postgres_pool, ticket, cfg)
+
+        for expected_attempt in (1, 2, 3):
+            assert await process_one_task(postgres_pool, activities)
+            row = _require_task_row(postgres_pool, key)
+            assert row["attempts"] == expected_attempt
+            if expected_attempt < 3:
+                assert row["status"] == "pending"
+                _force_task_due(postgres_pool, key)
+            else:
+                assert row["status"] == "failed"
+
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        snapshot = await compiled.aget_state(cfg)
+
+    assert agent.classify_calls == 3
+    assert _require_task_row(postgres_pool, key)["error"] == "backend overloaded"
+    assert _task_row(postgres_pool, f"{ticket.id}:draft") is None
+    assert snapshot.values["status"] == TicketStatus.ESCALATED
+    assert snapshot.values["result"].status == TicketStatus.ESCALATED
+    assert _refund_counts(postgres_pool, ticket.id) == (0, 0)
+    _assert_terminal_run_clean(postgres_pool, ticket.id, TicketStatus.ESCALATED)
+
+
+@pytest.mark.integration
+async def test_retargeted_workflow_permanent_error_does_not_retry(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+) -> None:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    ticket = make_ticket(f"t-74-permanent-{uuid.uuid4().hex}")
+    agent = PermanentFailureAgent(make_classification(), reply_draft())
+    activities = TicketActivities(agent, database_url=postgres_database_url)
+    cfg = config_for(ticket.id)
+    key = f"{ticket.id}:classify"
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        await _start_durable_run(compiled, postgres_pool, ticket, cfg)
+
+        assert await process_one_task(postgres_pool, activities)
+        row = _require_task_row(postgres_pool, key)
+
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        snapshot = await compiled.aget_state(cfg)
+
+    assert agent.classify_calls == 1
+    assert row["status"] == "failed"
+    assert row["attempts"] == 1
+    assert row["permanent"] is True
+    assert row["error"] == "invalid ticket input"
+    assert _task_row(postgres_pool, f"{ticket.id}:draft") is None
+    assert snapshot.values["status"] == TicketStatus.ESCALATED
+    _assert_terminal_run_clean(postgres_pool, ticket.id, TicketStatus.ESCALATED)
+
+
+@pytest.mark.integration
+async def test_retargeted_workflow_refund_idempotency_on_finalizer_retry(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+) -> None:
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    ticket = make_ticket(f"t-74-refund-idem-{uuid.uuid4().hex}")
+    agent = ScriptedAgent(make_classification(), refund_draft(amount=42.0))
+    activities = FailReplyOnceActivities(agent, database_url=postgres_database_url)
+    cfg = config_for(ticket.id)
+    finalize_key = f"{ticket.id}:finalize"
+    decision = ApprovalDecision(approved=True, approver="sam@example.com")
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        await _start_durable_run(compiled, postgres_pool, ticket, cfg)
+
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        awaiting = await compiled.aget_state(cfg)
+        assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
+
+        db.add_pending_signal(
+            ticket.id,
+            APPROVAL_DECISION_SIGNAL,
+            decision.model_dump(mode="json"),
+            pool=postgres_pool,
+        )
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        first_finalize = _require_task_row(postgres_pool, finalize_key)
+        assert first_finalize["status"] == "pending"
+        assert first_finalize["attempts"] == 1
+        assert _refund_counts(postgres_pool, ticket.id) == (1, 1)
+
+        _force_task_due(postgres_pool, finalize_key)
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        snapshot = await compiled.aget_state(cfg)
+
+    finalizer = _require_task_row(postgres_pool, finalize_key)
+    assert activities.reply_calls == 2
+    assert finalizer["status"] == "done"
+    assert finalizer["attempts"] == 2
+    assert finalizer["result"]["refund_executed"] is False
+    assert _refund_counts(postgres_pool, ticket.id) == (1, 2)
+    assert snapshot.values["status"] == TicketStatus.RESOLVED
+    assert snapshot.values["result"].refund_executed is False
+    _assert_terminal_run_clean(postgres_pool, ticket.id, TicketStatus.RESOLVED)
+
+
+async def _start_durable_run(
+    compiled: Any,
+    pool: db.ConnectionPool,
+    ticket: Ticket,
+    cfg: RunnableConfig,
+) -> None:
+    out = await compiled.ainvoke(
+        {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+    )
+    assert "__interrupt__" in out
+    snapshot = await compiled.aget_state(cfg)
+    with pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+            "VALUES (%s, %s, %s)",
+            (
+                ticket.id,
+                snapshot.values["status"],
+                snapshot.values.get("wakeup_at"),
+            ),
+        )
+        conn.commit()
+
+
+def _task_row(pool: object, idempotency_key: str) -> dict[str, Any] | None:
+    with pool.connection() as conn:  # type: ignore[attr-defined]
+        row = conn.execute(
+            """
+            SELECT queue_name, task_type, status, attempts, max_attempts,
+                   error, permanent, result
+            FROM task_queue
+            WHERE idempotency_key = %s
+            """,
+            (idempotency_key,),
+        ).fetchone()
+    if row is None:
+        return None
+    return {
+        "queue_name": row[0],
+        "task_type": row[1],
+        "status": row[2],
+        "attempts": row[3],
+        "max_attempts": row[4],
+        "error": row[5],
+        "permanent": row[6],
+        "result": row[7],
+    }
+
+
+def _require_task_row(pool: object, idempotency_key: str) -> dict[str, Any]:
+    row = _task_row(pool, idempotency_key)
+    assert row is not None, f"missing task row {idempotency_key}"
+    return row
+
+
+def _force_task_due(pool: object, idempotency_key: str) -> None:
+    with pool.connection() as conn:  # type: ignore[attr-defined]
+        conn.execute(
+            "UPDATE task_queue SET available_at = now() WHERE idempotency_key = %s",
+            (idempotency_key,),
+        )
+        conn.commit()
+
+
+def _refund_counts(pool: object, ticket_id: str) -> tuple[int, int]:
+    with pool.connection() as conn:  # type: ignore[attr-defined]
+        refunds = conn.execute(
+            "SELECT count(*) FROM refunds WHERE ticket_id = %s", (ticket_id,)
+        ).fetchone()
+        attempts = conn.execute(
+            "SELECT count(*) FROM refund_attempts WHERE ticket_id = %s",
+            (ticket_id,),
+        ).fetchone()
+    assert refunds is not None and attempts is not None
+    return int(refunds[0]), int(attempts[0])
+
+
+def _assert_terminal_run_clean(
+    pool: object, ticket_id: str, status: TicketStatus
+) -> None:
+    with pool.connection() as conn:  # type: ignore[attr-defined]
+        row = conn.execute(
+            "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+            "FROM workflow_run WHERE ticket_id = %s",
+            (ticket_id,),
+        ).fetchone()
+    assert row == (status.value, None, None, None)
 
 
 def _pending_keys(pool: object, workflow_id: str) -> list[str]:

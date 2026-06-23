@@ -174,9 +174,12 @@ def claim_run(
     """Lease one runnable workflow run for ``worker_id``.
 
     A run is claimable when it is not in a terminal status, its lease is free
-    or expired, and it is due to run (``wakeup_at`` is null or in the past). The
-    oldest matching run is leased with ``FOR UPDATE SKIP LOCKED`` so several
-    runner processes can claim disjoint runs concurrently.
+    or expired, and it is due to run (``wakeup_at`` is null or in the past).
+    Terminal rows are claimable only after a worker explicitly wakes them by
+    setting ``wakeup_at``; this lets the runner consume terminal task results
+    without polling already-settled rows. The oldest matching run is leased with
+    ``FOR UPDATE SKIP LOCKED`` so several runner processes can claim disjoint
+    runs concurrently.
 
     The finer "an agent result or approval signal is ready" predicate is layered
     on by the runner in later milestones; for now a future ``wakeup_at`` (an
@@ -198,7 +201,10 @@ def claim_run(
                 WHERE ticket_id = (
                     SELECT ticket_id
                     FROM workflow_run
-                    WHERE status NOT IN ('resolved', 'rejected', 'escalated')
+                    WHERE (
+                        status NOT IN ('resolved', 'rejected', 'escalated')
+                        OR (wakeup_at IS NOT NULL AND wakeup_at <= %s)
+                      )
                       AND (lease_expires_at IS NULL OR lease_expires_at < %s)
                       AND (wakeup_at IS NULL OR wakeup_at <= %s)
                     ORDER BY created_at
@@ -208,7 +214,7 @@ def claim_run(
                 RETURNING ticket_id, status, wakeup_at, lease_owner,
                           lease_expires_at, created_at, updated_at
                 """,
-                (worker_id, now, now, now, now),
+                (worker_id, now, now, now, now, now),
             ).fetchone()
             conn.commit()
     finally:

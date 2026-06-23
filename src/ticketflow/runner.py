@@ -209,10 +209,10 @@ def _parse_wakeup_at(value: Any) -> datetime | None:
 
 def _next_wakeup_at(output: dict[str, Any], resume: _ResumeValue) -> datetime | None:
     """The ``workflow_run.wakeup_at`` value to persist after a graph step."""
-    if resume.payload == {"kind": "timeout"}:
-        envelope = _interrupt_envelope_from_output(output)
-        if envelope is not None:
-            return _parse_wakeup_at(envelope.get("wakeup_at"))
+    _ = resume
+    envelope = _interrupt_envelope_from_output(output)
+    if envelope is not None:
+        return _parse_wakeup_at(envelope.get("wakeup_at"))
     return output.get("wakeup_at")
 
 

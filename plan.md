@@ -144,7 +144,7 @@ RETURNING *;
 - [ ] **7.2 Injectable clock** so 24h approval + 30s schedule-to-start fire deterministically.
 - [x] **7.3 Drive-until-quiescent helper** (in-process runner+worker steps), analogous to today's
   `make_worker`.
-- [ ] **7.4 Retarget workflow tests:** happy path, fallback-on-timeout, transient retries succeed,
+- [x] **7.4 Retarget workflow tests:** happy path, fallback-on-timeout, transient retries succeed,
   exhausted retries → escalate, permanent error → no retry, refund idempotency.
 - [ ] **7.5 Retarget API tests:** create, list-by-status, status, approval, duplicate approval 409,
   late approval timeout → escalate.
