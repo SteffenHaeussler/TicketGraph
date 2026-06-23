@@ -341,13 +341,14 @@ def test_claim_run_leases_due_unleased_run_with_skip_locked():
     assert "FOR UPDATE SKIP LOCKED" in sql
     assert "lease_expires_at = %s + interval '30 seconds'" in sql
     assert "status NOT IN ('resolved', 'rejected', 'escalated')" in sql
+    assert "wakeup_at IS NOT NULL AND wakeup_at <= %s" in sql
     assert "lease_expires_at IS NULL OR lease_expires_at < %s" in sql
     assert "wakeup_at IS NULL OR wakeup_at <= %s" in sql
     assert "ORDER BY created_at" in sql
     assert "RETURNING ticket_id, status, wakeup_at" in sql
     params = pool.connection_obj.params[-1]
     assert params[0] == "runner-1"
-    assert len(params) == 5
+    assert len(params) == 6
     assert all(isinstance(value, datetime) for value in params[1:])
     assert pool.connection_obj.commits == 1
     assert run is not None
@@ -1046,6 +1047,30 @@ def test_claim_run_uses_injected_clock_for_wakeup_against_real_postgres(
     assert claimed is not None
     assert claimed.ticket_id == "clocked"
     assert claimed.lease_owner == "runner-1"
+
+
+@pytest.mark.integration
+def test_claim_run_leases_woken_terminal_run_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+            "VALUES ('terminal-woken', 'escalated', now())"
+        )
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+            "VALUES ('terminal-quiet', 'resolved', NULL)"
+        )
+        conn.commit()
+
+    claimed = db.claim_run("runner-1", pool=postgres_pool)
+    second = db.claim_run("runner-2", pool=postgres_pool)
+
+    assert claimed is not None
+    assert claimed.ticket_id == "terminal-woken"
+    assert claimed.status == "escalated"
+    assert second is None
 
 
 @pytest.mark.integration

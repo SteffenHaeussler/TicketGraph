@@ -107,6 +107,35 @@ def test_resume_value_is_none_when_result_not_ready():
     assert runner._resume_value(conn, {"idempotency_key": "t-1:classify"}) is None
 
 
+def test_next_wakeup_at_clears_stale_wakeup_when_interrupt_has_no_timer():
+    stale = datetime(2026, 6, 16, 12, 0, tzinfo=UTC)
+    output = {
+        "status": "escalated",
+        "wakeup_at": stale,
+        "__interrupt__": [
+            FakeInterrupt(
+                {
+                    "kind": "terminal_task",
+                    "idempotency_key": "t-1:finalize",
+                }
+            )
+        ],
+    }
+
+    wakeup_at = runner._next_wakeup_at(
+        output,
+        runner._ResumeValue(
+            {
+                "kind": "task_failed",
+                "error": "backend overloaded",
+                "permanent": False,
+            }
+        ),
+    )
+
+    assert wakeup_at is None
+
+
 def test_resume_value_is_none_for_approval_envelope_without_signal():
     conn = FakeConnection(row=None)
 
