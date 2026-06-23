@@ -26,7 +26,7 @@ the result that the worker persisted after sending replies/refunds.
 
 from __future__ import annotations
 
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta
 from typing import Any, Literal, TypedDict
 
 from langgraph.checkpoint.base import BaseCheckpointSaver
@@ -37,6 +37,7 @@ from langgraph.types import interrupt
 from ticketflow import config, taskqueue
 from ticketflow.activities import TicketActivities
 from ticketflow.agent.mock import MockAgent
+from ticketflow.clock import Clock, resolve_clock
 from ticketflow.db import _Pool
 from ticketflow.models import (
     ActionType,
@@ -108,7 +109,9 @@ class TicketState(TypedDict, total=False):
     result: TicketResult | None
 
 
-def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
+def build_ticket_graph(
+    activities: TicketActivities, pool: _Pool, *, clock: Clock | None = None
+) -> StateGraph:
     """Build the uncompiled ticket workflow graph.
 
     ``pool`` is the Postgres connection pool the dispatching nodes use to
@@ -124,6 +127,7 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
                               |-> prepare_approval -> await_approval
     """
     del activities
+    active_clock = resolve_clock(clock)
 
     def enqueue_agent_task(
         *, task_type: str, workflow_id: str, payload: dict[str, Any]
@@ -139,9 +143,7 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
                 idempotency_key=key,
             )
             conn.commit()
-        return datetime.now(timezone.utc) + timedelta(
-            seconds=config.AGENT_SCHEDULE_TO_START_S
-        )
+        return active_clock.now() + timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S)
 
     async def await_agent_task(
         *,
@@ -275,7 +277,7 @@ def build_ticket_graph(activities: TicketActivities, pool: _Pool) -> StateGraph:
         _ = state
         return {
             "status": TicketStatus.AWAITING_APPROVAL,
-            "wakeup_at": datetime.now(timezone.utc) + APPROVAL_TIMEOUT,
+            "wakeup_at": active_clock.now() + APPROVAL_TIMEOUT,
         }
 
     async def await_approval(state: TicketState) -> TicketState:
@@ -422,9 +424,13 @@ def compile_ticket_graph(
     activities: TicketActivities,
     checkpointer: BaseCheckpointSaver,
     pool: _Pool,
+    *,
+    clock: Clock | None = None,
 ) -> CompiledStateGraph:
     """Compile the ticket workflow graph with a durable ``checkpointer``."""
-    return build_ticket_graph(activities, pool).compile(checkpointer=checkpointer)
+    return build_ticket_graph(activities, pool, clock=clock).compile(
+        checkpointer=checkpointer
+    )
 
 
 def default_activities() -> TicketActivities:

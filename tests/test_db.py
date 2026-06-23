@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 
 import pytest
 
+from tests.helpers import FrozenClock
 from ticketflow import db
 
 LEASED_ROW = (
@@ -338,13 +339,16 @@ def test_claim_run_leases_due_unleased_run_with_skip_locked():
 
     sql = pool.connection_obj.sql[-1]
     assert "FOR UPDATE SKIP LOCKED" in sql
-    assert "lease_expires_at = now() + interval '30 seconds'" in sql
+    assert "lease_expires_at = %s + interval '30 seconds'" in sql
     assert "status NOT IN ('resolved', 'rejected', 'escalated')" in sql
-    assert "lease_expires_at IS NULL OR lease_expires_at < now()" in sql
-    assert "wakeup_at IS NULL OR wakeup_at <= now()" in sql
+    assert "lease_expires_at IS NULL OR lease_expires_at < %s" in sql
+    assert "wakeup_at IS NULL OR wakeup_at <= %s" in sql
     assert "ORDER BY created_at" in sql
     assert "RETURNING ticket_id, status, wakeup_at" in sql
-    assert pool.connection_obj.params[-1] == ("runner-1",)
+    params = pool.connection_obj.params[-1]
+    assert params[0] == "runner-1"
+    assert len(params) == 5
+    assert all(isinstance(value, datetime) for value in params[1:])
     assert pool.connection_obj.commits == 1
     assert run is not None
     assert run.ticket_id == "ticket-1"
@@ -394,8 +398,10 @@ def test_reclaim_expired_runs_clears_stale_run_leases():
     assert "UPDATE workflow_run" in sql
     assert "lease_owner = NULL" in sql
     assert "lease_expires_at = NULL" in sql
-    assert "lease_expires_at < now()" in sql
+    assert "lease_expires_at < %s" in sql
     assert "RETURNING ticket_id" in sql
+    assert len(pool.connection_obj.params[-1]) == 2
+    assert all(isinstance(value, datetime) for value in pool.connection_obj.params[-1])
     assert pool.connection_obj.commits == 1
 
 
@@ -430,13 +436,12 @@ def test_save_run_persists_status_and_releases_lease():
     assert "wakeup_at = %s" in sql
     assert "lease_owner = NULL" in sql
     assert "lease_expires_at = NULL" in sql
-    assert "updated_at = now()" in sql
+    assert "updated_at = %s" in sql
     assert "WHERE ticket_id = %s" in sql
-    assert pool.connection_obj.params[-1] == (
-        "awaiting_approval",
-        wakeup_at,
-        "ticket-1",
-    )
+    params = pool.connection_obj.params[-1]
+    assert params[0:2] == ("awaiting_approval", wakeup_at)
+    assert isinstance(params[2], datetime)
+    assert params[3] == "ticket-1"
     assert pool.connection_obj.commits == 1
 
 
@@ -456,8 +461,12 @@ def test_save_run_can_mark_signal_consumed_with_lease_release():
     assert "UPDATE pending_signal" in sql
     assert "consumed = true" in sql
     assert "WHERE id = %s" in sql
-    assert pool.connection_obj.params[-2] == ("awaiting_approval", None, "ticket-1")
-    assert pool.connection_obj.params[-1] == (7,)
+    run_params = pool.connection_obj.params[-2]
+    signal_params = pool.connection_obj.params[-1]
+    assert run_params[0:2] == ("awaiting_approval", None)
+    assert isinstance(run_params[2], datetime)
+    assert run_params[3] == "ticket-1"
+    assert signal_params == (run_params[2], 7)
     assert pool.connection_obj.commits == 1
 
 
@@ -466,7 +475,10 @@ def test_save_run_accepts_null_wakeup_at():
 
     db.save_run("ticket-1", status="resolved", wakeup_at=None, pool=pool)
 
-    assert pool.connection_obj.params[-1] == ("resolved", None, "ticket-1")
+    params = pool.connection_obj.params[-1]
+    assert params[0:2] == ("resolved", None)
+    assert isinstance(params[2], datetime)
+    assert params[3] == "ticket-1"
 
 
 def test_save_run_opens_and_closes_owned_pool(monkeypatch):
@@ -495,10 +507,13 @@ def test_wake_run_pulls_wakeup_at_to_now():
 
     sql = pool.connection_obj.sql[-1]
     assert "UPDATE workflow_run" in sql
-    assert "wakeup_at = now()" in sql
-    assert "updated_at = now()" in sql
+    assert "wakeup_at = %s" in sql
+    assert "updated_at = %s" in sql
     assert "WHERE ticket_id = %s" in sql
-    assert pool.connection_obj.params[-1] == ("ticket-1",)
+    params = pool.connection_obj.params[-1]
+    assert isinstance(params[0], datetime)
+    assert params[0] == params[1]
+    assert params[2] == "ticket-1"
     assert pool.connection_obj.commits == 1
 
 
@@ -559,9 +574,12 @@ def test_add_pending_signal_inserts_signal_and_wakes_run():
     assert signal_id == 42
     assert "INSERT INTO pending_signal" in sql
     assert "UPDATE workflow_run" in sql
-    assert "wakeup_at = now()" in sql
+    assert "wakeup_at = %s" in sql
     assert pool.connection_obj.params[0][0:2] == ("ticket-1", "approval_decision")
-    assert pool.connection_obj.params[1] == ("ticket-1",)
+    wake_params = pool.connection_obj.params[1]
+    assert isinstance(wake_params[0], datetime)
+    assert wake_params[0] == wake_params[1]
+    assert wake_params[2] == "ticket-1"
     assert pool.connection_obj.commits == 1
 
 
@@ -606,12 +624,15 @@ def test_add_pending_signal_if_waiting_inserts_signal_and_wakes_run():
     assert "status = %s" in sql
     assert "ON CONFLICT (workflow_id, kind) WHERE consumed = false DO NOTHING" in sql
     assert "UPDATE workflow_run" in sql
-    assert "wakeup_at = now()" in sql
-    assert pool.connection_obj.params[-1][0:3] == (
+    assert "wakeup_at = %s" in sql
+    params = pool.connection_obj.params[-1]
+    assert params[0:3] == (
         "ticket-1",
         "awaiting_approval",
         "approval_decision",
     )
+    assert isinstance(params[4], datetime)
+    assert params[4] == params[5]
     assert pool.connection_obj.commits == 1
 
 
@@ -999,6 +1020,31 @@ def test_claim_run_reclaims_expired_lease_against_real_postgres(
     claimed = db.claim_run("runner-1", pool=postgres_pool)
 
     assert claimed is not None and claimed.ticket_id == "stale"
+    assert claimed.lease_owner == "runner-1"
+
+
+@pytest.mark.integration
+def test_claim_run_uses_injected_clock_for_wakeup_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
+    clock = FrozenClock(now)
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+            "VALUES ('clocked', 'classifying', %s)",
+            (now + timedelta(hours=1),),
+        )
+        conn.commit()
+
+    assert db.claim_run("runner-1", pool=postgres_pool, clock=clock) is None
+
+    clock.advance(timedelta(hours=1))
+
+    claimed = db.claim_run("runner-1", pool=postgres_pool, clock=clock)
+
+    assert claimed is not None
+    assert claimed.ticket_id == "clocked"
     assert claimed.lease_owner == "runner-1"
 
 
