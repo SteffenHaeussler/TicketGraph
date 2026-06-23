@@ -15,16 +15,24 @@ services:
       timeout: 5s
       retries: 30
 
-  worker:
+  runner:
     build: .
-    command: python -m ticketflow.worker
+    command: python -m ticketflow.runner
     environment:
       DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
-      TICKETFLOW_DB_PATH: /data/ticketflow.db
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
-    volumes:
-      - ticketflow-data:/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  agent_worker:
+    build: .
+    command: python -m ticketflow.agent_worker
+    environment:
+      DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
+      TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
+      TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     depends_on:
       postgres:
         condition: service_healthy

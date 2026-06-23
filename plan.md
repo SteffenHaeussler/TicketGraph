@@ -148,7 +148,7 @@ RETURNING *;
   exhausted retries → escalate, permanent error → no retry, refund idempotency.
 - [x] **7.5 Retarget API tests:** create, list-by-status, status, approval, duplicate approval 409,
   late approval timeout → escalate.
-- [ ] **7.6 Makefile + docs:** rename `worker`/`llm-worker` targets to `runner`/`agent_worker`;
+- [x] **7.6 Makefile + docs:** rename `worker`/`llm-worker` targets to `runner`/`agent_worker`;
   update README run instructions. (Keep `test_mock_agent.py` & `test_models.py` unchanged.)
 
 ## Milestone 8 — DDIA fault-injection demos (the payoff)

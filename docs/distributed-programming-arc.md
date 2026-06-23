@@ -33,7 +33,7 @@ The service has three runtime roles:
 - Temporal Server is the durable coordinator. It stores workflow history,
   schedules workflow and activity tasks, owns timers, tracks workflow IDs, and
   exposes visibility queries.
-- The worker in `src/ticketflow/worker.py` runs application code. It polls the
+- The worker in `src/ticketflow/runner.py` runs application code. It polls the
   `ticketflow` task queue and hosts both `TicketWorkflow` and
   `TicketActivities`.
 

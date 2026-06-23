@@ -7,10 +7,10 @@ How it is built:
 
 - `TicketWorkflow` and the fast side effects (`send_reply`, `execute_refund`,
   `record_result`) stay on the `ticketflow` task queue, hosted by
-  `src/ticketflow/worker.py`. Tickets keep progressing even when the agent
+  `src/ticketflow/runner.py`. Tickets keep progressing even when the agent
   queues are saturated.
 - `classify_ticket` and `draft_reply` run on the `ticketflow-agent` queue,
-  hosted by the dedicated `src/ticketflow/llm_worker.py` process.
+  hosted by the dedicated `src/ticketflow/agent_worker.py` process.
 - The primary agent queue is throttled with two different knobs
   (`src/ticketflow/config.py`):
   - `AGENT_MAX_PER_SECOND` → `max_task_queue_activities_per_second`, a

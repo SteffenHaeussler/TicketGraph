@@ -65,15 +65,15 @@ DDIA-flavored narrative), `docs/agent-activity-ops.md` (LLM worker operations).
 ## Split task queues: workflow worker vs LLM worker
 
 - **Decision:** `TicketWorkflow` and fast side effects stay on the `ticketflow`
-  queue (`worker.py`); `classify_ticket`/`draft_reply` run on `ticketflow-agent`,
-  served by a dedicated `llm_worker.py` process (PRs #40, #42).
+  queue (`runner.py`); `classify_ticket`/`draft_reply` run on `ticketflow-agent`,
+  served by a dedicated `agent_worker.py` process (PRs #40, #42).
 - **Why:** Real LLM backends are the scarce, rate-limited dependency. A separate
   queue lets the agent tier saturate or die while tickets keep progressing
   through replies, refunds, and record-keeping.
 - **Alternatives considered:** A message broker between worker and agent —
   rejected: Temporal's task queue *is* the queue; the realism comes from capacity
   tuning, not extra infrastructure.
-- **Where:** `src/ticketflow/worker.py`, `src/ticketflow/llm_worker.py`,
+- **Where:** `src/ticketflow/runner.py`, `src/ticketflow/agent_worker.py`,
   `src/ticketflow/config.py`.
 - **Taught:** The two production rate-limit knobs differ in scope:
   `max_task_queue_activities_per_second` is server-side — the *vendor's* budget,

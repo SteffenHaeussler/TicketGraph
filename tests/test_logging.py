@@ -37,13 +37,13 @@ def test_text_logging_includes_configured_fields():
         stream=stream,
     )
 
-    logging.getLogger("ticketflow.worker").info(
+    logging.getLogger("ticketflow.runner").info(
         "worker running", extra={"task_queue": "ticketflow"}
     )
 
     line = stream.getvalue().strip()
     assert "INFO" in line
-    assert "ticketflow.worker" in line
+    assert "ticketflow.runner" in line
     assert "worker running" in line
     assert "ticketflow" in line
 
