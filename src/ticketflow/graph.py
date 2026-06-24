@@ -35,8 +35,6 @@ from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
 from ticketflow import config, taskqueue
-from ticketflow.activities import TicketActivities
-from ticketflow.agent.mock import MockAgent
 from ticketflow.clock import Clock, resolve_clock
 from ticketflow.db import _Pool
 from ticketflow.models import (
@@ -109,14 +107,12 @@ class TicketState(TypedDict, total=False):
     result: TicketResult | None
 
 
-def build_ticket_graph(
-    activities: TicketActivities, pool: _Pool, *, clock: Clock | None = None
-) -> StateGraph:
+def build_ticket_graph(pool: _Pool, *, clock: Clock | None = None) -> StateGraph:
     """Build the uncompiled ticket workflow graph.
 
     ``pool`` is the Postgres connection pool the dispatching nodes use to
-    enqueue agent and terminal tasks. ``activities`` is accepted for API
-    compatibility with callers; side effects are performed by queued workers.
+    enqueue agent and terminal tasks. Side effects are performed by queued
+    workers.
 
     ``dispatch_*`` nodes enqueue and checkpoint status; ``await_*`` nodes
     ``interrupt()``. After drafting, the graph either dispatches terminal work
@@ -126,7 +122,6 @@ def build_ticket_graph(
           -> decide_approval -> execute -> record
                               |-> prepare_approval -> await_approval
     """
-    del activities
     active_clock = resolve_clock(clock)
 
     def enqueue_agent_task(
@@ -421,18 +416,10 @@ def build_ticket_graph(
 
 
 def compile_ticket_graph(
-    activities: TicketActivities,
     checkpointer: BaseCheckpointSaver,
     pool: _Pool,
     *,
     clock: Clock | None = None,
 ) -> CompiledStateGraph:
     """Compile the ticket workflow graph with a durable ``checkpointer``."""
-    return build_ticket_graph(activities, pool, clock=clock).compile(
-        checkpointer=checkpointer
-    )
-
-
-def default_activities() -> TicketActivities:
-    """Build the inline activities used by the demo workflow."""
-    return TicketActivities(MockAgent(), database_url=config.DATABASE_URL)
+    return build_ticket_graph(pool, clock=clock).compile(checkpointer=checkpointer)

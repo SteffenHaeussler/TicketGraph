@@ -59,7 +59,7 @@ test-docker-tracing:
 	uv run python scripts/wait_for_api.py --base-url $(API_URL); \
 	API_URL=$(API_URL) JAEGER_URL=$(JAEGER_URL) uv run pytest tests/test_tracing_stack.py -o addopts=
 
-## --- run the Milestone 0 stack ---
+## --- run the local stack ---
 
 server:
 	docker compose -f docker-compose.yml -f docker-compose.host-postgres.yml up postgres

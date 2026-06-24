@@ -354,9 +354,7 @@ async def main() -> None:
     try:
         async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
             await saver.setup()
-            compiled = graph.compile_ticket_graph(
-                graph.default_activities(), saver, pool
-            )
+            compiled = graph.compile_ticket_graph(saver, pool)
             await run_forever(compiled, pool, worker_id)
     finally:
         pool.close()

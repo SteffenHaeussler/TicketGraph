@@ -588,7 +588,7 @@ async def test_runner_drives_a_seeded_run_to_resolved_through_postgres(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         # Seed: the initial invoke creates the checkpoint + classify outbox and
         # parks at await_classify; the workflow_run row mirrors that state.
@@ -654,7 +654,7 @@ async def test_runner_delivers_approval_signal_through_postgres(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         out = await compiled.ainvoke(
             {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
@@ -705,11 +705,8 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback(
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
     from ticketflow import graph
-    from ticketflow.activities import TicketActivities
-    from ticketflow.agent.mock import MockAgent
     from ticketflow.models import Ticket, TicketStatus
 
-    activities = TicketActivities(MockAgent(seed=1, failure_rate=0.0))
     clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
     ticket = Ticket(
         id=f"t-runner-timeout-fallback-{uuid.uuid4().hex}",
@@ -721,9 +718,7 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(
-            activities, saver, postgres_pool, clock=clock
-        )
+        compiled = graph.compile_ticket_graph(saver, postgres_pool, clock=clock)
 
         out = await compiled.ainvoke(
             {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
@@ -777,11 +772,8 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
     from langgraph.types import Command
 
     from ticketflow import graph
-    from ticketflow.activities import TicketActivities
-    from ticketflow.agent.mock import MockAgent
     from ticketflow.models import Ticket, TicketStatus
 
-    activities = TicketActivities(MockAgent(seed=1, failure_rate=0.0))
     clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
     ticket = Ticket(
         id=f"t-runner-timeout-approval-{uuid.uuid4().hex}",
@@ -793,9 +785,7 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(
-            activities, saver, postgres_pool, clock=clock
-        )
+        compiled = graph.compile_ticket_graph(saver, postgres_pool, clock=clock)
 
         await compiled.ainvoke({"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg)
         await compiled.ainvoke(
@@ -887,7 +877,7 @@ async def test_worker_kill_mid_lease_redelivers_and_workflow_completes(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         # Seed: the initial invoke enqueues the classify task (transactional
         # outbox in the dispatch node) and parks at await_classify; mirror that
@@ -1009,7 +999,7 @@ async def test_duplicate_refund_delivery_is_at_most_once_in_ledger(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         # Seed: the initial invoke enqueues the classify task and parks; mirror
         # that into the workflow_run projection so the runner can claim it.

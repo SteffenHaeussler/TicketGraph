@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
@@ -85,6 +87,23 @@ def make_pool(database_url: str | None = None) -> ConnectionPool:
     )
 
 
+@contextmanager
+def managed_pool(
+    *, database_url: str | None = None, pool: _Pool | None = None
+) -> Iterator[_Pool]:
+    """Yield an open pool, owning lifecycle only when no pool was injected."""
+    if pool is not None:
+        yield pool
+        return
+
+    active_pool = make_pool(database_url)
+    active_pool.open()
+    try:
+        yield active_pool
+    finally:
+        active_pool.close()
+
+
 def ping(
     *,
     database_url: str | None = None,
@@ -96,16 +115,9 @@ def ping(
     reachable". An injected ``pool`` is assumed open and is left open for the
     caller; otherwise this owns the pool's lifecycle.
     """
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute("SELECT 1")
-    finally:
-        if owned_pool:
-            active_pool.close()
 
 
 def _task_from_row(row: tuple[Any, ...]) -> QueuedTask:
@@ -137,11 +149,7 @@ def dequeue(
     pool: _Pool | None = None,
 ) -> QueuedTask | None:
     """Lease one due pending task from ``queue_name`` for ``worker_id``."""
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
                 """
@@ -168,9 +176,6 @@ def dequeue(
                 (worker_id, queue_name),
             ).fetchone()
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
     return _task_from_row(row) if row is not None else None
 
@@ -208,12 +213,8 @@ def claim_run(
     on by the runner in later milestones; for now a future ``wakeup_at`` (an
     armed approval/fallback timer) keeps a run unclaimed until the timer is due.
     """
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
     now = resolve_clock(clock).now()
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
                 """
@@ -240,9 +241,6 @@ def claim_run(
                 (worker_id, now, now, now, now, now),
             ).fetchone()
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
     return _run_from_row(row) if row is not None else None
 
@@ -254,12 +252,8 @@ def reclaim_expired_runs(
     clock: Clock | None = None,
 ) -> int:
     """Clear expired workflow-run leases so another runner can claim them."""
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
     now = resolve_clock(clock).now()
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
                 """
@@ -276,9 +270,6 @@ def reclaim_expired_runs(
                 (now, now),
             ).fetchone()
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
     assert row is not None
     return int(row[0])
@@ -301,12 +292,8 @@ def save_run(
     a re-claim never sees a half-applied step. ``status`` must satisfy the
     ``workflow_run`` CHECK constraint.
     """
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
     now = resolve_clock(clock).now()
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute(
                 """
@@ -331,9 +318,6 @@ def save_run(
                     (now, consumed_signal_id),
                 )
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
 
 def create_run(
@@ -352,11 +336,7 @@ def create_run(
     default to ``now()``; ``status`` must satisfy the ``workflow_run`` CHECK
     constraint.
     """
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute(
                 """
@@ -366,9 +346,6 @@ def create_run(
                 (ticket_id, status, wakeup_at),
             )
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
 
 def wake_run(
@@ -385,12 +362,8 @@ def wake_run(
     When the awaited result lands a worker calls this to wake the run so the
     runner picks it up immediately rather than waiting out the timer.
     """
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
     now = resolve_clock(clock).now()
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute(
                 """
@@ -402,9 +375,6 @@ def wake_run(
                 (now, now, ticket_id),
             )
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
 
 def add_pending_signal(
@@ -421,12 +391,8 @@ def add_pending_signal(
     The insert and wake happen in one transaction so a caller cannot commit a
     signal without making its workflow run claimable.
     """
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
     now = resolve_clock(clock).now()
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
                 """
@@ -447,9 +413,6 @@ def add_pending_signal(
                 (now, now, workflow_id),
             )
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
     return int(row[0])
 
@@ -461,11 +424,7 @@ def list_runs_by_status(
     pool: _Pool | None = None,
 ) -> list[str]:
     """Return workflow ids whose projected run status matches ``status``."""
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             rows = conn.execute(
                 """
@@ -477,9 +436,6 @@ def list_runs_by_status(
                 (status,),
             ).fetchall()
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
     return [str(row[0]) for row in rows]
 
@@ -500,12 +456,8 @@ def add_pending_signal_if_waiting(
     index on unconsumed signals makes duplicate submissions lose the race and
     return ``None`` instead of inserting another pending decision.
     """
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
     now = resolve_clock(clock).now()
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
                 """
@@ -535,9 +487,6 @@ def add_pending_signal_if_waiting(
                 (workflow_id, waiting_status, kind, Jsonb(payload), now, now),
             ).fetchone()
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
     return int(row[0]) if row is not None else None
 
@@ -551,11 +500,7 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
     before use and closes it afterwards. An injected ``pool`` is assumed to be
     already open and is left open for the caller to manage.
     """
-    owned_pool = pool is None
-    active_pool = pool or make_pool(database_url)
-    try:
-        if owned_pool:
-            active_pool.open()
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute(
                 """
@@ -719,6 +664,3 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 (PENDING_SIGNAL_UNIQUE_MIGRATION,),
             )
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()

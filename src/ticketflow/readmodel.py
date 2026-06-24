@@ -15,11 +15,7 @@ def save_result(
     pool: Any | None = None,
 ) -> None:
     """Store or replace a terminal ticket result in Postgres."""
-    owned_pool = pool is None
-    active_pool = pool or db.make_pool(database_url)
-    try:
-        if owned_pool:
-            active_pool.open()
+    with db.managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute(
                 """
@@ -31,9 +27,6 @@ def save_result(
                 (result.ticket_id, Jsonb(result.model_dump(mode="json"))),
             )
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
 
 
 def record_refund(
@@ -49,17 +42,10 @@ def record_refund(
     The ticket id is the idempotency key: duplicate activity runs land in
     refund_attempts but the refund itself is recorded at most once.
     """
-    owned_pool = pool is None
-    active_pool = pool or db.make_pool(database_url)
-    try:
-        if owned_pool:
-            active_pool.open()
+    with db.managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             first = ledger.record_refund(conn, ticket_id, amount, attempt)
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
     return first
 
 
@@ -70,18 +56,11 @@ def load_result(
     pool: Any | None = None,
 ) -> TicketResult | None:
     """Load a terminal ticket result from Postgres, if it exists."""
-    owned_pool = pool is None
-    active_pool = pool or db.make_pool(database_url)
-    try:
-        if owned_pool:
-            active_pool.open()
+    with db.managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
                 "SELECT data FROM ticket_results WHERE ticket_id = %s", (ticket_id,)
             ).fetchone()
-    finally:
-        if owned_pool:
-            active_pool.close()
     return TicketResult.model_validate(row[0]) if row else None
 
 
@@ -91,11 +70,7 @@ def clear(
     pool: Any | None = None,
 ) -> int:
     """Remove all persisted ticket results from Postgres and return the count."""
-    owned_pool = pool is None
-    active_pool = pool or db.make_pool(database_url)
-    try:
-        if owned_pool:
-            active_pool.open()
+    with db.managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
                 """
@@ -107,8 +82,5 @@ def clear(
                 """
             ).fetchone()
             conn.commit()
-    finally:
-        if owned_pool:
-            active_pool.close()
     assert row is not None
     return int(row[0])
