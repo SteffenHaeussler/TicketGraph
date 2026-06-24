@@ -36,7 +36,7 @@ from langgraph.types import interrupt
 
 from ticketflow import config, taskqueue
 from ticketflow.clock import Clock, resolve_clock
-from ticketflow.db import _Pool
+from ticketflow.db import _AsyncPool, _Pool
 from ticketflow.models import (
     ActionType,
     ApprovalDecision,
@@ -107,12 +107,15 @@ class TicketState(TypedDict, total=False):
     result: TicketResult | None
 
 
-def build_ticket_graph(pool: _Pool, *, clock: Clock | None = None) -> StateGraph:
+def build_ticket_graph(
+    pool: _Pool, *, clock: Clock | None = None, async_pool: _AsyncPool | None = None
+) -> StateGraph:
     """Build the uncompiled ticket workflow graph.
 
-    ``pool`` is the Postgres connection pool the dispatching nodes use to
-    enqueue agent and terminal tasks. Side effects are performed by queued
-    workers.
+    ``pool`` is the Postgres connection pool the dispatching nodes use by
+    default. When ``async_pool`` is provided, graph-side task queue writes use it
+    instead so async request handlers do not block on the sync pool. Side effects
+    are performed by queued workers.
 
     ``dispatch_*`` nodes enqueue and checkpoint status; ``await_*`` nodes
     ``interrupt()``. After drafting, the graph either dispatches terminal work
@@ -124,21 +127,86 @@ def build_ticket_graph(pool: _Pool, *, clock: Clock | None = None) -> StateGraph
     """
     active_clock = resolve_clock(clock)
 
-    def enqueue_agent_task(
-        *, task_type: str, workflow_id: str, payload: dict[str, Any]
-    ) -> datetime:
-        key = f"{workflow_id}:{task_type}"
+    async def enqueue_task(
+        *,
+        queue_name: str,
+        task_type: str,
+        workflow_id: str,
+        payload: dict[str, Any],
+        idempotency_key: str,
+    ) -> None:
+        if async_pool is not None:
+            async with async_pool.connection() as conn:
+                await taskqueue.aenqueue(
+                    conn,
+                    queue_name=queue_name,
+                    task_type=task_type,
+                    workflow_id=workflow_id,
+                    payload=payload,
+                    idempotency_key=idempotency_key,
+                )
+                await conn.commit()
+            return
+
         with pool.connection() as conn:
             taskqueue.enqueue(
                 conn,
-                queue_name=config.AGENT_TASK_QUEUE,
+                queue_name=queue_name,
                 task_type=task_type,
                 workflow_id=workflow_id,
                 payload=payload,
-                idempotency_key=key,
+                idempotency_key=idempotency_key,
             )
             conn.commit()
+
+    async def enqueue_agent_task(
+        *, task_type: str, workflow_id: str, payload: dict[str, Any]
+    ) -> datetime:
+        key = f"{workflow_id}:{task_type}"
+        await enqueue_task(
+            queue_name=config.AGENT_TASK_QUEUE,
+            task_type=task_type,
+            workflow_id=workflow_id,
+            payload=payload,
+            idempotency_key=key,
+        )
         return active_clock.now() + timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S)
+
+    async def redispatch_agent_task(
+        *, key: str, task_type: str, workflow_id: str, payload: dict[str, Any]
+    ) -> bool:
+        if async_pool is not None:
+            async with async_pool.connection() as conn:
+                redispatched = await taskqueue.acancel_pending(
+                    conn, key, reason="redispatched to fallback"
+                )
+                if redispatched:
+                    await taskqueue.aenqueue(
+                        conn,
+                        queue_name=config.FALLBACK_TASK_QUEUE,
+                        task_type=task_type,
+                        workflow_id=workflow_id,
+                        payload=payload,
+                        idempotency_key=f"{key}:fallback",
+                    )
+                await conn.commit()
+            return redispatched
+
+        with pool.connection() as conn:
+            redispatched = taskqueue.cancel_pending(
+                conn, key, reason="redispatched to fallback"
+            )
+            if redispatched:
+                taskqueue.enqueue(
+                    conn,
+                    queue_name=config.FALLBACK_TASK_QUEUE,
+                    task_type=task_type,
+                    workflow_id=workflow_id,
+                    payload=payload,
+                    idempotency_key=f"{key}:fallback",
+                )
+            conn.commit()
+        return redispatched
 
     async def await_agent_task(
         *,
@@ -160,20 +228,9 @@ def build_ticket_graph(pool: _Pool, *, clock: Clock | None = None) -> StateGraph
             }
         )
         if _is_timeout(resume):
-            with pool.connection() as conn:
-                redispatched = taskqueue.cancel_pending(
-                    conn, key, reason="redispatched to fallback"
-                )
-                if redispatched:
-                    taskqueue.enqueue(
-                        conn,
-                        queue_name=config.FALLBACK_TASK_QUEUE,
-                        task_type=task_type,
-                        workflow_id=workflow_id,
-                        payload=payload,
-                        idempotency_key=f"{key}:fallback",
-                    )
-                conn.commit()
+            redispatched = await redispatch_agent_task(
+                key=key, task_type=task_type, workflow_id=workflow_id, payload=payload
+            )
             active_queue = (
                 config.FALLBACK_TASK_QUEUE if redispatched else config.AGENT_TASK_QUEUE
             )
@@ -191,7 +248,7 @@ def build_ticket_graph(pool: _Pool, *, clock: Clock | None = None) -> StateGraph
     async def dispatch_classify(state: TicketState) -> TicketState:
         ticket = state.get("ticket")
         assert ticket is not None
-        wakeup_at = enqueue_agent_task(
+        wakeup_at = await enqueue_agent_task(
             task_type="classify",
             workflow_id=ticket.id,
             payload={"ticket": ticket.model_dump(mode="json")},
@@ -226,7 +283,7 @@ def build_ticket_graph(pool: _Pool, *, clock: Clock | None = None) -> StateGraph
         ticket = state.get("ticket")
         classification = state.get("classification")
         assert ticket is not None and classification is not None
-        wakeup_at = enqueue_agent_task(
+        wakeup_at = await enqueue_agent_task(
             task_type="draft",
             workflow_id=ticket.id,
             payload={
@@ -332,16 +389,13 @@ def build_ticket_graph(pool: _Pool, *, clock: Clock | None = None) -> StateGraph
             "action": reply.action.model_dump(mode="json"),
             "result": expected_result.model_dump(mode="json"),
         }
-        with pool.connection() as conn:
-            taskqueue.enqueue(
-                conn,
-                queue_name=config.TASK_QUEUE,
-                task_type="finalize_ticket",
-                workflow_id=ticket.id,
-                payload=payload,
-                idempotency_key=key,
-            )
-            conn.commit()
+        await enqueue_task(
+            queue_name=config.TASK_QUEUE,
+            task_type="finalize_ticket",
+            workflow_id=ticket.id,
+            payload=payload,
+            idempotency_key=key,
+        )
 
         resume = interrupt(
             {
@@ -420,6 +474,9 @@ def compile_ticket_graph(
     pool: _Pool,
     *,
     clock: Clock | None = None,
+    async_pool: _AsyncPool | None = None,
 ) -> CompiledStateGraph:
     """Compile the ticket workflow graph with a durable ``checkpointer``."""
-    return build_ticket_graph(pool, clock=clock).compile(checkpointer=checkpointer)
+    return build_ticket_graph(pool, clock=clock, async_pool=async_pool).compile(
+        checkpointer=checkpointer
+    )

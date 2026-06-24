@@ -43,11 +43,17 @@ async def postgres_api(
 ) -> AsyncIterator[None]:
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
+        async_pool = db.make_async_pool(postgres_database_url)
+        await async_pool.open()
         app.state.pool = postgres_pool
+        app.state.async_pool = async_pool
         app.state.compiled = graph.compile_ticket_graph(
-            saver, postgres_pool, clock=clock
+            saver, postgres_pool, clock=clock, async_pool=async_pool
         )
-        yield
+        try:
+            yield
+        finally:
+            await async_pool.close()
 
 
 async def create_ticket(http: AsyncClient, *, subject: str, body: str) -> str:
@@ -179,17 +185,24 @@ async def test_create_ticket_seeds_run_and_returns_ticket_id(monkeypatch):
         }
     )
     sentinel_pool = object()
+    sentinel_async_pool = object()
     monkeypatch.setattr(app.state, "compiled", fake_graph, raising=False)
     monkeypatch.setattr(app.state, "pool", sentinel_pool, raising=False)
+    monkeypatch.setattr(app.state, "async_pool", sentinel_async_pool, raising=False)
 
     created: list[tuple[object, ...]] = []
 
-    def record_create_run(
+    async def record_acreate_run(
         ticket_id, *, status, wakeup_at, pool=None, database_url=None
     ):
         created.append((ticket_id, status, wakeup_at, pool))
 
-    monkeypatch.setattr(db, "create_run", record_create_run)
+    monkeypatch.setattr(db, "acreate_run", record_acreate_run)
+
+    def fail_sync_create_run(*args, **kwargs):
+        raise AssertionError("create_ticket should use db.acreate_run")
+
+    monkeypatch.setattr(db, "create_run", fail_sync_create_run)
 
     async with http_client() as http:
         response = await http.post(
@@ -215,7 +228,9 @@ async def test_create_ticket_seeds_run_and_returns_ticket_id(monkeypatch):
     assert cfg == {"configurable": {"thread_id": ticket_id}}
 
     # The workflow_run projection mirrors the seeded graph state.
-    assert created == [(ticket_id, TicketStatus.CLASSIFYING, wakeup_at, sentinel_pool)]
+    assert created == [
+        (ticket_id, TicketStatus.CLASSIFYING, wakeup_at, sentinel_async_pool)
+    ]
 
 
 async def test_list_tickets_queries_workflow_run_status(monkeypatch):
@@ -387,18 +402,26 @@ async def test_create_ticket_persists_workflow_run_and_outbox_through_postgres(
 ):
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
+        async_pool = db.make_async_pool(postgres_database_url)
+        await async_pool.open()
         app.state.pool = postgres_pool
-        app.state.compiled = graph.compile_ticket_graph(saver, postgres_pool)
+        app.state.async_pool = async_pool
+        app.state.compiled = graph.compile_ticket_graph(
+            saver, postgres_pool, async_pool=async_pool
+        )
 
-        async with http_client() as http:
-            response = await http.post(
-                "/tickets",
-                json={
-                    "customer_email": "jo@example.com",
-                    "subject": "refund please",
-                    "body": "I was double charged.",
-                },
-            )
+        try:
+            async with http_client() as http:
+                response = await http.post(
+                    "/tickets",
+                    json={
+                        "customer_email": "jo@example.com",
+                        "subject": "refund please",
+                        "body": "I was double charged.",
+                    },
+                )
+        finally:
+            await async_pool.close()
 
     assert response.status_code == 201
     ticket_id = response.json()["ticket_id"]
@@ -436,24 +459,32 @@ async def test_get_ticket_reads_state_through_postgres_checkpoint(
 ):
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
+        async_pool = db.make_async_pool(postgres_database_url)
+        await async_pool.open()
         app.state.pool = postgres_pool
-        app.state.compiled = graph.compile_ticket_graph(saver, postgres_pool)
+        app.state.async_pool = async_pool
+        app.state.compiled = graph.compile_ticket_graph(
+            saver, postgres_pool, async_pool=async_pool
+        )
 
-        async with http_client() as http:
-            created = await http.post(
-                "/tickets",
-                json={
-                    "customer_email": "jo@example.com",
-                    "subject": "refund please",
-                    "body": "I was double charged.",
-                },
-            )
-            ticket_id = created.json()["ticket_id"]
+        try:
+            async with http_client() as http:
+                created = await http.post(
+                    "/tickets",
+                    json={
+                        "customer_email": "jo@example.com",
+                        "subject": "refund please",
+                        "body": "I was double charged.",
+                    },
+                )
+                ticket_id = created.json()["ticket_id"]
 
-            response = await http.get(f"/tickets/{ticket_id}")
+                response = await http.get(f"/tickets/{ticket_id}")
 
-            # A ticket that never started has no checkpoint and no result.
-            missing = await http.get("/tickets/never-existed")
+                # A ticket that never started has no checkpoint and no result.
+                missing = await http.get("/tickets/never-existed")
+        finally:
+            await async_pool.close()
 
     # The status is read straight from the durable checkpoint.
     assert response.status_code == 200
@@ -601,7 +632,7 @@ async def test_api_status_tracks_live_postgres_checkpoint_states(
     activities = TicketActivities(
         ScriptedAgent(billing_classification(), refund_draft())
     )
-    clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
+    clock = FrozenClock(datetime.now(UTC))
 
     async with postgres_api(
         postgres_pool, postgres_database_url, activities, clock=clock
@@ -631,7 +662,10 @@ async def test_api_status_tracks_live_postgres_checkpoint_states(
                 http, subject="refund please", body="I was double charged again."
             )
             await drive_until_quiescent(
-                app.state.compiled, postgres_pool, activities, escalation_ticket_id
+                app.state.compiled,
+                postgres_pool,
+                activities,
+                escalation_ticket_id,
             )
             escalation_awaiting = await http.get(f"/tickets/{escalation_ticket_id}")
             with postgres_pool.connection() as conn:
@@ -717,7 +751,7 @@ async def test_api_late_approval_after_timeout_returns_409(
     activities = TicketActivities(
         ScriptedAgent(billing_classification(), refund_draft())
     )
-    clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
+    clock = FrozenClock(datetime.now(UTC))
 
     async with postgres_api(
         postgres_pool, postgres_database_url, activities, clock=clock
