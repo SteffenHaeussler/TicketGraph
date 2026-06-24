@@ -115,14 +115,14 @@ RETURNING *;
   due), resume its graph, persist **checkpoint + state + outbox tasks in one transaction**, release.
 - [x] **4.3 Timers.** Resume runs whose `wakeup_at <= now()` with a "timeout" input (drives 24h
   approval expiry and 30s fallback).
-- [ ] **4.4 Signals.** `pending_signal(workflow_id, kind, payload, consumed)`; deliver approval
+- [x] **4.4 Signals.** `pending_signal(workflow_id, kind, payload, consumed)`; deliver approval
   decisions into the resumed graph; mark consumed.
 - [x] **4.5 Janitor wired in.** Periodically call `reclaim_expired()` for tasks and runs.
 
 ## Milestone 5 — Workers
 *DDIA: Ch 11 backpressure & rate limiting.*
 
-- [ ] **5.1 Primary agent worker.** `agent_worker.py` consumes `ticketflow-agent` with a token
+- [x] **5.1 Primary agent worker.** `agent_worker.py` consumes `ticketflow-agent` with a token
   bucket (`AGENT_MAX_PER_SECOND`) + bounded concurrency (`AGENT_MAX_CONCURRENT`), calls
   `TicketActivities` → `MockAgent`, writes result, wakes the run.
 - [x] **5.2 Fallback worker.** Unthrottled consumer of `ticketflow-agent-fallback`.
@@ -141,7 +141,7 @@ RETURNING *;
 ## Milestone 7 — Tests & tooling
 
 - [x] **7.1 Postgres test fixture** (testcontainers or `pytest-postgresql`, isolated schema/test).
-- [ ] **7.2 Injectable clock** so 24h approval + 30s schedule-to-start fire deterministically.
+- [x] **7.2 Injectable clock** so 24h approval + 30s schedule-to-start fire deterministically.
 - [x] **7.3 Drive-until-quiescent helper** (in-process runner+worker steps), analogous to today's
   `make_worker`.
 - [x] **7.4 Retarget workflow tests:** happy path, fallback-on-timeout, transient retries succeed,
