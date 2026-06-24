@@ -1,0 +1,8 @@
+#:schema https://conductor.build/schemas/settings.repo.schema.json
+"$schema" = "https://conductor.build/schemas/settings.repo.schema.json"
+
+[scripts]
+setup = "uv sync"
+run = "API_PORT=$CONDUCTOR_PORT docker compose up --build"
+archive = "docker compose down --remove-orphans"
+run_mode = "concurrent"
