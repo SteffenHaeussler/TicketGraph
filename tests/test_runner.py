@@ -962,3 +962,160 @@ async def test_worker_kill_mid_lease_redelivers_and_workflow_completes(
     # At-least-once evidence: delivered twice (doomed lease + redelivery), yet the
     # effect happened once and the task is durably done.
     assert task_row == ("done", 2)
+
+
+@pytest.mark.integration
+async def test_duplicate_refund_delivery_is_at_most_once_in_ledger(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
+    """DDIA fault-injection 8.3: force the refund side effect to be delivered
+    twice and prove the ledger keeps it at-most-once (idempotent effect).
+
+    This is the textbook at-least-once duplicate: the side-effect worker runs the
+    refund effect, then crashes before acking the queue task. The lease lapses,
+    the janitor reclaims it, and the finalize task is redelivered to a healthy
+    worker that runs the effect a second time. The refund itself -- keyed on the
+    ticket id with ``INSERT ... ON CONFLICT DO NOTHING`` -- lands exactly once,
+    while both deliveries are visible in ``refund_attempts``.
+    """
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from tests.helpers import (
+        ScriptedAgent,
+        billing_classification,
+        drive_until_quiescent,
+        refund_draft,
+    )
+    from ticketflow import graph, side_effect_worker
+    from ticketflow.activities import TicketActivities
+    from ticketflow.models import ApprovalDecision, Ticket, TicketStatus
+
+    ticket = Ticket(
+        id=f"t-dup-refund-{uuid.uuid4().hex}",
+        customer_email="customer@example.com",
+        subject="Refund request",
+        body="I was charged twice and need a refund.",
+    )
+    # The refund effect resolves Postgres via database_url, so point it at the
+    # per-test schema (carried in the URL's search_path).
+    activities = TicketActivities(
+        ScriptedAgent(billing_classification(), refund_draft(amount=42.0)),
+        database_url=postgres_database_url,
+    )
+    cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
+    decision = ApprovalDecision(approved=True, approver="sam@example.com")
+    worker_id = "runner-1"
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+
+        # Seed: the initial invoke enqueues the classify task and parks; mirror
+        # that into the workflow_run projection so the runner can claim it.
+        out = await compiled.ainvoke(
+            {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        )
+        assert "__interrupt__" in out
+        snapshot = await compiled.aget_state(cfg)
+        with postgres_pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                "VALUES (%s, %s, %s)",
+                (
+                    ticket.id,
+                    snapshot.values["status"],
+                    snapshot.values.get("wakeup_at"),
+                ),
+            )
+            conn.commit()
+
+        # A refund draft always trips the approval gate; drive to the pause, then
+        # approve via a durable signal.
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        awaiting = await compiled.aget_state(cfg)
+        assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
+        db.add_pending_signal(
+            ticket.id,
+            "approval_decision",
+            decision.model_dump(mode="json"),
+            pool=postgres_pool,
+        )
+
+        # Resume past approval so execute enqueues the finalize task and the run
+        # parks at the terminal interrupt -- but stop before the task is acked: a
+        # doomed worker leases it.
+        leased = None
+        for _ in range(50):
+            await runner.step(compiled, postgres_pool, worker_id)
+            leased = db.dequeue(
+                config.TASK_QUEUE, "side-effect-doomed", pool=postgres_pool
+            )
+            if leased is not None:
+                break
+        assert leased is not None
+        assert leased.task_type == "finalize_ticket"
+        assert leased.status == "leased"
+        assert leased.attempts == 1
+
+        # First delivery: run the refund effect, then "lose the ack" -- the worker
+        # crashes before completing the queue task (run_finalize does not ack).
+        await side_effect_worker.run_finalize(leased, activities)
+        with postgres_pool.connection() as conn:
+            conn.execute(
+                "UPDATE task_queue SET lease_expires_at = now() - interval "
+                "'1 second' WHERE id = %s",
+                (leased.id,),
+            )
+            conn.commit()
+
+        # The janitor reclaims the dropped lease, making the task redeliverable.
+        janitor = runner.reclaim_expired_leases(postgres_pool)
+        assert janitor.tasks == 1
+        with postgres_pool.connection() as conn:
+            reclaimed_row = conn.execute(
+                "SELECT status, lease_owner FROM task_queue WHERE id = %s",
+                (leased.id,),
+            ).fetchone()
+        assert reclaimed_row == ("pending", None)
+
+        # Second delivery: a healthy worker re-leases the finalize task, runs the
+        # refund effect again (a no-op insert), acks the task, and the run resumes.
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        final = await compiled.aget_state(cfg)
+
+    with postgres_pool.connection() as conn:
+        refunds = conn.execute(
+            "SELECT count(*) FROM refunds WHERE ticket_id = %s", (ticket.id,)
+        ).fetchone()
+        attempts = conn.execute(
+            "SELECT count(*) FROM refund_attempts WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchone()
+        attempt_numbers = conn.execute(
+            "SELECT array_agg(attempt ORDER BY attempt) FROM refund_attempts "
+            "WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchone()
+        task_row = conn.execute(
+            "SELECT status, attempts FROM task_queue WHERE id = %s",
+            (leased.id,),
+        ).fetchone()
+        run_row = conn.execute(
+            "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+            "FROM workflow_run WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchone()
+
+    # At-most-once: the refund is recorded exactly once despite two deliveries...
+    assert refunds == (1,)
+    # ...while both deliveries are observable in the attempt ledger.
+    assert attempts == (2,)
+    assert attempt_numbers == ([1, 2],)
+    assert task_row == ("done", 2)
+    assert final.values["status"] == TicketStatus.RESOLVED
+    assert run_row is not None
+    assert run_row[0] == "resolved"
+    assert run_row[1] is None  # wakeup_at cleared at the terminal step
+    assert run_row[2] is None  # run lease released
+    assert run_row[3] is None
