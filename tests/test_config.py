@@ -1,6 +1,38 @@
 import importlib
+import os
 
+import ticketflow
 from ticketflow import config
+
+
+def test_ticketflow_import_disables_inherited_langsmith_tracing(monkeypatch):
+    monkeypatch.delenv("TICKETFLOW_LANGSMITH_TRACING", raising=False)
+    monkeypatch.setenv("LANGSMITH_TRACING_V2", "true")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "true")
+    monkeypatch.setenv("LANGCHAIN_TRACING", "true")
+    monkeypatch.setenv("LANGCHAIN_HANDLER", "langchain")
+
+    importlib.reload(ticketflow)
+
+    assert os.environ["LANGSMITH_TRACING_V2"] == "false"
+    assert os.environ["LANGCHAIN_TRACING_V2"] == "false"
+    assert "LANGCHAIN_TRACING" not in os.environ
+    assert "LANGCHAIN_HANDLER" not in os.environ
+
+
+def test_ticketflow_import_preserves_langsmith_env_when_opted_in(monkeypatch):
+    monkeypatch.setenv("TICKETFLOW_LANGSMITH_TRACING", "true")
+    monkeypatch.setenv("LANGSMITH_TRACING_V2", "true")
+    monkeypatch.setenv("LANGCHAIN_TRACING_V2", "true")
+    monkeypatch.setenv("LANGCHAIN_TRACING", "true")
+    monkeypatch.setenv("LANGCHAIN_HANDLER", "langchain")
+
+    importlib.reload(ticketflow)
+
+    assert os.environ["LANGSMITH_TRACING_V2"] == "true"
+    assert os.environ["LANGCHAIN_TRACING_V2"] == "true"
+    assert os.environ["LANGCHAIN_TRACING"] == "true"
+    assert os.environ["LANGCHAIN_HANDLER"] == "langchain"
 
 
 def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
