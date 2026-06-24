@@ -628,6 +628,9 @@ async def test_api_status_tracks_live_postgres_checkpoint_states(
 async def test_api_duplicate_approval_returns_409_before_signal_consumption(
     postgres_pool: db.ConnectionPool, postgres_database_url: str
 ):
+    """DDIA fault-injection 8.4: duplicate approval loses the signal race and
+    returns 409 before the workflow consumes the first durable signal.
+    """
     activities = TicketActivities(
         ScriptedAgent(billing_classification(), refund_draft())
     )
@@ -672,6 +675,9 @@ async def test_api_duplicate_approval_returns_409_before_signal_consumption(
 async def test_api_late_approval_after_timeout_returns_409(
     postgres_pool: db.ConnectionPool, postgres_database_url: str
 ):
+    """DDIA fault-injection 8.4: a fast-forwarded 24h approval timer escalates
+    the workflow and rejects a late approval with 409.
+    """
     activities = TicketActivities(
         ScriptedAgent(billing_classification(), refund_draft())
     )

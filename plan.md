@@ -160,7 +160,7 @@ RETURNING *;
   schedule-to-start → auto-routed to fallback queue. (backpressure)
 - [ ] **8.3 Duplicate refund.** Force duplicate delivery of `execute_refund` → ledger keeps it
   at-most-once. (idempotent effect)
-- [ ] **8.4 Approval edges.** Submit approval twice → second is 409; let approval lapse 24h (fast
+- [x] **8.4 Approval edges.** Submit approval twice → second is 409; let approval lapse 24h (fast
   clock) → escalation. (durable timer + idempotent signal)
 
 ---
