@@ -263,7 +263,7 @@ async def step(
     return True
 
 
-def reclaim_expired_leases(pool: _Pool, *, clock: Clock | None = None) -> JanitorResult:
+def reclaim_expired_leases(pool: _Pool) -> JanitorResult:
     """Reclaim expired task and workflow-run leases."""
     with pool.connection() as conn:
         tasks = taskqueue.reclaim_expired(conn)
@@ -299,10 +299,7 @@ async def run_forever(
     while stop is None or not stop():
         now = loop.time()
         if now >= next_janitor_at:
-            if clock is None:
-                reclaim_expired_leases(pool)
-            else:
-                reclaim_expired_leases(pool, clock=clock)
+            reclaim_expired_leases(pool)
             next_janitor_at = now + janitor_interval
 
         if clock is None:
