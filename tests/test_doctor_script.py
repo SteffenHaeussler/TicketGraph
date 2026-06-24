@@ -19,38 +19,66 @@ async def test_check_stack_reports_api_down():
     ]
 
 
-async def test_check_stack_reports_milestone_zero_degraded_state():
+def _ready_handler(ready_body: dict[str, object]):
     async def handler(request: httpx.Request) -> httpx.Response:
         if request.url.path == "/health":
             return httpx.Response(200, json={"status": "healthy"})
-        return httpx.Response(
-            200,
-            json={
-                "status": "degraded",
-                "database": {"status": "not_checked"},
-                "orchestration": {
-                    "status": "not_implemented",
-                    "message": "LangGraph/Postgres orchestration is not wired yet.",
-                },
+        return httpx.Response(200, json=ready_body)
+
+    return handler
+
+
+async def test_check_stack_reports_healthy_when_stack_is_ready():
+    transport = httpx.MockTransport(
+        _ready_handler(
+            {
+                "status": "healthy",
+                "database": {"status": "connected"},
+                "orchestration": {"status": "ready"},
                 "config": {
                     "database_url": "postgresql://localhost/ticketflow",
                     "task_queue": "ticketflow",
                     "agent_task_queue": "ticketflow-agent",
                     "fallback_task_queue": "ticketflow-agent-fallback",
                 },
-            },
+            }
         )
+    )
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        result = await doctor.check_stack(client)
 
-    transport = httpx.MockTransport(handler)
+    assert result.exit_code == 0
+    assert result.lines == [
+        "api: healthy",
+        "database: connected (postgresql://localhost/ticketflow)",
+        "orchestration: ready",
+    ]
+
+
+async def test_check_stack_reports_degraded_when_database_unreachable():
+    transport = httpx.MockTransport(
+        _ready_handler(
+            {
+                "status": "degraded",
+                "database": {"status": "unavailable"},
+                "orchestration": {"status": "ready"},
+                "config": {
+                    "database_url": "postgresql://localhost/ticketflow",
+                    "task_queue": "ticketflow",
+                    "agent_task_queue": "ticketflow-agent",
+                    "fallback_task_queue": "ticketflow-agent-fallback",
+                },
+            }
+        )
+    )
     async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
         result = await doctor.check_stack(client)
 
     assert result.exit_code == 1
     assert result.lines == [
         "api: healthy",
-        "database: not_checked (postgresql://localhost/ticketflow)",
-        "orchestration: not_implemented",
-        "orchestration: LangGraph/Postgres orchestration is not wired yet.",
+        "database: unavailable (postgresql://localhost/ticketflow)",
+        "orchestration: ready",
     ]
 
 
