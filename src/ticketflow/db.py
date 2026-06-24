@@ -12,7 +12,6 @@ from psycopg.types.json import Jsonb
 from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 from ticketflow import config
-from ticketflow.clock import Clock, resolve_clock
 
 BOOTSTRAP_MIGRATION = "000_bootstrap"
 TASK_QUEUE_MIGRATION = "001_task_queue"
@@ -232,7 +231,6 @@ def claim_run(
     *,
     database_url: str | None = None,
     pool: _Pool | None = None,
-    clock: Clock | None = None,
 ) -> WorkflowRun | None:
     """Lease one runnable workflow run for ``worker_id``.
 
@@ -248,24 +246,23 @@ def claim_run(
     on by the runner in later milestones; for now a future ``wakeup_at`` (an
     armed approval/fallback timer) keeps a run unclaimed until the timer is due.
     """
-    now = resolve_clock(clock).now()
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
                 """
                 UPDATE workflow_run
                 SET lease_owner = %s,
-                    lease_expires_at = %s + interval '30 seconds',
-                    updated_at = %s
+                    lease_expires_at = now() + interval '30 seconds',
+                    updated_at = now()
                 WHERE ticket_id = (
                     SELECT ticket_id
                     FROM workflow_run
                     WHERE (
                         status NOT IN ('resolved', 'rejected', 'escalated')
-                        OR (wakeup_at IS NOT NULL AND wakeup_at <= %s)
+                        OR (wakeup_at IS NOT NULL AND wakeup_at <= now())
                       )
-                      AND (lease_expires_at IS NULL OR lease_expires_at < %s)
-                      AND (wakeup_at IS NULL OR wakeup_at <= %s)
+                      AND (lease_expires_at IS NULL OR lease_expires_at < now())
+                      AND (wakeup_at IS NULL OR wakeup_at <= now())
                     ORDER BY created_at
                     FOR UPDATE SKIP LOCKED
                     LIMIT 1
@@ -273,7 +270,7 @@ def claim_run(
                 RETURNING ticket_id, status, wakeup_at, lease_owner,
                           lease_expires_at, created_at, updated_at
                 """,
-                (worker_id, now, now, now, now, now),
+                (worker_id,),
             ).fetchone()
             conn.commit()
 
@@ -284,10 +281,8 @@ def reclaim_expired_runs(
     *,
     database_url: str | None = None,
     pool: _Pool | None = None,
-    clock: Clock | None = None,
 ) -> int:
     """Clear expired workflow-run leases so another runner can claim them."""
-    now = resolve_clock(clock).now()
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
@@ -296,13 +291,12 @@ def reclaim_expired_runs(
                     UPDATE workflow_run
                     SET lease_owner = NULL,
                         lease_expires_at = NULL,
-                        updated_at = %s
-                    WHERE lease_expires_at < %s
+                        updated_at = now()
+                    WHERE lease_expires_at < now()
                     RETURNING ticket_id
                 )
                 SELECT count(*) FROM reclaimed
                 """,
-                (now, now),
             ).fetchone()
             conn.commit()
 
@@ -318,7 +312,6 @@ def save_run(
     consumed_signal_id: int | None = None,
     database_url: str | None = None,
     pool: _Pool | None = None,
-    clock: Clock | None = None,
 ) -> None:
     """Persist a workflow run's new ``status``/``wakeup_at`` and release its lease.
 
@@ -327,7 +320,6 @@ def save_run(
     a re-claim never sees a half-applied step. ``status`` must satisfy the
     ``workflow_run`` CHECK constraint.
     """
-    now = resolve_clock(clock).now()
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute(
@@ -337,20 +329,20 @@ def save_run(
                     wakeup_at = %s,
                     lease_owner = NULL,
                     lease_expires_at = NULL,
-                    updated_at = %s
+                    updated_at = now()
                 WHERE ticket_id = %s
                 """,
-                (status, wakeup_at, now, ticket_id),
+                (status, wakeup_at, ticket_id),
             )
             if consumed_signal_id is not None:
                 conn.execute(
                     """
                     UPDATE pending_signal
                     SET consumed = true,
-                        consumed_at = %s
+                        consumed_at = now()
                     WHERE id = %s
                     """,
-                    (now, consumed_signal_id),
+                    (consumed_signal_id,),
                 )
             conn.commit()
 
@@ -409,7 +401,6 @@ def wake_run(
     *,
     database_url: str | None = None,
     pool: _Pool | None = None,
-    clock: Clock | None = None,
 ) -> None:
     """Make a run claimable now by pulling its ``wakeup_at`` to the present.
 
@@ -418,17 +409,16 @@ def wake_run(
     When the awaited result lands a worker calls this to wake the run so the
     runner picks it up immediately rather than waiting out the timer.
     """
-    now = resolve_clock(clock).now()
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute(
                 """
                 UPDATE workflow_run
-                SET wakeup_at = %s,
-                    updated_at = %s
+                SET wakeup_at = now(),
+                    updated_at = now()
                 WHERE ticket_id = %s
                 """,
-                (now, now, ticket_id),
+                (ticket_id,),
             )
             conn.commit()
 
@@ -440,14 +430,12 @@ def add_pending_signal(
     *,
     database_url: str | None = None,
     pool: _Pool | None = None,
-    clock: Clock | None = None,
 ) -> int:
     """Persist an unconsumed workflow signal and wake the target run.
 
     The insert and wake happen in one transaction so a caller cannot commit a
     signal without making its workflow run claimable.
     """
-    now = resolve_clock(clock).now()
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
@@ -462,11 +450,11 @@ def add_pending_signal(
             conn.execute(
                 """
                 UPDATE workflow_run
-                SET wakeup_at = %s,
-                    updated_at = %s
+                SET wakeup_at = now(),
+                    updated_at = now()
                 WHERE ticket_id = %s
                 """,
-                (now, now, workflow_id),
+                (workflow_id,),
             )
             conn.commit()
 
@@ -504,7 +492,6 @@ def add_pending_signal_if_waiting(
     waiting_status: str,
     database_url: str | None = None,
     pool: _Pool | None = None,
-    clock: Clock | None = None,
 ) -> int | None:
     """Persist a signal only when its workflow is in ``waiting_status``.
 
@@ -512,7 +499,6 @@ def add_pending_signal_if_waiting(
     index on unconsumed signals makes duplicate submissions lose the race and
     return ``None`` instead of inserting another pending decision.
     """
-    now = resolve_clock(clock).now()
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             row = conn.execute(
@@ -533,14 +519,14 @@ def add_pending_signal_if_waiting(
                 ),
                 woken AS (
                     UPDATE workflow_run
-                    SET wakeup_at = %s,
-                        updated_at = %s
+                    SET wakeup_at = now(),
+                        updated_at = now()
                     WHERE ticket_id IN (SELECT workflow_id FROM inserted)
                     RETURNING ticket_id
                 )
                 SELECT id FROM inserted
                 """,
-                (workflow_id, waiting_status, kind, Jsonb(payload), now, now),
+                (workflow_id, waiting_status, kind, Jsonb(payload)),
             ).fetchone()
             conn.commit()
 

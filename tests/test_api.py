@@ -675,6 +675,12 @@ async def test_api_status_tracks_live_postgres_checkpoint_states(
                 ).fetchone()
             assert run_row is not None
             clock.advance(run_row[0] - clock.now())
+            with postgres_pool.connection() as conn:
+                conn.execute(
+                    "UPDATE workflow_run SET wakeup_at = now() WHERE ticket_id = %s",
+                    (escalation_ticket_id,),
+                )
+                conn.commit()
             advanced = await runner.step(
                 app.state.compiled, postgres_pool, "runner-1", clock=clock
             )
@@ -772,6 +778,12 @@ async def test_api_late_approval_after_timeout_returns_409(
                 ).fetchone()
             assert run_row is not None
             clock.advance(run_row[1] - clock.now())
+            with postgres_pool.connection() as conn:
+                conn.execute(
+                    "UPDATE workflow_run SET wakeup_at = now() WHERE ticket_id = %s",
+                    (ticket_id,),
+                )
+                conn.commit()
             advanced = await runner.step(
                 app.state.compiled, postgres_pool, "runner-1", clock=clock
             )
