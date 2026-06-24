@@ -289,7 +289,7 @@ async def drive_to_approval_interrupt(
 async def test_happy_path_dispatches_then_resolves() -> None:
     pool = FakePool(opened=True, row=(1,))
     activities = recording_activities()
-    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket()
 
     classification = make_classification()
@@ -327,7 +327,7 @@ async def test_happy_path_dispatches_then_resolves() -> None:
 
 async def test_agent_dispatch_updates_visible_status_before_interrupt() -> None:
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-visible")
     cfg = config_for(ticket.id)
 
@@ -350,9 +350,7 @@ async def test_agent_dispatch_uses_injected_clock_for_schedule_to_start() -> Non
     now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
     clock = FrozenClock(now)
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(
-        recording_activities(), InMemorySaver(), pool, clock=clock
-    )
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool, clock=clock)
     ticket = make_ticket("t-clock-dispatch")
     cfg = config_for(ticket.id)
 
@@ -382,7 +380,7 @@ async def test_agent_dispatch_uses_injected_clock_for_schedule_to_start() -> Non
 
 async def test_classify_task_failure_escalates_without_draft_dispatch() -> None:
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-classify-failed")
     cfg = config_for(ticket.id)
 
@@ -415,7 +413,7 @@ async def test_classify_task_failure_escalates_without_draft_dispatch() -> None:
 
 async def test_draft_task_failure_escalates_without_approval() -> None:
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-draft-failed")
     cfg = config_for(ticket.id)
 
@@ -450,7 +448,7 @@ async def test_draft_task_failure_escalates_without_approval() -> None:
 
 async def test_schedule_to_start_timeout_redispatches_to_fallback() -> None:
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-fallback")
     cfg = config_for(ticket.id)
 
@@ -488,7 +486,7 @@ async def test_schedule_to_start_timeout_skips_fallback_when_not_pending() -> No
     # row=None makes taskqueue.is_pending() report the task is no longer pending
     # (a worker already leased it), so no fallback dispatch happens.
     pool = FakePool(opened=True, row=None)
-    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-leased")
     cfg = config_for(ticket.id)
 
@@ -517,7 +515,7 @@ async def test_timeout_skips_fallback_when_cancel_loses_race() -> None:
     # second row makes the atomic cancel report that no pending row was claimed.
     pool = FakePool(opened=True, row=(1,))
     pool.connection_obj.rows = [(1,), None]
-    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-cancel-race")
     cfg = config_for(ticket.id)
 
@@ -534,7 +532,7 @@ async def test_timeout_skips_fallback_when_cancel_loses_race() -> None:
 
 async def test_decide_approval_flags_refund_drafts() -> None:
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-refund")
 
     _, state = await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
@@ -546,7 +544,7 @@ async def test_decide_approval_flags_refund_drafts() -> None:
 
 async def test_decide_approval_flags_low_confidence_drafts() -> None:
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(recording_activities(), InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-lowconf")
 
     _, state = await drive_to_approval_interrupt(
@@ -562,9 +560,7 @@ async def test_prepare_approval_uses_injected_clock_for_timeout() -> None:
     now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
     clock = FrozenClock(now)
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(
-        recording_activities(), InMemorySaver(), pool, clock=clock
-    )
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool, clock=clock)
     ticket = make_ticket("t-clock-approval")
 
     out = await resume_through_agents(
@@ -583,7 +579,7 @@ async def test_prepare_approval_uses_injected_clock_for_timeout() -> None:
 async def test_approved_resume_continues_to_resolution() -> None:
     pool = FakePool(opened=True, row=(1,))
     activities = recording_activities()
-    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-approved")
     _, state = await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
     decision = ApprovalDecision(approved=True, approver="sam@example.com")
@@ -618,7 +614,7 @@ async def test_approved_duplicate_refund_records_no_new_refund() -> None:
     pool = FakePool(opened=True, row=(1,))
     activities = recording_activities()
     activities.refund_results = [False]
-    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-approved-duplicate")
     await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
     decision = ApprovalDecision(approved=True, approver="sam@example.com")
@@ -651,7 +647,7 @@ async def test_approved_duplicate_refund_records_no_new_refund() -> None:
 async def test_rejected_resume_sends_and_records_rejection_reply() -> None:
     pool = FakePool(opened=True, row=(1,))
     activities = recording_activities()
-    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-rejected")
     await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
     decision = ApprovalDecision(
@@ -693,7 +689,7 @@ async def test_rejected_resume_sends_and_records_rejection_reply() -> None:
 async def test_timeout_resume_sends_and_records_escalation_reply() -> None:
     pool = FakePool(opened=True, row=(1,))
     activities = recording_activities()
-    compiled = graph.compile_ticket_graph(activities, InMemorySaver(), pool)
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-timeout")
     await drive_to_approval_interrupt(compiled, ticket, draft=refund_draft())
 
@@ -743,7 +739,7 @@ async def test_dispatch_loop_resolves_through_real_postgres(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         out = await compiled.ainvoke(
             {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
@@ -766,7 +762,7 @@ async def test_dispatch_loop_resolves_through_real_postgres(
 
     # A fresh saver (new connection) proves the run is durable in Postgres.
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as fresh:
-        reopened = graph.compile_ticket_graph(activities, fresh, postgres_pool)
+        reopened = graph.compile_ticket_graph(fresh, postgres_pool)
         snapshot = await reopened.aget_state(cfg)
 
     state = snapshot.values
@@ -792,7 +788,7 @@ async def test_schedule_to_start_timeout_routes_to_fallback_through_postgres(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         out = await compiled.ainvoke(
             {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
@@ -850,7 +846,7 @@ async def test_retargeted_workflow_happy_path_resolves_through_runner(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
         await _start_durable_run(compiled, postgres_pool, ticket, cfg)
 
         await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
@@ -885,9 +881,7 @@ async def test_retargeted_workflow_fallback_on_timeout_completes(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(
-            activities, saver, postgres_pool, clock=clock
-        )
+        compiled = graph.compile_ticket_graph(saver, postgres_pool, clock=clock)
         await _start_durable_run(compiled, postgres_pool, ticket, cfg)
 
         clock.advance(timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S))
@@ -928,7 +922,7 @@ async def test_retargeted_workflow_transient_retry_succeeds(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
         await _start_durable_run(compiled, postgres_pool, ticket, cfg)
 
         assert await process_one_task(postgres_pool, activities)
@@ -964,7 +958,7 @@ async def test_retargeted_workflow_exhausted_retries_escalate(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
         await _start_durable_run(compiled, postgres_pool, ticket, cfg)
 
         for expected_attempt in (1, 2, 3):
@@ -1003,7 +997,7 @@ async def test_retargeted_workflow_permanent_error_does_not_retry(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
         await _start_durable_run(compiled, postgres_pool, ticket, cfg)
 
         assert await process_one_task(postgres_pool, activities)
@@ -1037,7 +1031,7 @@ async def test_retargeted_workflow_refund_idempotency_on_finalizer_retry(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
         await _start_durable_run(compiled, postgres_pool, ticket, cfg)
 
         await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)

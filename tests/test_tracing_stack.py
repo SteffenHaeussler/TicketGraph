@@ -1,4 +1,4 @@
-"""Tracing smoke checks for the Milestone 0 Docker stack with Jaeger enabled."""
+"""Tracing smoke checks for the Docker stack with Jaeger enabled."""
 
 from __future__ import annotations
 

@@ -45,7 +45,7 @@ async def postgres_api(
         await saver.setup()
         app.state.pool = postgres_pool
         app.state.compiled = graph.compile_ticket_graph(
-            activities, saver, postgres_pool, clock=clock
+            saver, postgres_pool, clock=clock
         )
         yield
 
@@ -388,9 +388,7 @@ async def test_create_ticket_persists_workflow_run_and_outbox_through_postgres(
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
         app.state.pool = postgres_pool
-        app.state.compiled = graph.compile_ticket_graph(
-            graph.default_activities(), saver, postgres_pool
-        )
+        app.state.compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         async with http_client() as http:
             response = await http.post(
@@ -439,9 +437,7 @@ async def test_get_ticket_reads_state_through_postgres_checkpoint(
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
         app.state.pool = postgres_pool
-        app.state.compiled = graph.compile_ticket_graph(
-            graph.default_activities(), saver, postgres_pool
-        )
+        app.state.compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         async with http_client() as http:
             created = await http.post(
@@ -484,9 +480,7 @@ async def test_get_ticket_falls_back_to_read_model_through_postgres(
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
         app.state.pool = postgres_pool
-        app.state.compiled = graph.compile_ticket_graph(
-            graph.default_activities(), saver, postgres_pool
-        )
+        app.state.compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         async with http_client() as http:
             # No checkpoint exists for this ticket; the read model answers.

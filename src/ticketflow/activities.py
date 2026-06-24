@@ -11,7 +11,7 @@ logger = logging.getLogger(__name__)
 
 
 class TicketActivities:
-    """Agent and side-effect operations used by future queue workers."""
+    """Agent and side-effect operations used by queue workers."""
 
     def __init__(
         self,

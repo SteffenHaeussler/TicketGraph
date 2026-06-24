@@ -41,9 +41,7 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
             await saver.setup()
             app.state.pool = pool
-            app.state.compiled = graph.compile_ticket_graph(
-                graph.default_activities(), saver, pool
-            )
+            app.state.compiled = graph.compile_ticket_graph(saver, pool)
             yield
     finally:
         pool.close()

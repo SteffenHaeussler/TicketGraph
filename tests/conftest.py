@@ -11,12 +11,6 @@ from psycopg import sql
 from ticketflow import config, db
 
 
-@pytest.fixture(autouse=True)
-def isolated_read_model(tmp_path, monkeypatch):
-    """Keep tests from writing to the real read-model DB in the repo root."""
-    monkeypatch.setattr(config, "DB_PATH", str(tmp_path / "readmodel.db"))
-
-
 @pytest.fixture(scope="session")
 def postgres_base_url() -> Iterator[str]:
     """Return a Postgres URL for integration tests.

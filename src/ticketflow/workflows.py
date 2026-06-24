@@ -1,4 +1,4 @@
-"""LangGraph workflow placeholder for the orchestration migration."""
+"""Shared workflow constants for the LangGraph orchestration."""
 
 from datetime import timedelta
 

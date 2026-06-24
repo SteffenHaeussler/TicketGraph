@@ -91,10 +91,9 @@ You need at least `api`, `runner`, and `agent_worker` for a ticket to reach
 `resolved`; add `side-effect-worker` for refunds/replies and `fallback-worker`
 to exercise schedule-to-start fallback.
 
-> `make doctor` pings the API and prints the resolved config. Note its
-> `orchestration` line still reports the old Milestone-0 readiness stub
-> (`not_implemented`) — it is not yet a reliable orchestration health signal.
-> Use `make status ID=…` to observe real workflow progress.
+> `make doctor` pings the API and prints the resolved config. Its
+> `orchestration` line reports whether the durable graph compiled during API
+> startup; use `make status ID=…` to observe real workflow progress.
 
 ### Drive a ticket end-to-end
 
