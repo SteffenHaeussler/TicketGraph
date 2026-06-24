@@ -78,6 +78,29 @@ make stack-reset
 The Compose stack includes Postgres, the API, the workflow `runner`, and the
 `agent_worker`, `fallback-worker`, and `side-effect-worker` processes.
 
+## Fault Injection Demos
+
+Milestone 8 demos make the rebuilt distributed mechanisms visible. The
+saturation demo lowers the primary agent queue's rate limit and schedule-to-start
+budget, creates a concurrent batch, and requires at least one ticket to route
+through the unthrottled fallback queue:
+
+```bash
+make demo-saturation-fallback
+```
+
+Expected output includes a `model_paths` histogram with at least one fallback
+path, for example `fallback/fallback` or `primary/fallback`. The defaults are
+fast for local runs; override them when needed:
+
+```bash
+SATURATION_AGENT_MAX_PER_SECOND=0.25 \
+SATURATION_SCHEDULE_TO_START_S=1 \
+SATURATION_COUNT=8 \
+SATURATION_TIMEOUT=90 \
+make demo-saturation-fallback
+```
+
 ## Tracing
 
 OpenTelemetry tracing is off by default. Enable it with

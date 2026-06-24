@@ -41,6 +41,10 @@ class PreflightError(RuntimeError):
     """Raised when the API setup is missing before a batch run."""
 
 
+class FallbackRequirementError(RuntimeError):
+    """Raised when a demo batch does not show enough fallback-routed tickets."""
+
+
 @dataclass(frozen=True)
 class TicketSnapshot:
     """Ticket status payload fields used for batch summaries."""
@@ -176,6 +180,17 @@ def model_path_histogram(snapshots: dict[str, TicketSnapshot]) -> dict[str, int]
     return histogram
 
 
+def fallback_model_path_count(summary: BatchSummary) -> int:
+    """Count model paths with any fallback component."""
+    count = 0
+    for model_path, path_count in summary.model_paths.items():
+        if model_path == "total":
+            continue
+        if "fallback" in model_path.split("/"):
+            count += path_count
+    return count
+
+
 async def run_batch(
     *,
     count: int,
@@ -238,6 +253,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--base-url", default="http://localhost:8000")
     parser.add_argument("--concurrency", type=_positive_int, default=10)
     parser.add_argument("--timeout", type=_positive_float, default=120.0)
+    parser.add_argument(
+        "--require-fallback",
+        action="store_true",
+        help="fail unless the settled batch includes fallback-routed tickets",
+    )
+    parser.add_argument("--min-fallback-count", type=_positive_int, default=1)
     return parser.parse_args()
 
 
@@ -272,6 +293,16 @@ def main() -> int:
         return 1
 
     print_histogram(histogram)
+    if args.require_fallback:
+        observed = fallback_model_path_count(histogram)
+        if observed < args.min_fallback_count:
+            exc = FallbackRequirementError(
+                "expected at least "
+                f"{args.min_fallback_count} fallback-routed ticket, observed "
+                f"{observed}"
+            )
+            print(f"batch failed: {exc}")
+            return 1
     return 0
 
 

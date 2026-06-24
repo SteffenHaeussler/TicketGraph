@@ -156,7 +156,7 @@ RETURNING *;
 
 - [x] **8.1 Worker-kill redelivery.** Kill an agent worker mid-lease → janitor reclaims → task
   redelivered → workflow still completes. (at-least-once + crash recovery)
-- [ ] **8.2 Saturation → fallback.** Drop `AGENT_MAX_PER_SECOND` low → tasks exceed 30s
+- [x] **8.2 Saturation → fallback.** Drop `AGENT_MAX_PER_SECOND` low → tasks exceed 30s
   schedule-to-start → auto-routed to fallback queue. (backpressure)
 - [ ] **8.3 Duplicate refund.** Force duplicate delivery of `execute_refund` → ledger keeps it
   at-most-once. (idempotent effect)

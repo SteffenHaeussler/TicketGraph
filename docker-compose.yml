@@ -20,6 +20,7 @@ services:
     command: python -m ticketflow.runner
     environment:
       DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
+      AGENT_SCHEDULE_TO_START_S: ${AGENT_SCHEDULE_TO_START_S:-30}
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     depends_on:
@@ -31,6 +32,9 @@ services:
     command: python -m ticketflow.agent_worker
     environment:
       DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
+      AGENT_MAX_PER_SECOND: ${AGENT_MAX_PER_SECOND:-10.0}
+      AGENT_MAX_CONCURRENT: ${AGENT_MAX_CONCURRENT:-20}
+      AGENT_SCHEDULE_TO_START_S: ${AGENT_SCHEDULE_TO_START_S:-30}
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     depends_on:
@@ -42,6 +46,8 @@ services:
     command: python -m ticketflow.fallback_worker
     environment:
       DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
+      AGENT_MAX_CONCURRENT: ${AGENT_MAX_CONCURRENT:-20}
+      AGENT_SCHEDULE_TO_START_S: ${AGENT_SCHEDULE_TO_START_S:-30}
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     depends_on:
@@ -53,6 +59,8 @@ services:
     command: python -m ticketflow.side_effect_worker
     environment:
       DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
+      AGENT_MAX_CONCURRENT: ${AGENT_MAX_CONCURRENT:-20}
+      AGENT_SCHEDULE_TO_START_S: ${AGENT_SCHEDULE_TO_START_S:-30}
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     depends_on:
@@ -67,6 +75,7 @@ services:
     environment:
       DATABASE_URL: postgresql://ticketflow:ticketflow@postgres:5432/ticketflow
       TICKETFLOW_DB_PATH: /data/ticketflow.db
+      AGENT_SCHEDULE_TO_START_S: ${AGENT_SCHEDULE_TO_START_S:-30}
       TICKETFLOW_TRACE_EXPORTER: ${TICKETFLOW_TRACE_EXPORTER:-none}
       TICKETFLOW_OTLP_ENDPOINT: http://jaeger:4318/v1/traces
     volumes:

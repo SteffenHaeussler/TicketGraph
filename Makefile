@@ -1,9 +1,13 @@
-.PHONY: install install-hooks lint format-check format typecheck check test integration coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger runner agent_worker fallback-worker side-effect-worker api doctor ticket status approve reject batch reset
+.PHONY: install install-hooks lint format-check format typecheck check test integration coverage smoke test-docker test-docker-tracing server server-docker up down logs stack-reset jaeger runner agent_worker fallback-worker side-effect-worker api doctor ticket status approve reject batch demo-saturation-fallback reset
 
 N ?= 100
 API_PORT ?= 8000
 API_URL ?= http://localhost:$(API_PORT)
 JAEGER_URL ?= http://localhost:16686
+SATURATION_AGENT_MAX_PER_SECOND ?= 0.25
+SATURATION_SCHEDULE_TO_START_S ?= 1
+SATURATION_COUNT ?= 8
+SATURATION_TIMEOUT ?= 90
 
 install:
 	uv sync
@@ -119,6 +123,21 @@ reject:
 
 batch:
 	uv run python scripts/batch.py --count $(N) --base-url $(API_URL)
+
+demo-saturation-fallback:
+	@set -e; \
+	docker compose down; \
+	AGENT_MAX_PER_SECOND=$(SATURATION_AGENT_MAX_PER_SECOND) \
+	AGENT_SCHEDULE_TO_START_S=$(SATURATION_SCHEDULE_TO_START_S) \
+	API_PORT=$(API_PORT) \
+	docker compose up --build -d --force-recreate; \
+	uv run python scripts/wait_for_api.py --base-url $(API_URL); \
+	uv run python scripts/batch.py \
+	  --count $(SATURATION_COUNT) \
+	  --base-url $(API_URL) \
+	  --concurrency $(SATURATION_COUNT) \
+	  --timeout $(SATURATION_TIMEOUT) \
+	  --require-fallback
 
 reset:
 	uv run python scripts/reset.py
