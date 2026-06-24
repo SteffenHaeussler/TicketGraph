@@ -17,6 +17,16 @@ def test_default_compose_publishes_configurable_api_port() -> None:
     assert '"${API_PORT:-8000}:8000"' in compose
 
 
+def test_default_compose_disables_langsmith_tracing_for_app_services() -> None:
+    compose = open("docker-compose.yml", encoding="utf-8").read()
+
+    assert compose.count("      TICKETFLOW_LANGSMITH_TRACING:") == 5
+    assert compose.count('LANGSMITH_TRACING_V2: "${LANGSMITH_TRACING_V2:-false}"') == 5
+    assert compose.count('LANGCHAIN_TRACING_V2: "${LANGCHAIN_TRACING_V2:-false}"') == 5
+    assert compose.count('LANGCHAIN_TRACING: "${LANGCHAIN_TRACING:-}"') == 5
+    assert compose.count('LANGCHAIN_HANDLER: "${LANGCHAIN_HANDLER:-}"') == 5
+
+
 def test_host_postgres_override_publishes_configurable_postgres_port() -> None:
     override = open("docker-compose.host-postgres.yml", encoding="utf-8").read()
 
