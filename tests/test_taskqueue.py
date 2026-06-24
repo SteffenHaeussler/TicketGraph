@@ -27,6 +27,26 @@ class FakeConnection:
         return FakeCursor(self.rows.pop(0))
 
 
+class AsyncFakeCursor:
+    def __init__(self, row: tuple[object, ...] | None) -> None:
+        self.row = row
+
+    async def fetchone(self) -> tuple[object, ...] | None:
+        return self.row
+
+
+class AsyncFakeConnection:
+    def __init__(self, rows: list[tuple[object, ...] | None]) -> None:
+        self.rows = rows
+        self.sql: list[str] = []
+        self.params: list[tuple[object, ...]] = []
+
+    async def execute(self, sql: str, params: tuple[object, ...]) -> AsyncFakeCursor:
+        self.sql.append(sql)
+        self.params.append(params)
+        return AsyncFakeCursor(self.rows.pop(0))
+
+
 def test_enqueue_inserts_task_with_idempotency_key() -> None:
     conn = FakeConnection(rows=[(42,)])
     available_at = datetime(2026, 6, 16, 12, 0, tzinfo=UTC)
@@ -58,6 +78,48 @@ def test_enqueue_returns_none_when_idempotency_key_already_exists() -> None:
     conn = FakeConnection(rows=[None])
 
     task_id = taskqueue.enqueue(
+        conn,
+        queue_name="ticketflow-agent",
+        task_type="classify_ticket",
+        workflow_id="ticket-123",
+        payload={"ticket_id": "ticket-123"},
+        idempotency_key="ticket-123:classify",
+    )
+
+    assert task_id is None
+
+
+async def test_aenqueue_inserts_task_with_idempotency_key() -> None:
+    conn = AsyncFakeConnection(rows=[(42,)])
+    available_at = datetime(2026, 6, 16, 12, 0, tzinfo=UTC)
+
+    task_id = await taskqueue.aenqueue(
+        conn,
+        queue_name="ticketflow-agent",
+        task_type="classify_ticket",
+        workflow_id="ticket-123",
+        payload={"ticket_id": "ticket-123"},
+        idempotency_key="ticket-123:classify",
+        max_attempts=5,
+        available_at=available_at,
+    )
+
+    assert task_id == 42
+    assert "ON CONFLICT (idempotency_key) DO NOTHING" in conn.sql[0]
+    assert "RETURNING id" in conn.sql[0]
+    assert conn.params[0][0:4] == (
+        "ticketflow-agent",
+        "classify_ticket",
+        "ticket-123",
+        "ticket-123:classify",
+    )
+    assert conn.params[0][5:] == (5, available_at)
+
+
+async def test_aenqueue_returns_none_when_idempotency_key_already_exists() -> None:
+    conn = AsyncFakeConnection(rows=[None])
+
+    task_id = await taskqueue.aenqueue(
         conn,
         queue_name="ticketflow-agent",
         task_type="classify_ticket",
@@ -163,6 +225,30 @@ def test_cancel_pending_returns_false_when_no_pending_task_matched() -> None:
     assert cancelled is False
 
 
+async def test_acancel_pending_marks_task_failed_and_permanent() -> None:
+    conn = AsyncFakeConnection(rows=[(1,)])
+
+    cancelled = await taskqueue.acancel_pending(
+        conn, "ticket-123:classify", reason="redispatched to fallback"
+    )
+
+    assert cancelled is True
+    assert "SET status = 'failed'" in conn.sql[0]
+    assert "permanent = true" in conn.sql[0]
+    assert "WHERE idempotency_key = %s AND status = 'pending'" in conn.sql[0]
+    assert conn.params[0] == ("redispatched to fallback", "ticket-123:classify")
+
+
+async def test_acancel_pending_returns_false_when_no_pending_task_matched() -> None:
+    conn = AsyncFakeConnection(rows=[None])
+
+    cancelled = await taskqueue.acancel_pending(
+        conn, "ticket-123:classify", reason="redispatched to fallback"
+    )
+
+    assert cancelled is False
+
+
 @pytest.mark.integration
 def test_enqueue_is_idempotent_against_real_postgres(
     postgres_pool: db.ConnectionPool,
@@ -189,6 +275,45 @@ def test_enqueue_is_idempotent_against_real_postgres(
             ("ticket-123:classify",),
         ).fetchone()
         conn.commit()
+
+    assert first_id is not None
+    assert second_id is None
+    assert row == (1,)
+
+
+@pytest.mark.integration
+async def test_aenqueue_is_idempotent_against_real_postgres(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+) -> None:
+    del postgres_pool
+    async_pool = db.make_async_pool(postgres_database_url)
+    await async_pool.open()
+    try:
+        async with async_pool.connection() as conn:
+            first_id = await taskqueue.aenqueue(
+                conn,
+                queue_name="ticketflow-agent",
+                task_type="classify_ticket",
+                workflow_id="ticket-123",
+                payload={"ticket_id": "ticket-123"},
+                idempotency_key="ticket-123:classify",
+            )
+            second_id = await taskqueue.aenqueue(
+                conn,
+                queue_name="ticketflow-agent",
+                task_type="classify_ticket",
+                workflow_id="ticket-123",
+                payload={"ticket_id": "ticket-123"},
+                idempotency_key="ticket-123:classify",
+            )
+            cursor = await conn.execute(
+                "SELECT count(*) FROM task_queue WHERE idempotency_key = %s",
+                ("ticket-123:classify",),
+            )
+            row = await cursor.fetchone()
+            await conn.commit()
+    finally:
+        await async_pool.close()
 
     assert first_id is not None
     assert second_id is None

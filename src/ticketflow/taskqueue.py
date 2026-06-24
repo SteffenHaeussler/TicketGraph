@@ -50,6 +50,49 @@ def enqueue(
     return row[0]
 
 
+async def aenqueue(
+    conn: Any,
+    *,
+    queue_name: str,
+    task_type: str,
+    workflow_id: str,
+    payload: Mapping[str, Any],
+    idempotency_key: str,
+    max_attempts: int = 3,
+    available_at: datetime | None = None,
+) -> int | None:
+    """Async variant of ``enqueue``."""
+    cursor = await conn.execute(
+        """
+        INSERT INTO task_queue (
+            queue_name,
+            task_type,
+            workflow_id,
+            idempotency_key,
+            payload,
+            max_attempts,
+            available_at
+        )
+        VALUES (%s, %s, %s, %s, %s, %s, COALESCE(%s, now()))
+        ON CONFLICT (idempotency_key) DO NOTHING
+        RETURNING id
+        """,
+        (
+            queue_name,
+            task_type,
+            workflow_id,
+            idempotency_key,
+            Jsonb(payload),
+            max_attempts,
+            available_at,
+        ),
+    )
+    row = await cursor.fetchone()
+    if row is None:
+        return None
+    return row[0]
+
+
 def is_pending(conn: Any, idempotency_key: str) -> bool:
     """True if the task with this idempotency key is still awaiting a worker."""
     row = conn.execute(
@@ -72,6 +115,23 @@ def cancel_pending(conn: Any, idempotency_key: str, *, reason: str) -> bool:
         """,
         (reason, idempotency_key),
     ).fetchone()
+    return row is not None
+
+
+async def acancel_pending(conn: Any, idempotency_key: str, *, reason: str) -> bool:
+    """Async variant of ``cancel_pending``."""
+    cursor = await conn.execute(
+        """
+        UPDATE task_queue
+        SET status = 'failed',
+            error = %s,
+            permanent = true
+        WHERE idempotency_key = %s AND status = 'pending'
+        RETURNING id
+        """,
+        (reason, idempotency_key),
+    )
+    row = await cursor.fetchone()
     return row is not None
 
 

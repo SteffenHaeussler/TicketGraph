@@ -30,20 +30,26 @@ logger = logging.getLogger(__name__)
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Open the Postgres pool and compile the durable graph for request handlers.
 
-    Mirrors ``runner.main``: bootstrap the schema, open a connection pool, set up
-    the checkpointer, and compile the workflow graph. Handlers read ``compiled``
-    and ``pool`` from ``app.state``.
+    Mirrors ``runner.main``: bootstrap the schema, open connection pools, set up
+    the checkpointer, and compile the workflow graph. Handlers read ``compiled``,
+    ``pool``, and ``async_pool`` from ``app.state``.
     """
     db.bootstrap()
     pool = db.make_pool()
+    async_pool = db.make_async_pool()
     pool.open()
+    await async_pool.open()
     try:
         async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
             await saver.setup()
             app.state.pool = pool
-            app.state.compiled = graph.compile_ticket_graph(saver, pool)
+            app.state.async_pool = async_pool
+            app.state.compiled = graph.compile_ticket_graph(
+                saver, pool, async_pool=async_pool
+            )
             yield
     finally:
+        await async_pool.close()
         pool.close()
 
 
@@ -159,13 +165,16 @@ async def create_ticket(
         body=body.body,
     )
     compiled = request.app.state.compiled
-    pool = request.app.state.pool
+    async_pool = request.app.state.async_pool
     cfg = {"configurable": {"thread_id": ticket.id}}
     out = await compiled.ainvoke(
         {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
     )
-    db.create_run(
-        ticket.id, status=out["status"], wakeup_at=out.get("wakeup_at"), pool=pool
+    await db.acreate_run(
+        ticket.id,
+        status=out["status"],
+        wakeup_at=out.get("wakeup_at"),
+        pool=async_pool,
     )
     logger.info("ticket workflow started", extra={"ticket_id": ticket.id})
     return CreateTicketResponse(ticket_id=ticket.id)

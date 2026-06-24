@@ -106,6 +106,62 @@ class FakePool:
         self.closed = True
 
 
+class AsyncFakeCursor:
+    def __init__(self, row: tuple[object, ...] | None) -> None:
+        self.row = row
+
+    async def fetchone(self) -> tuple[object, ...] | None:
+        return self.row
+
+
+class AsyncFakeConnection:
+    def __init__(self) -> None:
+        self.sql: list[str] = []
+        self.params: list[tuple[object, ...]] = []
+        self.commits = 0
+
+    async def execute(
+        self, sql: str, params: tuple[object, ...] | None = None
+    ) -> AsyncFakeCursor:
+        self.sql.append(sql)
+        if params is not None:
+            self.params.append(params)
+        return AsyncFakeCursor(None)
+
+    async def commit(self) -> None:
+        self.commits += 1
+
+
+class AsyncFakeConnectionContext:
+    def __init__(self, connection: AsyncFakeConnection) -> None:
+        self.connection = connection
+
+    async def __aenter__(self) -> AsyncFakeConnection:
+        return self.connection
+
+    async def __aexit__(self, exc_type, exc, tb) -> object:
+        return None
+
+
+class AsyncFakePool:
+    def __init__(self, *, opened: bool = False) -> None:
+        self.connection_obj = AsyncFakeConnection()
+        self.opened = opened
+        self.closed = False
+
+    async def open(self) -> None:
+        self.opened = True
+
+    def connection(self, timeout: float | None = None) -> AsyncFakeConnectionContext:
+        del timeout
+        if not self.opened:
+            raise AssertionError("connection() called before open()")
+        return AsyncFakeConnectionContext(self.connection_obj)
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def test_make_pool_uses_database_url_from_config(monkeypatch):
     calls: list[dict[str, object]] = []
 
@@ -117,6 +173,28 @@ def test_make_pool_uses_database_url_from_config(monkeypatch):
     monkeypatch.setattr(db.config, "DATABASE_URL", "postgresql://example/tickets")
 
     assert isinstance(db.make_pool(), RecordingPool)
+
+    assert calls == [
+        {
+            "conninfo": "postgresql://example/tickets",
+            "min_size": 1,
+            "max_size": 10,
+            "open": False,
+        }
+    ]
+
+
+def test_make_async_pool_uses_database_url_from_config(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class RecordingAsyncPool:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(db, "AsyncConnectionPool", RecordingAsyncPool)
+    monkeypatch.setattr(db.config, "DATABASE_URL", "postgresql://example/tickets")
+
+    assert isinstance(db.make_async_pool(), RecordingAsyncPool)
 
     assert calls == [
         {
@@ -559,6 +637,60 @@ def test_create_run_opens_and_closes_owned_pool(monkeypatch):
 
     assert pool.opened is True
     assert pool.closed is True
+
+
+async def test_acreate_run_inserts_initial_workflow_run():
+    pool = AsyncFakePool(opened=True)
+    wakeup_at = datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+
+    await db.acreate_run(
+        "ticket-1", status="classifying", wakeup_at=wakeup_at, pool=pool
+    )
+
+    sql = pool.connection_obj.sql[-1]
+    assert "INSERT INTO workflow_run" in sql
+    assert "ticket_id" in sql
+    assert "status" in sql
+    assert "wakeup_at" in sql
+    assert pool.connection_obj.params[-1] == ("ticket-1", "classifying", wakeup_at)
+    assert pool.connection_obj.commits == 1
+
+
+async def test_acreate_run_opens_and_closes_owned_pool(monkeypatch):
+    pool = AsyncFakePool()
+    monkeypatch.setattr(db, "make_async_pool", lambda database_url=None: pool)
+
+    await db.acreate_run("ticket-1", status="classifying", wakeup_at=None)
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
+@pytest.mark.integration
+async def test_acreate_run_inserts_real_postgres_workflow_run(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
+    del postgres_pool
+    async_pool = db.make_async_pool(postgres_database_url)
+    await async_pool.open()
+    wakeup_at = datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+    try:
+        await db.acreate_run(
+            "ticket-async-1",
+            status="classifying",
+            wakeup_at=wakeup_at,
+            pool=async_pool,
+        )
+        async with async_pool.connection() as conn:
+            cursor = await conn.execute(
+                "SELECT status, wakeup_at FROM workflow_run WHERE ticket_id = %s",
+                ("ticket-async-1",),
+            )
+            row = await cursor.fetchone()
+    finally:
+        await async_pool.close()
+
+    assert row == ("classifying", wakeup_at)
 
 
 def test_add_pending_signal_inserts_signal_and_wakes_run():

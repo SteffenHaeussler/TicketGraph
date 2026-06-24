@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Any, Protocol
 
 from psycopg.types.json import Jsonb
-from psycopg_pool import ConnectionPool
+from psycopg_pool import AsyncConnectionPool, ConnectionPool
 
 from ticketflow import config
 from ticketflow.clock import Clock, resolve_clock
@@ -77,9 +77,27 @@ class _Pool(Protocol):
     def close(self) -> None: ...
 
 
+class _AsyncPool(Protocol):
+    def connection(self, timeout: float | None = None) -> Any: ...
+
+    async def open(self) -> None: ...
+
+    async def close(self) -> None: ...
+
+
 def make_pool(database_url: str | None = None) -> ConnectionPool:
     """Create a Postgres connection pool for the configured database."""
     return ConnectionPool(
+        conninfo=database_url or config.DATABASE_URL,
+        min_size=1,
+        max_size=10,
+        open=False,
+    )
+
+
+def make_async_pool(database_url: str | None = None) -> AsyncConnectionPool:
+    """Create an async Postgres connection pool for the configured database."""
+    return AsyncConnectionPool(
         conninfo=database_url or config.DATABASE_URL,
         min_size=1,
         max_size=10,
@@ -102,6 +120,23 @@ def managed_pool(
         yield active_pool
     finally:
         active_pool.close()
+
+
+@asynccontextmanager
+async def managed_async_pool(
+    *, database_url: str | None = None, pool: _AsyncPool | None = None
+) -> AsyncIterator[_AsyncPool]:
+    """Yield an open async pool, owning lifecycle only when no pool was injected."""
+    if pool is not None:
+        yield pool
+        return
+
+    active_pool = make_async_pool(database_url)
+    await active_pool.open()
+    try:
+        yield active_pool
+    finally:
+        await active_pool.close()
 
 
 def ping(
@@ -346,6 +381,27 @@ def create_run(
                 (ticket_id, status, wakeup_at),
             )
             conn.commit()
+
+
+async def acreate_run(
+    ticket_id: str,
+    *,
+    status: str,
+    wakeup_at: datetime | None,
+    database_url: str | None = None,
+    pool: _AsyncPool | None = None,
+) -> None:
+    """Async variant of ``create_run`` for FastAPI request paths."""
+    async with managed_async_pool(database_url=database_url, pool=pool) as active_pool:
+        async with active_pool.connection() as conn:
+            await conn.execute(
+                """
+                INSERT INTO workflow_run (ticket_id, status, wakeup_at)
+                VALUES (%s, %s, %s)
+                """,
+                (ticket_id, status, wakeup_at),
+            )
+            await conn.commit()
 
 
 def wake_run(
