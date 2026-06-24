@@ -158,7 +158,7 @@ RETURNING *;
   redelivered → workflow still completes. (at-least-once + crash recovery)
 - [x] **8.2 Saturation → fallback.** Drop `AGENT_MAX_PER_SECOND` low → tasks exceed 30s
   schedule-to-start → auto-routed to fallback queue. (backpressure)
-- [ ] **8.3 Duplicate refund.** Force duplicate delivery of `execute_refund` → ledger keeps it
+- [x] **8.3 Duplicate refund.** Force duplicate delivery of `execute_refund` → ledger keeps it
   at-most-once. (idempotent effect)
 - [x] **8.4 Approval edges.** Submit approval twice → second is 409; let approval lapse 24h (fast
   clock) → escalation. (durable timer + idempotent signal)
