@@ -422,11 +422,11 @@ async def test_step_uses_injected_clock_before_and_after_timer_due(monkeypatch):
     )
     pool = FakePool(opened=True, row=None)
 
-    claim_calls: list[object] = []
+    claim_calls: list[tuple[str, object]] = []
     monkeypatch.setattr(
         db,
         "claim_run",
-        lambda worker_id, *, pool, clock=None: claim_calls.append(clock) or run,
+        lambda worker_id, *, pool: claim_calls.append((worker_id, pool)) or run,
     )
     saved: list[dict] = []
 
@@ -437,7 +437,6 @@ async def test_step_uses_injected_clock_before_and_after_timer_due(monkeypatch):
         wakeup_at,
         pool,
         consumed_signal_id=None,
-        clock=None,
     ):
         saved.append({"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at})
 
@@ -451,7 +450,7 @@ async def test_step_uses_injected_clock_before_and_after_timer_due(monkeypatch):
 
     assert advanced is False
     assert compiled.invoked_with == []
-    assert claim_calls == [clock]
+    assert claim_calls == [("runner-1", pool)]
     assert saved == [{"ticket_id": "t-1", "status": "classifying", "wakeup_at": due_at}]
 
     clock.advance(timedelta(minutes=5))

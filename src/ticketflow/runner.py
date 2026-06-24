@@ -225,10 +225,7 @@ async def step(
     when no run was claimable or the claimed run had no ready result (its lease is
     released without advancing).
     """
-    if clock is None:
-        run = db.claim_run(worker_id, pool=pool)
-    else:
-        run = db.claim_run(worker_id, pool=pool, clock=clock)
+    run = db.claim_run(worker_id, pool=pool)
     if run is None:
         return False
 
@@ -244,41 +241,22 @@ async def step(
     if envelope is None or resume is None:
         # Not actionable yet (no task result, approval signal, or due timer).
         # Release the lease, leaving status/wakeup_at untouched.
-        if clock is None:
-            db.save_run(
-                run.ticket_id,
-                status=run.status,
-                wakeup_at=run.wakeup_at,
-                pool=pool,
-            )
-        else:
-            db.save_run(
-                run.ticket_id,
-                status=run.status,
-                wakeup_at=run.wakeup_at,
-                pool=pool,
-                clock=clock,
-            )
+        db.save_run(
+            run.ticket_id,
+            status=run.status,
+            wakeup_at=run.wakeup_at,
+            pool=pool,
+        )
         return False
 
     out = await compiled.ainvoke(Command(resume=resume.payload), cfg)
-    if clock is None:
-        db.save_run(
-            run.ticket_id,
-            status=out["status"],
-            wakeup_at=_next_wakeup_at(out, resume),
-            consumed_signal_id=resume.consumed_signal_id,
-            pool=pool,
-        )
-    else:
-        db.save_run(
-            run.ticket_id,
-            status=out["status"],
-            wakeup_at=_next_wakeup_at(out, resume),
-            consumed_signal_id=resume.consumed_signal_id,
-            pool=pool,
-            clock=clock,
-        )
+    db.save_run(
+        run.ticket_id,
+        status=out["status"],
+        wakeup_at=_next_wakeup_at(out, resume),
+        consumed_signal_id=resume.consumed_signal_id,
+        pool=pool,
+    )
     logger.info(
         "advanced run", extra={"ticket_id": run.ticket_id, "status": out["status"]}
     )
@@ -291,10 +269,7 @@ def reclaim_expired_leases(pool: _Pool, *, clock: Clock | None = None) -> Janito
         tasks = taskqueue.reclaim_expired(conn)
         conn.commit()
 
-    if clock is None:
-        runs = db.reclaim_expired_runs(pool=pool)
-    else:
-        runs = db.reclaim_expired_runs(pool=pool, clock=clock)
+    runs = db.reclaim_expired_runs(pool=pool)
     result = JanitorResult(tasks=tasks, runs=runs)
     if tasks or runs:
         logger.info(
