@@ -848,3 +848,117 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
     assert run_row[2] is None
     assert run_row[3] is None
     assert terminal_row == (config.TASK_QUEUE, "finalize_ticket", "pending")
+
+
+@pytest.mark.integration
+async def test_worker_kill_mid_lease_redelivers_and_workflow_completes(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
+    """DDIA fault-injection 8.1: kill an agent worker mid-lease, the janitor
+    reclaims the dropped lease, the task is redelivered to a healthy worker, and
+    the workflow still drives to a terminal status (at-least-once + crash
+    recovery).
+
+    The kill is simulated deterministically by leasing the classify task with a
+    doomed worker and then backdating ``lease_expires_at`` -- the exact durable
+    state a process killed before renewing or completing its lease leaves behind.
+    """
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from tests.helpers import drive_until_quiescent
+    from ticketflow import graph
+    from ticketflow.activities import TicketActivities
+    from ticketflow.agent.mock import MockAgent
+    from ticketflow.models import Ticket, TicketStatus
+
+    activities = TicketActivities(
+        MockAgent(
+            seed=1, failure_rate=0.0, refund_rate=0.0, confidence_range=(0.8, 1.0)
+        )
+    )
+    ticket = Ticket(
+        id=f"t-worker-kill-{uuid.uuid4().hex}",
+        customer_email="customer@example.com",
+        subject="Need help",
+        body="My login keeps failing and I want it fixed.",
+    )
+    cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(activities, saver, postgres_pool)
+
+        # Seed: the initial invoke enqueues the classify task (transactional
+        # outbox in the dispatch node) and parks at await_classify; mirror that
+        # into the workflow_run projection.
+        out = await compiled.ainvoke(
+            {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        )
+        assert "__interrupt__" in out
+        snapshot = await compiled.aget_state(cfg)
+        with postgres_pool.connection() as conn:
+            conn.execute(
+                "INSERT INTO workflow_run (ticket_id, status, wakeup_at) "
+                "VALUES (%s, %s, %s)",
+                (
+                    ticket.id,
+                    snapshot.values["status"],
+                    snapshot.values.get("wakeup_at"),
+                ),
+            )
+            conn.commit()
+
+        # A doomed worker leases the classify task, then dies before completing.
+        leased = db.dequeue(
+            config.AGENT_TASK_QUEUE, "agent-worker-doomed", pool=postgres_pool
+        )
+        assert leased is not None
+        assert leased.status == "leased"
+        assert leased.attempts == 1
+
+        # Kill mid-lease: the lease lapses without ever being renewed/completed.
+        with postgres_pool.connection() as conn:
+            conn.execute(
+                "UPDATE task_queue SET lease_expires_at = now() - interval "
+                "'1 second' WHERE id = %s",
+                (leased.id,),
+            )
+            conn.commit()
+
+        # The janitor reclaims the dropped lease, making the task redeliverable.
+        janitor = runner.reclaim_expired_leases(postgres_pool)
+        assert janitor.tasks == 1
+        assert janitor.runs == 0
+        with postgres_pool.connection() as conn:
+            reclaimed_row = conn.execute(
+                "SELECT status, lease_owner FROM task_queue WHERE id = %s",
+                (leased.id,),
+            ).fetchone()
+        assert reclaimed_row == ("pending", None)
+
+        # A healthy worker re-leases the redelivered task and the run completes.
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        final = await compiled.aget_state(cfg)
+
+    with postgres_pool.connection() as conn:
+        run_row = conn.execute(
+            "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+            "FROM workflow_run WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchone()
+        task_row = conn.execute(
+            "SELECT status, attempts FROM task_queue WHERE id = %s",
+            (leased.id,),
+        ).fetchone()
+
+    # The workflow still reaches a terminal status despite the crash.
+    assert final.values["status"] == TicketStatus.RESOLVED
+    assert run_row is not None
+    assert run_row[0] == "resolved"
+    assert run_row[1] is None  # wakeup_at cleared at the terminal step
+    assert run_row[2] is None  # run lease released
+    assert run_row[3] is None
+    # At-least-once evidence: delivered twice (doomed lease + redelivery), yet the
+    # effect happened once and the task is durably done.
+    assert task_row == ("done", 2)
