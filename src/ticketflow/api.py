@@ -24,7 +24,6 @@ setup_logging()
 tracing = setup_tracing_components(service_name="ticketflow-api")
 
 logger = logging.getLogger(__name__)
-ORCHESTRATION_UNAVAILABLE_DETAIL = "LangGraph/Postgres orchestration is not wired yet."
 
 
 @asynccontextmanager
@@ -99,10 +98,6 @@ def _readiness_config() -> dict[str, str]:
     }
 
 
-def _orchestration_unavailable() -> HTTPException:
-    return HTTPException(status_code=503, detail=ORCHESTRATION_UNAVAILABLE_DETAIL)
-
-
 def _approval_conflict() -> HTTPException:
     return HTTPException(status_code=409, detail="ticket is not awaiting approval")
 
@@ -113,15 +108,37 @@ async def health() -> dict[str, str]:
     return {"status": "healthy", "service": "ticketflow-api"}
 
 
+def _database_connected(pool: db.ConnectionPool | None) -> bool:
+    """Return whether the configured Postgres is reachable through ``pool``."""
+    if pool is None:
+        return False
+    try:
+        db.ping(pool=pool)
+    except Exception:
+        logger.exception("readiness database check failed")
+        return False
+    return True
+
+
 @app.get("/ready")
-async def ready() -> dict[str, object]:
-    """Report Milestone 0 readiness for local tooling."""
+async def ready(request: Request) -> dict[str, object]:
+    """Report whether the durable orchestration stack is ready to serve.
+
+    Reflects live state rather than a fixed scaffold: the database is
+    ``connected`` when Postgres answers ``SELECT 1`` through the request pool,
+    and orchestration is ``ready`` once the durable graph has been compiled
+    during lifespan startup. The top-level ``status`` is ``healthy`` only when
+    both hold.
+    """
+    state = request.app.state
+    database_connected = _database_connected(getattr(state, "pool", None))
+    orchestration_ready = getattr(state, "compiled", None) is not None
+    healthy = database_connected and orchestration_ready
     return {
-        "status": "degraded",
-        "database": {"status": "not_checked"},
+        "status": "healthy" if healthy else "degraded",
+        "database": {"status": "connected" if database_connected else "unavailable"},
         "orchestration": {
-            "status": "not_implemented",
-            "message": ORCHESTRATION_UNAVAILABLE_DETAIL,
+            "status": "ready" if orchestration_ready else "not_ready",
         },
         "config": _readiness_config(),
     }

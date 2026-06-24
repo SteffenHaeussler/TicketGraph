@@ -1,4 +1,4 @@
-"""Diagnose whether the local Ticketflow Milestone 0 stack is ready."""
+"""Diagnose whether the local Ticketflow stack is ready to serve tickets."""
 
 from __future__ import annotations
 
@@ -19,7 +19,7 @@ class CheckResult:
 
 
 async def check_stack(client: httpx.AsyncClient) -> CheckResult:
-    """Check API and Milestone 0 readiness through the HTTP API."""
+    """Check API liveness and stack readiness through the HTTP API."""
     try:
         health = await client.get("/health")
     except httpx.HTTPError:

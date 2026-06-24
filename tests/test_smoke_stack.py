@@ -28,8 +28,9 @@ async def test_health_and_ready_report_stack_status(client: httpx.AsyncClient):
     ready = await client.get("/ready")
     assert ready.status_code == 200
     body = ready.json()
-    assert body["database"]["status"] == "not_checked"
-    assert body["orchestration"]["status"] == "not_implemented"
+    assert body["status"] == "healthy"
+    assert body["database"]["status"] == "connected"
+    assert body["orchestration"]["status"] == "ready"
 
 
 async def test_ticket_creation_returns_ticket_id(client: httpx.AsyncClient):

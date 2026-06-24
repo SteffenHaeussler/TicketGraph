@@ -106,24 +106,66 @@ async def test_health_returns_alive_status():
     assert response.json() == {"status": "healthy", "service": "ticketflow-api"}
 
 
-async def test_ready_reports_milestone_zero_scaffolding():
+def _readiness_config_block() -> dict[str, str]:
+    return {
+        "database_url": config.DATABASE_URL,
+        "task_queue": config.TASK_QUEUE,
+        "agent_task_queue": config.AGENT_TASK_QUEUE,
+        "fallback_task_queue": config.FALLBACK_TASK_QUEUE,
+    }
+
+
+async def test_ready_reports_healthy_when_stack_is_wired(monkeypatch):
+    monkeypatch.setattr(app.state, "compiled", FakeCompiledGraph(), raising=False)
+    monkeypatch.setattr(app.state, "pool", object(), raising=False)
+    monkeypatch.setattr(db, "ping", lambda *, pool=None, database_url=None: None)
+
+    async with http_client() as http:
+        response = await http.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "healthy",
+        "database": {"status": "connected"},
+        "orchestration": {"status": "ready"},
+        "config": _readiness_config_block(),
+    }
+
+
+async def test_ready_reports_degraded_when_database_unreachable(monkeypatch):
+    monkeypatch.setattr(app.state, "compiled", FakeCompiledGraph(), raising=False)
+    monkeypatch.setattr(app.state, "pool", object(), raising=False)
+
+    def boom(*, pool=None, database_url=None):
+        raise RuntimeError("no postgres")
+
+    monkeypatch.setattr(db, "ping", boom)
+
     async with http_client() as http:
         response = await http.get("/ready")
 
     assert response.status_code == 200
     assert response.json() == {
         "status": "degraded",
-        "database": {"status": "not_checked"},
-        "orchestration": {
-            "status": "not_implemented",
-            "message": "LangGraph/Postgres orchestration is not wired yet.",
-        },
-        "config": {
-            "database_url": config.DATABASE_URL,
-            "task_queue": config.TASK_QUEUE,
-            "agent_task_queue": config.AGENT_TASK_QUEUE,
-            "fallback_task_queue": config.FALLBACK_TASK_QUEUE,
-        },
+        "database": {"status": "unavailable"},
+        "orchestration": {"status": "ready"},
+        "config": _readiness_config_block(),
+    }
+
+
+async def test_ready_reports_degraded_before_graph_is_compiled(monkeypatch):
+    monkeypatch.delattr(app.state, "compiled", raising=False)
+    monkeypatch.delattr(app.state, "pool", raising=False)
+
+    async with http_client() as http:
+        response = await http.get("/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "status": "degraded",
+        "database": {"status": "unavailable"},
+        "orchestration": {"status": "not_ready"},
+        "config": _readiness_config_block(),
     }
 
 

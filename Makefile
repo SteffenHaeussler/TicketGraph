@@ -100,7 +100,7 @@ api:
 doctor:
 	uv run python scripts/doctor.py
 
-## --- demo commands; orchestration is intentionally unavailable in Milestone 0 ---
+## --- demo commands; `ticket` runs the doctor preflight before creating a ticket ---
 
 ticket:
 	@uv run python scripts/doctor.py --quiet --base-url $(API_URL)

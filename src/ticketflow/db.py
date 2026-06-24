@@ -85,6 +85,29 @@ def make_pool(database_url: str | None = None) -> ConnectionPool:
     )
 
 
+def ping(
+    *,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> None:
+    """Verify Postgres connectivity by running ``SELECT 1``.
+
+    Raises on failure so callers can treat a clean return as "database
+    reachable". An injected ``pool`` is assumed open and is left open for the
+    caller; otherwise this owns the pool's lifecycle.
+    """
+    owned_pool = pool is None
+    active_pool = pool or make_pool(database_url)
+    try:
+        if owned_pool:
+            active_pool.open()
+        with active_pool.connection() as conn:
+            conn.execute("SELECT 1")
+    finally:
+        if owned_pool:
+            active_pool.close()
+
+
 def _task_from_row(row: tuple[Any, ...]) -> QueuedTask:
     return QueuedTask(
         id=row[0],
