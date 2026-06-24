@@ -5,34 +5,29 @@ lightweight side effects. This started as a sketch; it is now implemented.
 
 How it is built:
 
-- `TicketWorkflow` and the fast side effects (`send_reply`, `execute_refund`,
-  `record_result`) stay on the `ticketflow` task queue, hosted by
-  `src/ticketflow/runner.py`. Tickets keep progressing even when the agent
-  queues are saturated.
-- `classify_ticket` and `draft_reply` run on the `ticketflow-agent` queue,
+- The LangGraph ticket workflow is advanced by `src/ticketflow/runner.py`.
+  Terminal side effects (`send_reply`, `execute_refund`, `record_result`) are
+  dispatched through the default `ticketflow` queue and drained by
+  `src/ticketflow/side_effect_worker.py`.
+- `classify` and `draft` agent work runs on the `ticketflow-agent` queue,
   hosted by the dedicated `src/ticketflow/agent_worker.py` process.
 - The primary agent queue is throttled with two different knobs
   (`src/ticketflow/config.py`):
-  - `AGENT_MAX_PER_SECOND` → `max_task_queue_activities_per_second`, a
-    *server-side* limit that models the LLM provider's request budget. It is
-    enforced across all workers polling the queue, so scaling out workers never
-    exceeds the vendor limit.
-  - `AGENT_MAX_CONCURRENT` → `max_concurrent_activities`, a *worker-side* limit
-    that models the host's capacity and protects each process.
+  - `AGENT_MAX_PER_SECOND` controls the primary worker's token bucket and spaces
+    out task leases to model the LLM provider's request budget.
+  - `AGENT_MAX_CONCURRENT` bounds in-process worker tasks and models host
+    capacity.
 - If an agent task waits longer than `AGENT_SCHEDULE_TO_START_S` (default 30s)
-  in the primary queue, `TicketWorkflow._execute_agent_activity`
-  (`src/ticketflow/workflows.py`) catches the `SCHEDULE_TO_START` timeout and
-  reruns the activity on the unthrottled `ticketflow-agent-fallback` queue,
-  served by a faster, lower-confidence mock (`MockAgent.fallback()`). Fallback
-  results cap confidence at 0.6, so they visibly land in the approval inbox.
-- Agent activities keep longer start-to-close (2m) and heartbeat (30s) timeouts
-  than side-effect activities (30s start-to-close). Transient provider pressure
-  raises `AgentOverloadedError` and is retried with backoff; permanent failures
-  raise `AgentPermanentError`, which activities convert to a non-retryable
-  Temporal application error and the workflow turns into an `ESCALATED` ticket.
+  in the primary queue, the runner resumes the graph with a timeout envelope.
+  The graph cancels the still-pending primary task and re-dispatches the same
+  work to the unthrottled `ticketflow-agent-fallback` queue, served by a faster,
+  lower-confidence mock (`MockAgent.fallback()`).
+- Transient provider pressure raises `AgentOverloadedError` and is retried by
+  the Postgres queue with exponential backoff. Permanent failures raise
+  `AgentPermanentError`, are recorded as non-retryable task failures, and the
+  workflow turns into an `ESCALATED` ticket.
 
-Known gaps are tracked in `docs/context.md` under "Open follow-ups": heartbeats
-fire only at the start and end of each agent call (a real >30s LLM call would
-trip the heartbeat timeout), and the fallback path has no schedule-to-start
-budget of its own (if the fallback worker is down too, tickets hang instead of
-escalating).
+Run `make demo-saturation-fallback` to see backpressure routing: the target
+starts the Docker stack with a low `AGENT_MAX_PER_SECOND`, short
+`AGENT_SCHEDULE_TO_START_S`, and a batch assertion that at least one settled
+ticket reports a fallback model path.

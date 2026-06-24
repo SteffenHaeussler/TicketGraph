@@ -1,4 +1,5 @@
 import asyncio
+import sys
 from collections import Counter
 
 import httpx
@@ -234,6 +235,21 @@ def test_model_path_histogram_counts_known_model_paths():
     }
 
 
+def test_fallback_model_path_count_matches_any_fallback_component():
+    summary = batch.BatchSummary(
+        statuses={"resolved": 4, "total": 4},
+        model_paths={
+            "fallback/fallback": 1,
+            "primary/fallback": 1,
+            "primary/primary": 1,
+            "unknown": 1,
+            "total": 4,
+        },
+    )
+
+    assert batch.fallback_model_path_count(summary) == 2
+
+
 def test_print_histogram_prints_statuses_and_models(capsys):
     summary = batch.BatchSummary(
         statuses={"resolved": 1, "total": 1},
@@ -250,6 +266,81 @@ def test_print_histogram_prints_statuses_and_models(capsys):
         "primary/primary: 1",
         "total: 1",
     ]
+
+
+def test_main_with_required_fallback_succeeds_when_threshold_is_met(
+    monkeypatch, capsys
+):
+    summary = batch.BatchSummary(
+        statuses={"resolved": 2, "total": 2},
+        model_paths={"fallback/fallback": 1, "primary/primary": 1, "total": 2},
+    )
+
+    async def fake_run_batch(**kwargs):
+        assert kwargs == {
+            "count": 2,
+            "base_url": "http://test",
+            "concurrency": 2,
+            "timeout": 5.0,
+        }
+        return summary
+
+    monkeypatch.setattr(batch, "run_batch", fake_run_batch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "batch.py",
+            "--count",
+            "2",
+            "--base-url",
+            "http://test",
+            "--concurrency",
+            "2",
+            "--timeout",
+            "5",
+            "--require-fallback",
+            "--min-fallback-count",
+            "1",
+        ],
+    )
+
+    assert batch.main() == 0
+    assert "fallback/fallback: 1" in capsys.readouterr().out
+
+
+def test_main_with_required_fallback_fails_when_threshold_is_missed(
+    monkeypatch, capsys
+):
+    summary = batch.BatchSummary(
+        statuses={"resolved": 2, "total": 2},
+        model_paths={"primary/primary": 2, "total": 2},
+    )
+
+    async def fake_run_batch(**kwargs):
+        return summary
+
+    monkeypatch.setattr(batch, "run_batch", fake_run_batch)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "batch.py",
+            "--count",
+            "2",
+            "--base-url",
+            "http://test",
+            "--require-fallback",
+            "--min-fallback-count",
+            "1",
+        ],
+    )
+
+    assert batch.main() == 1
+    assert (
+        "batch failed: expected at least 1 fallback-routed ticket, observed 0"
+        in capsys.readouterr().out
+    )
 
 
 async def test_poll_ticket_statuses_times_out():
