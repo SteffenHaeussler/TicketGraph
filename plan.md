@@ -29,7 +29,7 @@ and self-contained — pick one up at a time. Check it off when its **Done** con
 | `schedule_to_start` → fallback | 30s timer; if still `pending`, re-dispatch to `-fallback` | Ch 11 backpressure routing |
 | Rate limit + concurrency (10/s, 20) | Token bucket + lease-batch in primary worker | Ch 11 backpressure |
 | Idempotent enqueue | `idempotency_key` UNIQUE (`{ticket_id}:{step}`) | Ch 11/12 dedup |
-| `execute_refund` at-most-once | Refund ledger keyed by `ticket_id`, `ON CONFLICT DO NOTHING` | Ch 12 exactly-once effects |
+| Terminal effects at-most-once | Refund/reply ledgers keyed by `ticket_id`, `ON CONFLICT DO NOTHING`; result upsert | Ch 12 exactly-once effects |
 | Enqueue + state in one step | Outbox: task row written in the checkpoint transaction | Ch 11 outbox |
 | Durable timers (24h, 30s) | `workflow_run.wakeup_at`, runner resumes when due | durable timers |
 | Visibility search attribute | `workflow_run.status` secondary index, queried by API | Ch 3 secondary indexes |
@@ -189,10 +189,12 @@ because they shape how the rest is described.*
   `record_refund`'s "first time?" return, so a finalize retry after a successful refund persists
   `refund_executed=False` even though money moved. Source the flag from whether a `refunds` row
   exists for the ticket. _Done:_ a forced finalize retry still reports `refund_executed=True`.
-- [ ] **9.4 Make every terminal side effect idempotent (or document the exceptions).** Only the
+- [x] **9.4 Make every terminal side effect idempotent (or document the exceptions).** Only the
   refund is dedup'd; `send_reply` re-fires on every finalize retry. Either add a sent-reply guard
-  (e.g. a ledger row) or explicitly document `send_reply` as at-least-once. _Done:_ retry behavior
-  of each side effect is either idempotent or documented.
+  (e.g. a ledger row) or explicitly document `send_reply` as at-least-once. _Done:_ `send_reply`
+  now uses `reply_attempts` + `sent_replies` as a durable guard, `execute_refund` remains
+  ledger-backed, and `record_result` remains an idempotent upsert. Docs call out that real email
+  providers still need provider-side idempotency or an outbound outbox.
 
 ### Time & concurrency model
 

@@ -49,6 +49,33 @@ def record_refund(
     return first
 
 
+def record_sent_reply(
+    ticket_id: str,
+    customer_email: str,
+    reply_text: str,
+    attempt: int,
+    *,
+    database_url: str | None = None,
+    pool: Any | None = None,
+) -> bool:
+    """Log a reply attempt; return True only the first time a ticket is replied.
+
+    The ticket id is the idempotency key: duplicate activity runs land in
+    reply_attempts but the sent reply itself is recorded at most once.
+    """
+    with db.managed_pool(database_url=database_url, pool=pool) as active_pool:
+        with active_pool.connection() as conn:
+            first = ledger.record_sent_reply(
+                conn,
+                ticket_id,
+                customer_email,
+                reply_text,
+                attempt,
+            )
+            conn.commit()
+    return first
+
+
 def load_result(
     ticket_id: str,
     *,

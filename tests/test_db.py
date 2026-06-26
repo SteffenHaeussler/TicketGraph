@@ -211,13 +211,15 @@ def test_bootstrap_creates_idempotent_migration_marker():
     db.bootstrap(pool=pool)
     db.bootstrap(pool=pool)
 
-    # Each call issues 15 statements: schema_migrations create + 000 marker,
+    # Each call issues 19 statements: schema_migrations create + 000 marker,
     # task_queue create, dispatch index, 001 marker, refunds create,
     # refund_attempts create, ticket_results create, 002 marker,
     # workflow_run create, status index, 003 marker, pending_signal create,
-    # signal lookup index, 004 marker, unique signal index, 005 marker.
+    # signal lookup index, 004 marker, unique signal index, 005 marker,
+    # sent_replies create, reply_attempts create, reply_attempts index,
+    # 006 marker.
     assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 34
+    assert len(pool.connection_obj.sql) == 42
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
     assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
@@ -248,6 +250,15 @@ def test_bootstrap_creates_idempotent_migration_marker():
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind"
         in pool.connection_obj.sql[15]
     )
+    assert "CREATE TABLE IF NOT EXISTS sent_replies" in pool.connection_obj.sql[17]
+    assert "ticket_id      text        PRIMARY KEY" in pool.connection_obj.sql[17]
+    assert "customer_email text        NOT NULL" in pool.connection_obj.sql[17]
+    assert "reply_text     text        NOT NULL" in pool.connection_obj.sql[17]
+    assert "CREATE TABLE IF NOT EXISTS reply_attempts" in pool.connection_obj.sql[18]
+    assert (
+        "CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket"
+        in pool.connection_obj.sql[19]
+    )
     assert pool.connection_obj.params == [
         ("000_bootstrap",),
         ("001_task_queue",),
@@ -255,12 +266,14 @@ def test_bootstrap_creates_idempotent_migration_marker():
         ("003_workflow_run",),
         ("004_pending_signal",),
         ("005_pending_signal_unique_unconsumed",),
+        ("006_sent_reply_guard",),
         ("000_bootstrap",),
         ("001_task_queue",),
         ("002_read_model",),
         ("003_workflow_run",),
         ("004_pending_signal",),
         ("005_pending_signal_unique_unconsumed",),
+        ("006_sent_reply_guard",),
     ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
@@ -331,6 +344,24 @@ def test_bootstrap_creates_unique_unconsumed_pending_signal_index():
     assert "ON pending_signal (workflow_id, kind)" in sql
     assert "WHERE consumed = false" in sql
     assert ("005_pending_signal_unique_unconsumed",) in pool.connection_obj.params
+
+
+def test_bootstrap_creates_sent_reply_guard_tables():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE TABLE IF NOT EXISTS sent_replies" in sql
+    assert "ticket_id      text        PRIMARY KEY" in sql
+    assert "customer_email text        NOT NULL" in sql
+    assert "reply_text     text        NOT NULL" in sql
+    assert "CREATE TABLE IF NOT EXISTS reply_attempts" in sql
+    assert "ticket_id    text        NOT NULL" in sql
+    assert "attempt      integer     NOT NULL" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket" in sql
+    assert "ON reply_attempts (ticket_id, attempted_at, id)" in sql
+    assert ("006_sent_reply_guard",) in pool.connection_obj.params
 
 
 def test_bootstrap_leaves_injected_pool_unopened_to_caller():
