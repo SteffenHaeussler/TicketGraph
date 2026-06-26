@@ -204,11 +204,13 @@ because they shape how the rest is described.*
   boundary (override `now()`, or inject `available_at`/`wakeup_at`). _Done:_ timer tests no longer
   rely on past-dating a frozen clock; graph deadlines are derived from Postgres `now()`, and tests
   force due timers by updating persisted `wakeup_at` values.
-- [ ] **9.6 Pick one async story for DB access.** The runner calls sync `claim_run`/`save_run`
+- [x] **9.6 Pick one async story for DB access.** The runner calls sync `claim_run`/`save_run`
   inside `async step` and compiles the graph with the sync pool, so dispatch-node enqueues block
   the event loop inside `await ainvoke`; the worker, by contrast, uses `to_thread`. Make it
-  consistent (async pool everywhere, or sync-behind-`to_thread` everywhere). _Done:_ no blocking
-  sync DB calls run directly on the runner's event loop.
+  consistent (async pool everywhere, or sync-behind-`to_thread` everywhere). _Done:_ runner-owned
+  sync DB work (`claim_run`, `save_run`, resume lookups, reconciliation, janitor, and sync pool
+  lifecycle) runs behind `asyncio.to_thread`, and the runner compiles the graph with an async pool
+  so graph dispatch writes do not block the event loop.
 
 ### Efficiency & hygiene
 
