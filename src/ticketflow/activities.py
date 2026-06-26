@@ -77,6 +77,12 @@ class TicketActivities:
             )
         return first
 
+    async def refund_recorded(self, ticket_id: str) -> bool:
+        """Return whether a refund is durably recorded for the ticket."""
+        return await asyncio.to_thread(
+            readmodel.refund_recorded, ticket_id, database_url=self._database_url
+        )
+
     async def record_result(self, result: TicketResult) -> None:
         """Persist the terminal workflow result to the read model."""
         await asyncio.to_thread(

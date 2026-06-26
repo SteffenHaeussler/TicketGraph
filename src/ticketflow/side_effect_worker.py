@@ -41,6 +41,9 @@ async def run_finalize(
     Issues the refund (only when the ticket resolved with a refund action),
     sends the reply, and records the result. The refund attempt number is the
     task's own attempt count so retries stay observable in the refund ledger.
+    ``refund_executed`` is sourced from durable ledger state (whether a refunds
+    row exists) rather than from the refund call's "first time?" return, so a
+    finalize retry after a committed refund still reports that money moved.
     Returns the result that is stored as the task result and used to resume the
     workflow run.
     """
@@ -54,9 +57,10 @@ async def run_finalize(
     refund_executed = False
     if result.status == TicketStatus.RESOLVED and action.type == ActionType.REFUND:
         assert action.refund_amount is not None
-        refund_executed = await activities.execute_refund(
+        await activities.execute_refund(
             ticket.id, action.refund_amount, attempt=task.attempts
         )
+        refund_executed = await activities.refund_recorded(ticket.id)
 
     await activities.send_reply(ticket, result.reply_text, attempt=task.attempts)
     result = result.model_copy(update={"refund_executed": refund_executed})
