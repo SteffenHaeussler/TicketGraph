@@ -30,8 +30,11 @@ class FakeInterrupt:
 
 
 class FakeSnapshot:
-    def __init__(self, interrupts: list[FakeInterrupt]) -> None:
+    def __init__(
+        self, interrupts: list[FakeInterrupt], values: dict[str, Any] | None = None
+    ) -> None:
         self.interrupts = interrupts
+        self.values = values or {}
 
 
 class FakeCompiled:
@@ -625,6 +628,96 @@ async def test_runner_drives_a_seeded_run_to_resolved_through_postgres(
     assert row[1] is None  # wakeup_at cleared at the terminal step
     assert row[2] is None  # lease released
     assert row[3] is None
+
+
+@pytest.mark.integration
+async def test_reconcile_rebuilds_run_row_orphaned_by_a_crash(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
+    """A crash between seed and run-row insert leaves a reconcilable ticket (M9.2).
+
+    ``api.create_ticket`` seeds the checkpoint (status ``classifying``, parked at
+    ``await_classify``) and *then* inserts the ``workflow_run`` row in a separate
+    transaction. We inject the crash by skipping that insert, leaving an orphaned
+    checkpoint the runner could never lease. ``reconcile_orphaned_runs`` rebuilds
+    the missing row from the checkpoint and the ticket runs to ``resolved``.
+    """
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from ticketflow import graph
+    from ticketflow.activities import TicketActivities
+    from ticketflow.agent.mock import MockAgent
+    from ticketflow.models import Ticket, TicketStatus
+
+    activities = TicketActivities(
+        MockAgent(
+            seed=1, failure_rate=0.0, refund_rate=0.0, confidence_range=(0.8, 1.0)
+        )
+    )
+    ticket = Ticket(
+        id=f"t-orphan-{uuid.uuid4().hex}",
+        customer_email="customer@example.com",
+        subject="Need help",
+        body="My login keeps failing and I want it fixed.",
+    )
+    cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
+
+        # Seed only — the "crash" is skipping the workflow_run insert that
+        # create_ticket would normally do next.
+        out = await compiled.ainvoke(
+            {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        )
+        assert "__interrupt__" in out
+        snapshot = await compiled.aget_state(cfg)
+        seeded_wakeup_at = snapshot.values.get("wakeup_at")
+
+        # The gap: no run row exists, so the runner cannot lease the ticket.
+        assert db.claim_run("recon-worker", pool=postgres_pool) is None
+        with postgres_pool.connection() as conn:
+            count_row = conn.execute(
+                "SELECT count(*) FROM workflow_run WHERE ticket_id = %s",
+                (ticket.id,),
+            ).fetchone()
+        assert count_row is not None
+        assert count_row[0] == 0
+
+        reconciled = await runner.reconcile_orphaned_runs(compiled, postgres_pool)
+        assert reconciled == 1
+
+        with postgres_pool.connection() as conn:
+            row = conn.execute(
+                "SELECT status, wakeup_at FROM workflow_run WHERE ticket_id = %s",
+                (ticket.id,),
+            ).fetchone()
+        assert row is not None
+        assert row[0] == TicketStatus.CLASSIFYING
+        assert row[1] == seeded_wakeup_at
+
+        # A second pass finds nothing left to reconcile.
+        assert await runner.reconcile_orphaned_runs(compiled, postgres_pool) == 0
+
+        # The rebuilt run is genuinely runnable: drive it to a terminal result.
+        await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
+        final = await compiled.aget_state(cfg)
+
+    with postgres_pool.connection() as conn:
+        run = conn.execute(
+            "SELECT status, wakeup_at, lease_owner, lease_expires_at "
+            "FROM workflow_run WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchone()
+
+    assert final.values["status"] == TicketStatus.RESOLVED
+    assert run is not None
+    assert run[0] == "resolved"
+    assert run[1] is None
+    assert run[2] is None
+    assert run[3] is None
 
 
 @pytest.mark.integration

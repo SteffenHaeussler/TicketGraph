@@ -614,6 +614,15 @@ def test_create_run_inserts_initial_workflow_run():
     assert pool.connection_obj.commits == 1
 
 
+def test_create_run_insert_is_idempotent():
+    pool = FakePool(opened=True)
+
+    db.create_run("ticket-1", status="classifying", wakeup_at=None, pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "ON CONFLICT (ticket_id) DO NOTHING" in sql
+
+
 def test_create_run_accepts_null_wakeup_at():
     pool = FakePool(opened=True)
 
@@ -647,6 +656,27 @@ async def test_acreate_run_inserts_initial_workflow_run():
     assert "wakeup_at" in sql
     assert pool.connection_obj.params[-1] == ("ticket-1", "classifying", wakeup_at)
     assert pool.connection_obj.commits == 1
+
+
+async def test_acreate_run_insert_is_idempotent():
+    pool = AsyncFakePool(opened=True)
+
+    await db.acreate_run("ticket-1", status="classifying", wakeup_at=None, pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "ON CONFLICT (ticket_id) DO NOTHING" in sql
+
+
+def test_list_orphaned_checkpoint_threads_returns_unprojected_threads():
+    pool = FakePool(opened=True)
+    pool.connection_obj.rows = [[("t-orphan-1",), ("t-orphan-2",)]]
+
+    threads = db.list_orphaned_checkpoint_threads(pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "checkpoints" in sql
+    assert "workflow_run" in sql
+    assert threads == ["t-orphan-1", "t-orphan-2"]
 
 
 async def test_acreate_run_opens_and_closes_owned_pool(monkeypatch):

@@ -362,6 +362,11 @@ def create_run(
     ``lease_owner``/``lease_expires_at`` stay NULL (unleased) and the timestamps
     default to ``now()``; ``status`` must satisfy the ``workflow_run`` CHECK
     constraint.
+
+    The insert is idempotent (``ON CONFLICT (ticket_id) DO NOTHING``): the runner's
+    orphan reconciler may race this call and create the same row first from the
+    checkpoint, deriving an identical ``status``/``wakeup_at``, so the loser is a
+    harmless no-op rather than a duplicate-key error.
     """
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
@@ -369,6 +374,7 @@ def create_run(
                 """
                 INSERT INTO workflow_run (ticket_id, status, wakeup_at)
                 VALUES (%s, %s, %s)
+                ON CONFLICT (ticket_id) DO NOTHING
                 """,
                 (ticket_id, status, wakeup_at),
             )
@@ -383,13 +389,18 @@ async def acreate_run(
     database_url: str | None = None,
     pool: _AsyncPool | None = None,
 ) -> None:
-    """Async variant of ``create_run`` for FastAPI request paths."""
+    """Async variant of ``create_run`` for FastAPI request paths.
+
+    Idempotent like ``create_run``: ``ON CONFLICT (ticket_id) DO NOTHING`` lets the
+    runner's orphan reconciler win the race without breaking ``create_ticket``.
+    """
     async with managed_async_pool(database_url=database_url, pool=pool) as active_pool:
         async with active_pool.connection() as conn:
             await conn.execute(
                 """
                 INSERT INTO workflow_run (ticket_id, status, wakeup_at)
                 VALUES (%s, %s, %s)
+                ON CONFLICT (ticket_id) DO NOTHING
                 """,
                 (ticket_id, status, wakeup_at),
             )
@@ -478,6 +489,35 @@ def list_runs_by_status(
                 ORDER BY created_at, ticket_id
                 """,
                 (status,),
+            ).fetchall()
+            conn.commit()
+
+    return [str(row[0]) for row in rows]
+
+
+def list_orphaned_checkpoint_threads(
+    *,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> list[str]:
+    """Return checkpoint thread ids that have no ``workflow_run`` projection.
+
+    ``api.create_ticket`` seeds the durable checkpoint (owned by LangGraph's
+    ``checkpoints`` table, keyed by ``thread_id`` = ticket id) and *then* inserts
+    the ``workflow_run`` row in a separate transaction. A crash in between strands
+    a checkpoint with no run row, which the runner can never lease. These threads
+    are exactly the orphans the reconciler rebuilds.
+    """
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
+        with active_pool.connection() as conn:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT c.thread_id
+                FROM checkpoints c
+                WHERE NOT EXISTS (
+                    SELECT 1 FROM workflow_run w WHERE w.ticket_id = c.thread_id
+                )
+                """,
             ).fetchall()
             conn.commit()
 
