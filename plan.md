@@ -112,7 +112,8 @@ RETURNING *;
 - [x] **4.1 `workflow_run` table** `(ticket_id PK, status, wakeup_at, lease_owner,
   lease_expires_at, …)` + a claim/lease helper.
 - [x] **4.2 Runner loop.** `runner.py`: lease a runnable run (result/signal ready OR `wakeup_at`
-  due), resume its graph, persist **checkpoint + state + outbox tasks in one transaction**, release.
+  due), resume its graph, persist the checkpoint and enqueue outbox tasks (**at-least-once
+  dispatch made safe by idempotency keys**), release.
 - [x] **4.3 Timers.** Resume runs whose `wakeup_at <= now()` with a "timeout" input (drives 24h
   approval expiry and 30s fallback).
 - [x] **4.4 Signals.** `pending_signal(workflow_id, kind, payload, consumed)`; deliver approval
@@ -169,7 +170,7 @@ because they shape how the rest is described.*
 
 ### Correctness & claims (do first)
 
-- [ ] **9.1 Align the outbox claim with reality.** The runner uses three independent
+- [x] **9.1 Align the outbox claim with reality.** The runner uses three independent
   transactions (checkpoint, outbox enqueue, `workflow_run` projection), not one — `runner.py`'s
   module docstring already admits this, but `README.md` (the runner row, ~line 25) and `plan.md`
   M4.2 say "in one transaction." Either (a) reword both to "at-least-once dispatch made safe by
