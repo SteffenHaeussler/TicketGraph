@@ -25,7 +25,7 @@ Five processes cooperate (all share one Postgres):
 | `runner` | `ticketflow.runner` | Leases runnable workflows, advances the graph, dispatches tasks at-least-once (made safe by idempotency keys), fires durable timers |
 | `agent_worker` | `ticketflow.agent_worker` | Drains the primary agent queue with a token-bucket rate limit + bounded concurrency |
 | `fallback_worker` | `ticketflow.fallback_worker` | Unthrottled drain of the fallback queue (used when a task misses its schedule-to-start budget) |
-| `side_effect_worker` | `ticketflow.side_effect_worker` | Runs `send_reply` / `execute_refund` / `record_result`, with at-most-once refunds via the ledger |
+| `side_effect_worker` | `ticketflow.side_effect_worker` | Runs `send_reply` / `execute_refund` / `record_result`; replies and refunds are guarded at-most-once by Postgres ledgers, and results upsert by ticket ID |
 
 A ticket moves through these states:
 

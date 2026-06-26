@@ -19,6 +19,7 @@ READ_MODEL_MIGRATION = "002_read_model"
 WORKFLOW_RUN_MIGRATION = "003_workflow_run"
 PENDING_SIGNAL_MIGRATION = "004_pending_signal"
 PENDING_SIGNAL_UNIQUE_MIGRATION = "005_pending_signal_unique_unconsumed"
+SENT_REPLY_GUARD_MIGRATION = "006_sent_reply_guard"
 
 
 @dataclass(frozen=True)
@@ -744,5 +745,39 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 ON CONFLICT (version) DO NOTHING
                 """,
                 (PENDING_SIGNAL_UNIQUE_MIGRATION,),
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sent_replies (
+                    ticket_id      text        PRIMARY KEY,
+                    customer_email text        NOT NULL,
+                    reply_text     text        NOT NULL,
+                    recorded_at    timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reply_attempts (
+                    id           bigserial   PRIMARY KEY,
+                    ticket_id    text        NOT NULL,
+                    attempt      integer     NOT NULL,
+                    attempted_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket
+                ON reply_attempts (ticket_id, attempted_at, id)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations (version)
+                VALUES (%s)
+                ON CONFLICT (version) DO NOTHING
+                """,
+                (SENT_REPLY_GUARD_MIGRATION,),
             )
             conn.commit()

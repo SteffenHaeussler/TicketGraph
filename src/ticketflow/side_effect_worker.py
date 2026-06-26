@@ -58,7 +58,7 @@ async def run_finalize(
             ticket.id, action.refund_amount, attempt=task.attempts
         )
 
-    await activities.send_reply(ticket, result.reply_text)
+    await activities.send_reply(ticket, result.reply_text, attempt=task.attempts)
     result = result.model_copy(update={"refund_executed": refund_executed})
     await activities.record_result(result)
     return result

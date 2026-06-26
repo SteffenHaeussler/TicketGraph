@@ -155,11 +155,77 @@ def test_record_refund_logs_attempt_before_refund_insert() -> None:
     assert pool.connection_obj.params == [("t-1", 3), ("t-1", 42.0)]
 
 
+def test_record_sent_reply_returns_true_and_commits_on_first_reply() -> None:
+    pool = FakePool(rows=[None, ("t-1",)])
+
+    first = readmodel.record_sent_reply(
+        "t-1",
+        "customer@example.com",
+        "We handled it.",
+        attempt=1,
+        pool=pool,
+    )
+
+    assert first is True
+    assert pool.connection_obj.commits == 1
+    assert pool.closed is False
+
+
+def test_record_sent_reply_returns_false_on_duplicate_reply() -> None:
+    pool = FakePool(rows=[None, None])
+
+    duplicate = readmodel.record_sent_reply(
+        "t-1",
+        "customer@example.com",
+        "We handled it.",
+        attempt=2,
+        pool=pool,
+    )
+
+    assert duplicate is False
+
+
+def test_record_sent_reply_logs_attempt_before_sent_reply_insert() -> None:
+    pool = FakePool(rows=[None, ("t-1",)])
+
+    readmodel.record_sent_reply(
+        "t-1",
+        "customer@example.com",
+        "We handled it.",
+        attempt=3,
+        pool=pool,
+    )
+
+    assert "INSERT INTO reply_attempts" in pool.connection_obj.sql[0]
+    assert "INSERT INTO sent_replies" in pool.connection_obj.sql[1]
+    assert "ON CONFLICT (ticket_id) DO NOTHING" in pool.connection_obj.sql[1]
+    assert pool.connection_obj.params == [
+        ("t-1", 3),
+        ("t-1", "customer@example.com", "We handled it."),
+    ]
+
+
 def test_record_refund_opens_and_closes_owned_pool(monkeypatch) -> None:
     pool = FakePool(rows=[None, ("t-1",)])
     monkeypatch.setattr(readmodel.db, "make_pool", lambda database_url=None: pool)
 
     readmodel.record_refund("t-1", 42.0, attempt=1, database_url="postgresql://db")
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
+def test_record_sent_reply_opens_and_closes_owned_pool(monkeypatch) -> None:
+    pool = FakePool(rows=[None, ("t-1",)])
+    monkeypatch.setattr(readmodel.db, "make_pool", lambda database_url=None: pool)
+
+    readmodel.record_sent_reply(
+        "t-1",
+        "customer@example.com",
+        "We handled it.",
+        attempt=1,
+        database_url="postgresql://db",
+    )
 
     assert pool.opened is True
     assert pool.closed is True
@@ -229,4 +295,37 @@ def test_record_refund_is_at_most_once_against_real_postgres(
     assert first is True
     assert second is False
     assert refunds == (1,)
+    assert attempts == (2,)
+
+
+@pytest.mark.integration
+def test_record_sent_reply_is_at_most_once_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    first = readmodel.record_sent_reply(
+        "t-1",
+        "customer@example.com",
+        "We handled it.",
+        attempt=1,
+        pool=postgres_pool,
+    )
+    second = readmodel.record_sent_reply(
+        "t-1",
+        "customer@example.com",
+        "We handled it.",
+        attempt=2,
+        pool=postgres_pool,
+    )
+
+    with postgres_pool.connection() as conn:
+        sent = conn.execute(
+            "SELECT count(*) FROM sent_replies WHERE ticket_id = %s", ("t-1",)
+        ).fetchone()
+        attempts = conn.execute(
+            "SELECT count(*) FROM reply_attempts WHERE ticket_id = %s", ("t-1",)
+        ).fetchone()
+
+    assert first is True
+    assert second is False
+    assert sent == (1,)
     assert attempts == (2,)

@@ -32,7 +32,7 @@ class RecordingActivities(TicketActivities):
         super().__init__(MockAgent())
         self.refund_first = refund_first
         self.refund_calls: list[tuple[str, float, int]] = []
-        self.sent_replies: list[tuple[str, str]] = []
+        self.sent_replies: list[tuple[str, str, int]] = []
         self.recorded: list[TicketResult] = []
 
     async def execute_refund(
@@ -41,8 +41,11 @@ class RecordingActivities(TicketActivities):
         self.refund_calls.append((ticket_id, amount, attempt))
         return self.refund_first
 
-    async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
-        self.sent_replies.append((ticket.id, reply_text))
+    async def send_reply(
+        self, ticket: Ticket, reply_text: str, attempt: int = 1
+    ) -> bool:
+        self.sent_replies.append((ticket.id, reply_text, attempt))
+        return True
 
     async def record_result(self, result: TicketResult) -> None:
         self.recorded.append(result)
@@ -118,7 +121,7 @@ async def test_run_finalize_executes_refund_for_resolved_refund() -> None:
     out = await side_effect_worker.run_finalize(task, activities)
 
     assert activities.refund_calls == [(ticket.id, 42.0, 3)]
-    assert activities.sent_replies == [(ticket.id, draft.reply_text)]
+    assert activities.sent_replies == [(ticket.id, draft.reply_text, 3)]
     assert activities.recorded == [out]
     assert out.refund_executed is True
 
@@ -137,7 +140,7 @@ async def test_run_finalize_skips_refund_for_reply_only() -> None:
     out = await side_effect_worker.run_finalize(task, activities)
 
     assert activities.refund_calls == []
-    assert activities.sent_replies == [(ticket.id, draft.reply_text)]
+    assert activities.sent_replies == [(ticket.id, draft.reply_text, 1)]
     assert out.refund_executed is False
 
 
@@ -226,3 +229,43 @@ async def test_postgres_finalize_runs_side_effects_and_wakes_run(
     assert claimed.ticket_id == ticket.id
     assert stored is not None
     assert stored.refund_executed is True
+
+
+@pytest.mark.integration
+async def test_postgres_duplicate_finalize_sends_reply_at_most_once(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    ticket = make_ticket(id=f"t-dup-reply-{uuid.uuid4().hex}")
+    draft = reply_only_draft()
+    result = TicketResult(
+        ticket_id=ticket.id,
+        status=TicketStatus.RESOLVED,
+        reply_text=draft.reply_text,
+    )
+    activities = TicketActivities(MockAgent(), database_url=config.DATABASE_URL)
+
+    await side_effect_worker.run_finalize(
+        _finalize_task(ticket=ticket, action=draft.action, result=result, attempts=1),
+        activities,
+    )
+    await side_effect_worker.run_finalize(
+        _finalize_task(ticket=ticket, action=draft.action, result=result, attempts=2),
+        activities,
+    )
+
+    with postgres_pool.connection() as conn:
+        sent = conn.execute(
+            "SELECT customer_email, reply_text FROM sent_replies WHERE ticket_id = %s",
+            (ticket.id,),
+        ).fetchall()
+        attempts = conn.execute(
+            "SELECT attempt FROM reply_attempts WHERE ticket_id = %s ORDER BY attempt",
+            (ticket.id,),
+        ).fetchall()
+
+    stored = readmodel.load_result(ticket.id, database_url=config.DATABASE_URL)
+
+    assert sent == [(ticket.customer_email, draft.reply_text)]
+    assert attempts == [(1,), (2,)]
+    assert stored is not None
+    assert stored.reply_text == draft.reply_text

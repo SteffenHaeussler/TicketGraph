@@ -49,8 +49,12 @@ class RecordingActivities(TicketActivities):
         self.refund_results: list[bool] = [True]
         self.recorded_results: list[TicketResult] = []
 
-    async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
+    async def send_reply(
+        self, ticket: Ticket, reply_text: str, attempt: int = 1
+    ) -> bool:
+        _ = attempt
         self.sent_replies.append((ticket.id, reply_text))
+        return True
 
     async def execute_refund(
         self, ticket_id: str, amount: float, attempt: int = 1
@@ -126,11 +130,13 @@ class FailReplyOnceActivities(TicketActivities):
         super().__init__(agent, database_url=database_url)
         self.reply_calls = 0
 
-    async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
-        _ = ticket, reply_text
+    async def send_reply(
+        self, ticket: Ticket, reply_text: str, attempt: int = 1
+    ) -> bool:
         self.reply_calls += 1
         if self.reply_calls == 1:
             raise RuntimeError("mail server down")
+        return await super().send_reply(ticket, reply_text, attempt=attempt)
 
 
 def make_ticket(ticket_id: str = "t-1") -> Ticket:
