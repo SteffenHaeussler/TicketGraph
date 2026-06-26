@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from psycopg.types.json import Jsonb
@@ -19,6 +19,7 @@ READ_MODEL_MIGRATION = "002_read_model"
 WORKFLOW_RUN_MIGRATION = "003_workflow_run"
 PENDING_SIGNAL_MIGRATION = "004_pending_signal"
 PENDING_SIGNAL_UNIQUE_MIGRATION = "005_pending_signal_unique_unconsumed"
+SENT_REPLY_GUARD_MIGRATION = "006_sent_reply_guard"
 
 
 @dataclass(frozen=True)
@@ -152,6 +153,21 @@ def ping(
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute("SELECT 1")
+
+
+def timestamp_after(conn: Any, delta: timedelta) -> datetime:
+    """Return a timestamp ``delta`` after the database's current time."""
+    row = conn.execute("SELECT now() + %s::interval", (delta,)).fetchone()
+    assert row is not None
+    return row[0]
+
+
+async def atimestamp_after(conn: Any, delta: timedelta) -> datetime:
+    """Async variant of ``timestamp_after``."""
+    cursor = await conn.execute("SELECT now() + %s::interval", (delta,))
+    row = await cursor.fetchone()
+    assert row is not None
+    return row[0]
 
 
 def _task_from_row(row: tuple[Any, ...]) -> QueuedTask:
@@ -744,5 +760,39 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 ON CONFLICT (version) DO NOTHING
                 """,
                 (PENDING_SIGNAL_UNIQUE_MIGRATION,),
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS sent_replies (
+                    ticket_id      text        PRIMARY KEY,
+                    customer_email text        NOT NULL,
+                    reply_text     text        NOT NULL,
+                    recorded_at    timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reply_attempts (
+                    id           bigserial   PRIMARY KEY,
+                    ticket_id    text        NOT NULL,
+                    attempt      integer     NOT NULL,
+                    attempted_at timestamptz NOT NULL DEFAULT now()
+                )
+                """
+            )
+            conn.execute(
+                """
+                CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket
+                ON reply_attempts (ticket_id, attempted_at, id)
+                """
+            )
+            conn.execute(
+                """
+                INSERT INTO schema_migrations (version)
+                VALUES (%s)
+                ON CONFLICT (version) DO NOTHING
+                """,
+                (SENT_REPLY_GUARD_MIGRATION,),
             )
             conn.commit()

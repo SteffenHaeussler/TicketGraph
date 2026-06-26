@@ -15,7 +15,6 @@ from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.types import Command
 
 from tests.helpers import (
-    FrozenClock,
     drive_until_quiescent,
     process_one_task,
 )
@@ -49,8 +48,12 @@ class RecordingActivities(TicketActivities):
         self.refund_results: list[bool] = [True]
         self.recorded_results: list[TicketResult] = []
 
-    async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
+    async def send_reply(
+        self, ticket: Ticket, reply_text: str, attempt: int = 1
+    ) -> bool:
+        _ = attempt
         self.sent_replies.append((ticket.id, reply_text))
+        return True
 
     async def execute_refund(
         self, ticket_id: str, amount: float, attempt: int = 1
@@ -126,11 +129,13 @@ class FailReplyOnceActivities(TicketActivities):
         super().__init__(agent, database_url=database_url)
         self.reply_calls = 0
 
-    async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
-        _ = ticket, reply_text
+    async def send_reply(
+        self, ticket: Ticket, reply_text: str, attempt: int = 1
+    ) -> bool:
         self.reply_calls += 1
         if self.reply_calls == 1:
             raise RuntimeError("mail server down")
+        return await super().send_reply(ticket, reply_text, attempt=attempt)
 
 
 def make_ticket(ticket_id: str = "t-1") -> Ticket:
@@ -346,11 +351,12 @@ async def test_agent_dispatch_updates_visible_status_before_interrupt() -> None:
     assert snapshot.values["status"] == TicketStatus.DRAFTING
 
 
-async def test_agent_dispatch_uses_injected_clock_for_schedule_to_start() -> None:
-    now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
-    clock = FrozenClock(now)
+async def test_agent_dispatch_uses_database_clock_for_schedule_to_start() -> None:
+    classify_wakeup = datetime(2026, 6, 23, 12, 0, 30, tzinfo=timezone.utc)
+    draft_wakeup = datetime(2026, 6, 23, 12, 5, 30, tzinfo=timezone.utc)
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(InMemorySaver(), pool, clock=clock)
+    pool.connection_obj.rows = [(1,), (classify_wakeup,), (1,), (draft_wakeup,)]
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-clock-dispatch")
     cfg = config_for(ticket.id)
 
@@ -358,24 +364,18 @@ async def test_agent_dispatch_uses_injected_clock_for_schedule_to_start() -> Non
         {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
     )
 
-    expected_classify_wakeup = now + timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S)
-    assert out["wakeup_at"] == expected_classify_wakeup
-    assert out["__interrupt__"][0].value["wakeup_at"] == (
-        expected_classify_wakeup.isoformat()
+    assert out["wakeup_at"] == classify_wakeup
+    assert out["__interrupt__"][0].value["wakeup_at"] == classify_wakeup.isoformat()
+    assert (timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S),) in (
+        pool.connection_obj.params
     )
 
-    clock.advance(timedelta(minutes=5))
     out = await compiled.ainvoke(
         Command(resume=make_classification().model_dump(mode="json")), cfg
     )
 
-    expected_draft_wakeup = clock.now() + timedelta(
-        seconds=config.AGENT_SCHEDULE_TO_START_S
-    )
-    assert out["wakeup_at"] == expected_draft_wakeup
-    assert out["__interrupt__"][0].value["wakeup_at"] == (
-        expected_draft_wakeup.isoformat()
-    )
+    assert out["wakeup_at"] == draft_wakeup
+    assert out["__interrupt__"][0].value["wakeup_at"] == draft_wakeup.isoformat()
 
 
 async def test_classify_task_failure_escalates_without_draft_dispatch() -> None:
@@ -514,7 +514,11 @@ async def test_timeout_skips_fallback_when_cancel_loses_race() -> None:
     # The first row lets the initial dispatch enqueue appear successful; the
     # second row makes the atomic cancel report that no pending row was claimed.
     pool = FakePool(opened=True, row=(1,))
-    pool.connection_obj.rows = [(1,), None]
+    pool.connection_obj.rows = [
+        (1,),
+        (datetime.now(timezone.utc) + timedelta(seconds=30),),
+        None,
+    ]
     compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-cancel-race")
     cfg = config_for(ticket.id)
@@ -556,11 +560,17 @@ async def test_decide_approval_flags_low_confidence_drafts() -> None:
     assert draft.confidence < 0.75
 
 
-async def test_prepare_approval_uses_injected_clock_for_timeout() -> None:
-    now = datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc)
-    clock = FrozenClock(now)
+async def test_prepare_approval_uses_database_clock_for_timeout() -> None:
+    approval_wakeup = datetime(2026, 6, 24, 12, 0, tzinfo=timezone.utc)
     pool = FakePool(opened=True, row=(1,))
-    compiled = graph.compile_ticket_graph(InMemorySaver(), pool, clock=clock)
+    pool.connection_obj.rows = [
+        (1,),
+        (datetime(2026, 6, 23, 12, 0, 30, tzinfo=timezone.utc),),
+        (1,),
+        (datetime(2026, 6, 23, 12, 1, 0, tzinfo=timezone.utc),),
+        (approval_wakeup,),
+    ]
+    compiled = graph.compile_ticket_graph(InMemorySaver(), pool)
     ticket = make_ticket("t-clock-approval")
 
     out = await resume_through_agents(
@@ -571,9 +581,9 @@ async def test_prepare_approval_uses_injected_clock_for_timeout() -> None:
     )
     snapshot = await compiled.aget_state(config_for(ticket.id))
 
-    expected_wakeup = now + APPROVAL_TIMEOUT
-    assert snapshot.values["wakeup_at"] == expected_wakeup
-    assert out["__interrupt__"][0].value["wakeup_at"] == expected_wakeup.isoformat()
+    assert snapshot.values["wakeup_at"] == approval_wakeup
+    assert out["__interrupt__"][0].value["wakeup_at"] == approval_wakeup.isoformat()
+    assert (APPROVAL_TIMEOUT,) in pool.connection_obj.params
 
 
 async def test_approved_resume_continues_to_resolution() -> None:
@@ -873,7 +883,6 @@ async def test_retargeted_workflow_fallback_on_timeout_completes(
 ) -> None:
     from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
-    clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=timezone.utc))
     ticket = make_ticket(f"t-74-fallback-{uuid.uuid4().hex}")
     agent = ScriptedAgent(make_classification(), reply_draft())
     activities = TicketActivities(agent, database_url=postgres_database_url)
@@ -881,11 +890,17 @@ async def test_retargeted_workflow_fallback_on_timeout_completes(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(saver, postgres_pool, clock=clock)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
         await _start_durable_run(compiled, postgres_pool, ticket, cfg)
 
-        clock.advance(timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S))
-        advanced = await runner.step(compiled, postgres_pool, "runner-1", clock=clock)
+        with postgres_pool.connection() as conn:
+            conn.execute(
+                "UPDATE workflow_run SET wakeup_at = now(), updated_at = now() "
+                "WHERE ticket_id = %s",
+                (ticket.id,),
+            )
+            conn.commit()
+        advanced = await runner.step(compiled, postgres_pool, "runner-1")
         fallback_row = _require_task_row(
             postgres_pool, f"{ticket.id}:classify:fallback"
         )

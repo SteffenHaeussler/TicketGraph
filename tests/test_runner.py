@@ -8,13 +8,12 @@ integration test drives a seeded run ``received -> resolved`` purely through
 
 import logging
 import uuid
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from tests.helpers import (
-    FrozenClock,
     billing_classification,
     drive_until_quiescent,
     refund_draft,
@@ -197,7 +196,6 @@ async def test_step_resumes_when_result_is_ready(monkeypatch):
         wakeup_at,
         pool,
         consumed_signal_id=None,
-        clock=None,
     ):
         saved.append({"ticket_id": ticket_id, "status": status, "wakeup_at": wakeup_at})
 
@@ -389,7 +387,7 @@ async def test_step_clears_stale_wakeup_after_timeout_reinterrupt(monkeypatch):
 
 
 async def test_step_releases_without_advancing_when_result_not_ready(monkeypatch):
-    run = make_run(wakeup_at=datetime.now(UTC) + timedelta(hours=1))
+    run = make_run(wakeup_at=None)
     snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
     compiled = FakeCompiled(snapshot)
     pool = FakePool(opened=True, row=None)  # no stored task result yet
@@ -414,10 +412,8 @@ async def test_step_releases_without_advancing_when_result_not_ready(monkeypatch
     ]
 
 
-async def test_step_uses_injected_clock_before_and_after_timer_due(monkeypatch):
-    now = datetime(2026, 6, 23, 12, 0, tzinfo=UTC)
-    clock = FrozenClock(now)
-    due_at = now + timedelta(minutes=5)
+async def test_step_treats_claimed_timer_as_due_without_python_clock(monkeypatch):
+    due_at = datetime(2099, 6, 23, 12, 5, tzinfo=UTC)
     run = make_run(wakeup_at=due_at)
     snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
     compiled = FakeCompiled(
@@ -449,20 +445,11 @@ async def test_step_uses_injected_clock_before_and_after_timer_due(monkeypatch):
         _save_run,
     )
 
-    advanced = await runner.step(compiled, pool, "runner-1", clock=clock)
-
-    assert advanced is False
-    assert compiled.invoked_with == []
-    assert claim_calls == [("runner-1", pool)]
-    assert saved == [{"ticket_id": "t-1", "status": "classifying", "wakeup_at": due_at}]
-
-    clock.advance(timedelta(minutes=5))
-    saved.clear()
-
-    advanced = await runner.step(compiled, pool, "runner-1", clock=clock)
+    advanced = await runner.step(compiled, pool, "runner-1")
 
     assert advanced is True
     assert compiled.invoked_with[0].resume == {"kind": "timeout"}
+    assert claim_calls == [("runner-1", pool)]
     assert saved == [{"ticket_id": "t-1", "status": "classifying", "wakeup_at": due_at}]
 
 
@@ -480,6 +467,52 @@ async def test_step_returns_false_when_no_run_is_claimable(monkeypatch):
     assert await runner.step(compiled, FakePool(opened=True), "runner-1") is False
     assert called is False
     assert compiled.invoked_with == []
+
+
+async def test_step_runs_sync_db_work_in_threads(monkeypatch):
+    run = make_run()
+    snapshot = FakeSnapshot([FakeInterrupt({"idempotency_key": "t-1:classify"})])
+    compiled = FakeCompiled(
+        snapshot, invoke_result={"status": "drafting", "wakeup_at": None}
+    )
+    pool = FakePool(opened=True, row=("done", {"category": "billing"}, None, False))
+    threaded_calls: list[str] = []
+
+    async def _to_thread(func, /, *args, **kwargs):
+        threaded_calls.append(func.__name__)
+        return func(*args, **kwargs)
+
+    def _save_run(
+        ticket_id,
+        *,
+        status,
+        wakeup_at,
+        pool,
+        consumed_signal_id=None,
+    ):
+        assert ticket_id == "t-1"
+        assert status == "drafting"
+        assert wakeup_at is None
+        assert pool is not None
+        assert consumed_signal_id is None
+
+    def _claim_run(worker_id, *, pool):
+        assert worker_id == "runner-1"
+        assert pool is not None
+        return run
+
+    monkeypatch.setattr(runner.asyncio, "to_thread", _to_thread)
+    monkeypatch.setattr(db, "claim_run", _claim_run)
+    monkeypatch.setattr(db, "save_run", _save_run)
+
+    advanced = await runner.step(compiled, pool, "runner-1")
+
+    assert advanced is True
+    assert threaded_calls == [
+        "_claim_run",
+        "_resume_for_run_from_pool",
+        "_save_run",
+    ]
 
 
 def test_reclaim_expired_leases_reclaims_tasks_and_runs(monkeypatch, caplog):
@@ -523,6 +556,7 @@ async def test_run_forever_runs_janitor_on_startup_and_interval(monkeypatch):
     pool = FakePool(opened=True)
     steps = 0
     janitor_calls = 0
+    threaded_calls: list[str] = []
     loop_times = iter([10.0, 14.0, 15.0, 19.0])
 
     class FakeLoop:
@@ -542,10 +576,15 @@ async def test_run_forever_runs_janitor_on_startup_and_interval(monkeypatch):
         janitor_calls += 1
         return runner.JanitorResult(tasks=0, runs=0)
 
+    async def _to_thread(func, /, *args, **kwargs):
+        threaded_calls.append(func.__name__)
+        return func(*args, **kwargs)
+
     monkeypatch.setattr(runner, "step", _step)
     monkeypatch.setattr(runner, "reclaim_expired_leases", _janitor)
     monkeypatch.setattr(runner.asyncio, "get_running_loop", lambda: FakeLoop())
     monkeypatch.setattr(runner.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(runner.asyncio, "to_thread", _to_thread)
 
     def _stop():
         return steps >= 3
@@ -561,6 +600,93 @@ async def test_run_forever_runs_janitor_on_startup_and_interval(monkeypatch):
 
     assert steps == 3
     assert janitor_calls == 2
+    assert threaded_calls == [
+        "_janitor",
+        "list_orphaned_checkpoint_threads",
+        "_janitor",
+        "list_orphaned_checkpoint_threads",
+    ]
+
+
+async def test_main_compiles_runner_graph_with_async_pool(monkeypatch):
+    class RecordingPool:
+        def __init__(self) -> None:
+            self.opened = False
+            self.closed = False
+
+        def open(self) -> None:
+            self.opened = True
+
+        def close(self) -> None:
+            self.closed = True
+
+    class RecordingAsyncPool:
+        def __init__(self) -> None:
+            self.opened = False
+            self.closed = False
+
+        async def open(self) -> None:
+            self.opened = True
+
+        async def close(self) -> None:
+            self.closed = True
+
+    class RecordingSaver:
+        def __init__(self) -> None:
+            self.setup_called = False
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def setup(self) -> None:
+            self.setup_called = True
+
+    class RecordingAsyncPostgresSaver:
+        @classmethod
+        def from_conn_string(cls, conn_string: str):
+            saver_calls.append(conn_string)
+            return saver
+
+    pool = RecordingPool()
+    async_pool = RecordingAsyncPool()
+    saver = RecordingSaver()
+    saver_calls: list[str] = []
+    compile_calls: list[tuple[object, object, object | None]] = []
+    run_calls: list[tuple[object, object, str]] = []
+
+    async def _to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    def _compile_ticket_graph(checkpointer, pool_arg, *, async_pool=None):
+        compile_calls.append((checkpointer, pool_arg, async_pool))
+        return "compiled"
+
+    async def _run_forever(compiled, pool_arg, worker_id):
+        run_calls.append((compiled, pool_arg, worker_id))
+
+    monkeypatch.setattr(runner, "setup_logging", lambda: None)
+    monkeypatch.setattr(runner.asyncio, "to_thread", _to_thread)
+    monkeypatch.setattr(db, "bootstrap", lambda: None)
+    monkeypatch.setattr(db, "make_pool", lambda: pool)
+    monkeypatch.setattr(db, "make_async_pool", lambda: async_pool)
+    monkeypatch.setattr(runner, "AsyncPostgresSaver", RecordingAsyncPostgresSaver)
+    monkeypatch.setattr(runner.graph, "compile_ticket_graph", _compile_ticket_graph)
+    monkeypatch.setattr(runner, "run_forever", _run_forever)
+    monkeypatch.setattr(runner, "_worker_id", lambda: "runner-main")
+
+    await runner.main()
+
+    assert pool.opened is True
+    assert pool.closed is True
+    assert async_pool.opened is True
+    assert async_pool.closed is True
+    assert saver.setup_called is True
+    assert saver_calls == [config.DATABASE_URL]
+    assert compile_calls == [(saver, pool, async_pool)]
+    assert run_calls == [("compiled", pool, "runner-main")]
 
 
 @pytest.mark.integration
@@ -799,7 +925,6 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback(
     from ticketflow import graph
     from ticketflow.models import Ticket, TicketStatus
 
-    clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
     ticket = Ticket(
         id=f"t-runner-timeout-fallback-{uuid.uuid4().hex}",
         customer_email="customer@example.com",
@@ -810,7 +935,7 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(saver, postgres_pool, clock=clock)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         out = await compiled.ainvoke(
             {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
@@ -827,10 +952,14 @@ async def test_runner_timeout_redispatches_due_agent_task_to_fallback(
                     snapshot.values.get("wakeup_at"),
                 ),
             )
+            conn.execute(
+                "UPDATE workflow_run SET wakeup_at = now(), updated_at = now() "
+                "WHERE ticket_id = %s",
+                (ticket.id,),
+            )
             conn.commit()
 
-        clock.advance(timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S))
-        advanced = await runner.step(compiled, postgres_pool, "runner-1", clock=clock)
+        advanced = await runner.step(compiled, postgres_pool, "runner-1")
         snapshot = await compiled.aget_state(cfg)
 
     with postgres_pool.connection() as conn:
@@ -866,7 +995,6 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
     from ticketflow import graph
     from ticketflow.models import Ticket, TicketStatus
 
-    clock = FrozenClock(datetime(2026, 6, 23, 12, 0, tzinfo=UTC))
     ticket = Ticket(
         id=f"t-runner-timeout-approval-{uuid.uuid4().hex}",
         customer_email="customer@example.com",
@@ -877,7 +1005,7 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
 
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
-        compiled = graph.compile_ticket_graph(saver, postgres_pool, clock=clock)
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
 
         await compiled.ainvoke({"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg)
         await compiled.ainvoke(
@@ -901,12 +1029,16 @@ async def test_runner_timeout_escalates_due_approval_and_clears_wakeup(
                     snapshot.values.get("wakeup_at"),
                 ),
             )
+            conn.execute(
+                "UPDATE workflow_run SET wakeup_at = now(), updated_at = now() "
+                "WHERE ticket_id = %s",
+                (ticket.id,),
+            )
             conn.commit()
 
         wakeup_at = snapshot.values["wakeup_at"]
         assert isinstance(wakeup_at, datetime)
-        clock.advance(wakeup_at - clock.now())
-        advanced = await runner.step(compiled, postgres_pool, "runner-1", clock=clock)
+        advanced = await runner.step(compiled, postgres_pool, "runner-1")
         snapshot = await compiled.aget_state(cfg)
 
     with postgres_pool.connection() as conn:

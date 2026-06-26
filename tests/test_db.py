@@ -53,15 +53,27 @@ class FakeCursor:
 class FakeConnection:
     def __init__(self, row: tuple[object, ...] | None = None) -> None:
         self.sql: list[str] = []
-        self.params: list[tuple[str, ...]] = []
+        self.params: list[tuple[object, ...]] = []
         self.commits = 0
         self.row = row
         self.rows: list[tuple[object, ...] | list[tuple[object, ...]] | None] = []
 
-    def execute(self, sql: str, params: tuple[str, ...] | None = None) -> FakeCursor:
+    def execute(self, sql: str, params: tuple[object, ...] | None = None) -> FakeCursor:
         self.sql.append(sql)
         if params is not None:
             self.params.append(params)
+        if "SELECT now() + %s::interval" in sql:
+            if self.rows:
+                result = self.rows.pop(0)
+                if isinstance(result, tuple) or result is None:
+                    return FakeCursor(result)
+                return FakeCursor(None, result)
+            if self.row is not None and self.row != (1,):
+                return FakeCursor(self.row)
+            assert params is not None
+            delta = params[0]
+            assert isinstance(delta, timedelta)
+            return FakeCursor((datetime.now(UTC) + delta,))
         if self.rows:
             result = self.rows.pop(0)
             if isinstance(result, list):
@@ -114,10 +126,11 @@ class AsyncFakeCursor:
 
 
 class AsyncFakeConnection:
-    def __init__(self) -> None:
+    def __init__(self, row: tuple[object, ...] | None = None) -> None:
         self.sql: list[str] = []
         self.params: list[tuple[object, ...]] = []
         self.commits = 0
+        self.row = row
 
     async def execute(
         self, sql: str, params: tuple[object, ...] | None = None
@@ -125,7 +138,15 @@ class AsyncFakeConnection:
         self.sql.append(sql)
         if params is not None:
             self.params.append(params)
-        return AsyncFakeCursor(None)
+        if (
+            "SELECT now() + %s::interval" in sql
+            and self.row is None
+            and params is not None
+        ):
+            delta = params[0]
+            assert isinstance(delta, timedelta)
+            return AsyncFakeCursor((datetime.now(UTC) + delta,))
+        return AsyncFakeCursor(self.row)
 
     async def commit(self) -> None:
         self.commits += 1
@@ -159,6 +180,16 @@ class AsyncFakePool:
 
     async def close(self) -> None:
         self.closed = True
+
+
+async def test_atimestamp_after_uses_database_now() -> None:
+    conn = AsyncFakeConnection(row=(datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC),))
+
+    timestamp = await db.atimestamp_after(conn, timedelta(seconds=30))
+
+    assert timestamp == datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+    assert "SELECT now() + %s::interval" in conn.sql[-1]
+    assert conn.params[-1] == (timedelta(seconds=30),)
 
 
 def test_make_pool_uses_database_url_from_config(monkeypatch):
@@ -211,13 +242,15 @@ def test_bootstrap_creates_idempotent_migration_marker():
     db.bootstrap(pool=pool)
     db.bootstrap(pool=pool)
 
-    # Each call issues 15 statements: schema_migrations create + 000 marker,
+    # Each call issues 19 statements: schema_migrations create + 000 marker,
     # task_queue create, dispatch index, 001 marker, refunds create,
     # refund_attempts create, ticket_results create, 002 marker,
     # workflow_run create, status index, 003 marker, pending_signal create,
-    # signal lookup index, 004 marker, unique signal index, 005 marker.
+    # signal lookup index, 004 marker, unique signal index, 005 marker,
+    # sent_replies create, reply_attempts create, reply_attempts index,
+    # 006 marker.
     assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 34
+    assert len(pool.connection_obj.sql) == 42
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
     assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
     assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
@@ -248,6 +281,15 @@ def test_bootstrap_creates_idempotent_migration_marker():
         "CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind"
         in pool.connection_obj.sql[15]
     )
+    assert "CREATE TABLE IF NOT EXISTS sent_replies" in pool.connection_obj.sql[17]
+    assert "ticket_id      text        PRIMARY KEY" in pool.connection_obj.sql[17]
+    assert "customer_email text        NOT NULL" in pool.connection_obj.sql[17]
+    assert "reply_text     text        NOT NULL" in pool.connection_obj.sql[17]
+    assert "CREATE TABLE IF NOT EXISTS reply_attempts" in pool.connection_obj.sql[18]
+    assert (
+        "CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket"
+        in pool.connection_obj.sql[19]
+    )
     assert pool.connection_obj.params == [
         ("000_bootstrap",),
         ("001_task_queue",),
@@ -255,12 +297,14 @@ def test_bootstrap_creates_idempotent_migration_marker():
         ("003_workflow_run",),
         ("004_pending_signal",),
         ("005_pending_signal_unique_unconsumed",),
+        ("006_sent_reply_guard",),
         ("000_bootstrap",),
         ("001_task_queue",),
         ("002_read_model",),
         ("003_workflow_run",),
         ("004_pending_signal",),
         ("005_pending_signal_unique_unconsumed",),
+        ("006_sent_reply_guard",),
     ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
@@ -333,6 +377,24 @@ def test_bootstrap_creates_unique_unconsumed_pending_signal_index():
     assert ("005_pending_signal_unique_unconsumed",) in pool.connection_obj.params
 
 
+def test_bootstrap_creates_sent_reply_guard_tables():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE TABLE IF NOT EXISTS sent_replies" in sql
+    assert "ticket_id      text        PRIMARY KEY" in sql
+    assert "customer_email text        NOT NULL" in sql
+    assert "reply_text     text        NOT NULL" in sql
+    assert "CREATE TABLE IF NOT EXISTS reply_attempts" in sql
+    assert "ticket_id    text        NOT NULL" in sql
+    assert "attempt      integer     NOT NULL" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket" in sql
+    assert "ON reply_attempts (ticket_id, attempted_at, id)" in sql
+    assert ("006_sent_reply_guard",) in pool.connection_obj.params
+
+
 def test_bootstrap_leaves_injected_pool_unopened_to_caller():
     # An injected pool is assumed already open; bootstrap must not re-open it.
     pool = FakePool(opened=True)
@@ -379,6 +441,16 @@ def test_dequeue_leases_due_pending_task_with_skip_locked():
     assert task.result is None
     assert task.error is None
     assert task.permanent is False
+
+
+def test_timestamp_after_uses_database_now() -> None:
+    conn = FakeConnection(row=(datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC),))
+
+    timestamp = db.timestamp_after(conn, timedelta(seconds=30))
+
+    assert timestamp == datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+    assert "SELECT now() + %s::interval" in conn.sql[-1]
+    assert conn.params[-1] == (timedelta(seconds=30),)
 
 
 def test_dequeue_returns_none_when_no_task_is_available():

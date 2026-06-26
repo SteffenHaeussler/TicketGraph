@@ -1,4 +1,4 @@
-"""Postgres refund ledger: at-most-once refund effects keyed by ticket id."""
+"""Postgres ledgers for at-most-once terminal effects keyed by ticket id."""
 
 from typing import Any
 
@@ -34,5 +34,34 @@ def refund_recorded(conn: Any, ticket_id: str) -> bool:
     """
     row = conn.execute(
         "SELECT 1 FROM refunds WHERE ticket_id = %s", (ticket_id,)
+    ).fetchone()
+    return row is not None
+
+
+def record_sent_reply(
+    conn: Any,
+    ticket_id: str,
+    customer_email: str,
+    reply_text: str,
+    attempt: int,
+) -> bool:
+    """Log a reply attempt; return True only the first time a ticket is replied.
+
+    The ticket id is the idempotency key: duplicate deliveries land in
+    reply_attempts, but the sent reply itself is recorded at most once. The
+    caller owns the transaction and is responsible for committing.
+    """
+    conn.execute(
+        "INSERT INTO reply_attempts (ticket_id, attempt) VALUES (%s, %s)",
+        (ticket_id, attempt),
+    )
+    row = conn.execute(
+        """
+        INSERT INTO sent_replies (ticket_id, customer_email, reply_text)
+        VALUES (%s, %s, %s)
+        ON CONFLICT (ticket_id) DO NOTHING
+        RETURNING ticket_id
+        """,
+        (ticket_id, customer_email, reply_text),
     ).fetchone()
     return row is not None

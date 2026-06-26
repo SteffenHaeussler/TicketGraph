@@ -32,9 +32,27 @@ class TicketActivities:
         """Ask the configured agent to draft a response."""
         return await self._agent.draft_reply(ticket, classification)
 
-    async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
-        """Send or log the customer reply."""
-        logger.info("Sending reply to %s: %s", ticket.customer_email, reply_text)
+    async def send_reply(
+        self, ticket: Ticket, reply_text: str, attempt: int = 1
+    ) -> bool:
+        """Send or log the customer reply at most once per ticket id."""
+        first = await asyncio.to_thread(
+            readmodel.record_sent_reply,
+            ticket.id,
+            ticket.customer_email,
+            reply_text,
+            attempt,
+            database_url=self._database_url,
+        )
+        if first:
+            logger.info("Sending reply to %s: %s", ticket.customer_email, reply_text)
+        else:
+            logger.info(
+                "Reply for ticket %s already sent; attempt %d is a no-op",
+                ticket.id,
+                attempt,
+            )
+        return first
 
     async def execute_refund(
         self, ticket_id: str, amount: float, attempt: int = 1

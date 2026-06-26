@@ -1,7 +1,6 @@
 """Test doubles and factories shared across test modules."""
 
 import uuid
-from datetime import datetime, timedelta
 from typing import Any
 
 from ticketflow import agent_worker, config, side_effect_worker
@@ -16,19 +15,6 @@ from ticketflow.models import (
     Ticket,
     TicketCategory,
 )
-
-
-class FrozenClock:
-    """Advanceable clock for deterministic timer tests."""
-
-    def __init__(self, now: datetime) -> None:
-        self._now = now
-
-    def now(self) -> datetime:
-        return self._now
-
-    def advance(self, delta: timedelta) -> None:
-        self._now += delta
 
 
 def make_ticket(**overrides: object) -> Ticket:

@@ -144,18 +144,23 @@ DDIA-flavored narrative), `docs/agent-activity-ops.md` (LLM worker operations).
   removals/renames break forward compatibility with old senders; defaults buy
   both.
 
-## Idempotency ledger for refunds (DDIA ch. 7–8)
+## Idempotency ledgers for terminal effects (DDIA ch. 7–8)
 
 - **Decision:** `execute_refund` records every delivery in `refund_attempts` but
-  the refund itself at most once in `refunds`, keyed by ticket ID (PR #41,
-  demonstrated with a crash injected between side effect and ack).
+  the refund itself at most once in `refunds`, keyed by ticket ID. `send_reply`
+  follows the same shape with `reply_attempts` plus `sent_replies`, so finalize
+  retries do not resend the simulated customer reply.
 - **Why:** Activities are at-least-once. "Exactly-once" is a sum: at-least-once
   delivery plus idempotent effects. Keeping the attempt log separate from the
   effect makes the duplicate delivery *observable* instead of silently absorbed.
 - **Where:** `src/ticketflow/activities.py` (`execute_refund`),
-  `src/ticketflow/readmodel.py` (`record_refund`).
+  `src/ticketflow/activities.py` (`send_reply`), `src/ticketflow/readmodel.py`
+  (`record_refund`, `record_sent_reply`).
 - **Taught:** The idempotency key must live in the same transactional store as
-  the effect — and a plain `INSERT` + counter would have double-counted.
+  the effect — and a plain `INSERT` + counter would have double-counted. A real
+  email or payment provider still needs provider-side idempotency or an
+  outbound outbox to close the gap between recording intent and the external
+  send.
 
 ## Operability: readiness, doctor, preflight
 

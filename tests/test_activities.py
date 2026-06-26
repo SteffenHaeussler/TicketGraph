@@ -47,6 +47,10 @@ async def test_side_effect_methods_complete(monkeypatch):
         "ticketflow.activities.readmodel.record_refund",
         lambda *args, **kwargs: True,
     )
+    monkeypatch.setattr(
+        "ticketflow.activities.readmodel.record_sent_reply",
+        lambda *args, **kwargs: True,
+    )
     acts = TicketActivities(agent)
 
     await acts.send_reply(make_ticket(), "hello")
@@ -89,3 +93,55 @@ async def test_execute_refund_passes_refund_details_to_readmodel(monkeypatch):
 
     assert first is False
     assert calls == [("t1", 42.0, 2, "postgresql://example/tickets")]
+
+
+async def test_send_reply_returns_readmodel_result(monkeypatch):
+    agent = ScriptedAgent(billing_classification(), refund_draft())
+    monkeypatch.setattr(
+        "ticketflow.activities.readmodel.record_sent_reply",
+        lambda *args, **kwargs: False,
+    )
+    acts = TicketActivities(agent)
+
+    first = await acts.send_reply(make_ticket(id="t1"), "hello")
+
+    assert first is False
+
+
+async def test_send_reply_passes_reply_details_to_readmodel(monkeypatch):
+    agent = ScriptedAgent(billing_classification(), refund_draft())
+    calls: list[tuple[str, str, str, int, str | None]] = []
+
+    def fake_record_sent_reply(
+        ticket_id: str,
+        customer_email: str,
+        reply_text: str,
+        attempt: int,
+        *,
+        database_url: str | None = None,
+    ) -> bool:
+        calls.append((ticket_id, customer_email, reply_text, attempt, database_url))
+        return True
+
+    monkeypatch.setattr(
+        "ticketflow.activities.readmodel.record_sent_reply",
+        fake_record_sent_reply,
+    )
+    acts = TicketActivities(agent, database_url="postgresql://example/tickets")
+
+    first = await acts.send_reply(
+        make_ticket(id="t1", customer_email="customer@example.com"),
+        "hello",
+        attempt=3,
+    )
+
+    assert first is True
+    assert calls == [
+        (
+            "t1",
+            "customer@example.com",
+            "hello",
+            3,
+            "postgresql://example/tickets",
+        )
+    ]

@@ -18,6 +18,8 @@ those orphaned run rows from the checkpoint so the ticket stays runnable.
 
 The runner resumes when the awaited task result or approval signal is ready, or
 when a durable timer is due and should resume with ``{"kind": "timeout"}``.
+Runner-owned sync DB helpers run behind ``asyncio.to_thread`` so they do not
+block the event loop while the async graph/checkpointer is running.
 """
 
 from __future__ import annotations
@@ -36,7 +38,6 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import Command
 
 from ticketflow import config, db, graph, taskqueue
-from ticketflow.clock import Clock, resolve_clock
 from ticketflow.db import _Pool
 from ticketflow.logging import setup_logging
 from ticketflow.signals import APPROVAL_DECISION_SIGNAL
@@ -170,8 +171,6 @@ def _resume_for_run(
     conn: Any,
     envelope: dict[str, Any],
     wakeup_at: datetime | None,
-    *,
-    clock: Clock | None = None,
 ) -> _ResumeValue | None:
     """Return a ready task/signal value, a due timer envelope, or ``None``.
 
@@ -183,16 +182,19 @@ def _resume_for_run(
     resume = _resume_value(conn, envelope)
     if resume is not None:
         return resume
-    if _timer_is_due(wakeup_at, clock=clock):
+    if wakeup_at is not None:
         return _ResumeValue({"kind": "timeout"})
     return None
 
 
-def _timer_is_due(wakeup_at: datetime | None, *, clock: Clock | None = None) -> bool:
-    """Whether a durable timer should resume the parked graph now."""
-    if wakeup_at is None:
-        return False
-    return wakeup_at <= resolve_clock(clock).now()
+def _resume_for_run_from_pool(
+    pool: _Pool,
+    envelope: dict[str, Any],
+    wakeup_at: datetime | None,
+) -> _ResumeValue | None:
+    """Open a sync DB connection and compute the ready resume value."""
+    with pool.connection() as conn:
+        return _resume_for_run(conn, envelope, wakeup_at)
 
 
 def _interrupt_envelope_from_output(output: dict[str, Any]) -> dict[str, Any] | None:
@@ -222,16 +224,14 @@ def _next_wakeup_at(output: dict[str, Any], resume: _ResumeValue) -> datetime | 
     return output.get("wakeup_at")
 
 
-async def step(
-    compiled: _Graph, pool: _Pool, worker_id: str, *, clock: Clock | None = None
-) -> bool:
+async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
     """Advance at most one runnable workflow run by one resume.
 
     Returns ``True`` when a run was resumed and its new state persisted, ``False``
     when no run was claimable or the claimed run had no ready result (its lease is
     released without advancing).
     """
-    run = db.claim_run(worker_id, pool=pool)
+    run = await asyncio.to_thread(db.claim_run, worker_id, pool=pool)
     if run is None:
         return False
 
@@ -241,13 +241,15 @@ async def step(
 
     resume: _ResumeValue | None = None
     if envelope is not None:
-        with pool.connection() as conn:
-            resume = _resume_for_run(conn, envelope, run.wakeup_at, clock=clock)
+        resume = await asyncio.to_thread(
+            _resume_for_run_from_pool, pool, envelope, run.wakeup_at
+        )
 
     if envelope is None or resume is None:
         # Not actionable yet (no task result, approval signal, or due timer).
         # Release the lease, leaving status/wakeup_at untouched.
-        db.save_run(
+        await asyncio.to_thread(
+            db.save_run,
             run.ticket_id,
             status=run.status,
             wakeup_at=run.wakeup_at,
@@ -256,7 +258,8 @@ async def step(
         return False
 
     out = await compiled.ainvoke(Command(resume=resume.payload), cfg)
-    db.save_run(
+    await asyncio.to_thread(
+        db.save_run,
         run.ticket_id,
         status=out["status"],
         wakeup_at=_next_wakeup_at(out, resume),
@@ -283,13 +286,15 @@ async def reconcile_orphaned_runs(compiled: _Graph, pool: _Pool) -> int:
     of run rows created.
     """
     reconciled = 0
-    for ticket_id in db.list_orphaned_checkpoint_threads(pool=pool):
+    orphaned = await asyncio.to_thread(db.list_orphaned_checkpoint_threads, pool=pool)
+    for ticket_id in orphaned:
         snapshot = await compiled.aget_state(_thread_config(ticket_id))
         values = snapshot.values
         if not values:
             # A checkpoint with no materialized state — nothing to project yet.
             continue
-        db.create_run(
+        await asyncio.to_thread(
+            db.create_run,
             ticket_id,
             status=values["status"],
             wakeup_at=values.get("wakeup_at"),
@@ -326,7 +331,6 @@ async def run_forever(
     poll_interval: float = POLL_INTERVAL_S,
     janitor_interval: float = config.JANITOR_INTERVAL_S,
     stop: Callable[[], bool] | None = None,
-    clock: Clock | None = None,
 ) -> None:
     """Poll for runnable runs, advancing them until ``stop`` (or cancellation).
 
@@ -338,14 +342,11 @@ async def run_forever(
     while stop is None or not stop():
         now = loop.time()
         if now >= next_janitor_at:
-            reclaim_expired_leases(pool)
+            await asyncio.to_thread(reclaim_expired_leases, pool)
             await reconcile_orphaned_runs(compiled, pool)
             next_janitor_at = now + janitor_interval
 
-        if clock is None:
-            advanced = await step(compiled, pool, worker_id)
-        else:
-            advanced = await step(compiled, pool, worker_id, clock=clock)
+        advanced = await step(compiled, pool, worker_id)
         if not advanced:
             await asyncio.sleep(poll_interval)
 
@@ -358,18 +359,21 @@ def _worker_id() -> str:
 async def main() -> None:
     """Run the durable workflow runner against the configured Postgres."""
     setup_logging()
-    db.bootstrap()
+    await asyncio.to_thread(db.bootstrap)
     pool = db.make_pool()
-    pool.open()
+    async_pool = db.make_async_pool()
+    await asyncio.to_thread(pool.open)
+    await async_pool.open()
     worker_id = _worker_id()
     logger.info("runner starting", extra={"worker_id": worker_id})
     try:
         async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
             await saver.setup()
-            compiled = graph.compile_ticket_graph(saver, pool)
+            compiled = graph.compile_ticket_graph(saver, pool, async_pool=async_pool)
             await run_forever(compiled, pool, worker_id)
     finally:
-        pool.close()
+        await async_pool.close()
+        await asyncio.to_thread(pool.close)
 
 
 if __name__ == "__main__":
