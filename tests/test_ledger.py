@@ -53,6 +53,34 @@ def test_record_refund_logs_attempt_before_refund() -> None:
     assert conn.params[0] == ("t-1", 3)
 
 
+def test_refund_recorded_true_when_row_exists() -> None:
+    conn = FakeConnection(rows=[("1",)])
+
+    assert ledger.refund_recorded(conn, "t-1") is True
+    assert "FROM refunds" in conn.sql[0]
+    assert conn.params[0] == ("t-1",)
+
+
+def test_refund_recorded_false_when_no_row() -> None:
+    conn = FakeConnection(rows=[None])
+
+    assert ledger.refund_recorded(conn, "t-1") is False
+
+
+@pytest.mark.integration
+def test_refund_recorded_reflects_ledger_state_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    with postgres_pool.connection() as conn:
+        before = ledger.refund_recorded(conn, "t-1")
+        ledger.record_refund(conn, "t-1", 42.0, attempt=1)
+        after = ledger.refund_recorded(conn, "t-1")
+        conn.commit()
+
+    assert before is False
+    assert after is True
+
+
 @pytest.mark.integration
 def test_record_refund_is_at_most_once_against_real_postgres(
     postgres_pool: db.ConnectionPool,

@@ -28,10 +28,17 @@ from ticketflow.models import (
 class RecordingActivities(TicketActivities):
     """Activities that record side effects without touching the database."""
 
-    def __init__(self, *, refund_first: bool = True) -> None:
+    def __init__(
+        self, *, refund_first: bool = True, refund_exists: bool | None = None
+    ) -> None:
         super().__init__(MockAgent())
         self.refund_first = refund_first
+        # When None, a refund is "recorded" once execute_refund has run, mirroring
+        # the real ledger. Override to simulate a row that already exists on retry.
+        self._refund_exists = refund_exists
+        self._refunded = False
         self.refund_calls: list[tuple[str, float, int]] = []
+        self.refund_recorded_calls: list[str] = []
         self.sent_replies: list[tuple[str, str]] = []
         self.recorded: list[TicketResult] = []
 
@@ -39,7 +46,14 @@ class RecordingActivities(TicketActivities):
         self, ticket_id: str, amount: float, attempt: int = 1
     ) -> bool:
         self.refund_calls.append((ticket_id, amount, attempt))
+        self._refunded = True
         return self.refund_first
+
+    async def refund_recorded(self, ticket_id: str) -> bool:
+        self.refund_recorded_calls.append(ticket_id)
+        if self._refund_exists is not None:
+            return self._refund_exists
+        return self._refunded
 
     async def send_reply(self, ticket: Ticket, reply_text: str) -> None:
         self.sent_replies.append((ticket.id, reply_text))
@@ -123,6 +137,26 @@ async def test_run_finalize_executes_refund_for_resolved_refund() -> None:
     assert out.refund_executed is True
 
 
+async def test_run_finalize_reports_refund_executed_on_retry() -> None:
+    # A finalize retry: execute_refund is a no-op (returns False on ON CONFLICT),
+    # but the refunds row already exists, so the flag must still report True.
+    ticket = make_ticket(id="ticket-refund-retry")
+    draft = refund_draft(amount=42.0)
+    result = TicketResult(
+        ticket_id=ticket.id,
+        status=TicketStatus.RESOLVED,
+        reply_text=draft.reply_text,
+    )
+    task = _finalize_task(ticket=ticket, action=draft.action, result=result, attempts=2)
+    activities = RecordingActivities(refund_first=False, refund_exists=True)
+
+    out = await side_effect_worker.run_finalize(task, activities)
+
+    assert activities.refund_calls == [(ticket.id, 42.0, 2)]
+    assert activities.refund_recorded_calls == [ticket.id]
+    assert out.refund_executed is True
+
+
 async def test_run_finalize_skips_refund_for_reply_only() -> None:
     ticket = make_ticket(id="ticket-reply")
     draft = reply_only_draft()
@@ -137,6 +171,7 @@ async def test_run_finalize_skips_refund_for_reply_only() -> None:
     out = await side_effect_worker.run_finalize(task, activities)
 
     assert activities.refund_calls == []
+    assert activities.refund_recorded_calls == []
     assert activities.sent_replies == [(ticket.id, draft.reply_text)]
     assert out.refund_executed is False
 
@@ -155,6 +190,7 @@ async def test_run_finalize_skips_refund_when_not_resolved() -> None:
     out = await side_effect_worker.run_finalize(task, activities)
 
     assert activities.refund_calls == []
+    assert activities.refund_recorded_calls == []
     assert out.refund_executed is False
 
 
@@ -226,3 +262,33 @@ async def test_postgres_finalize_runs_side_effects_and_wakes_run(
     assert claimed.ticket_id == ticket.id
     assert stored is not None
     assert stored.refund_executed is True
+
+
+@pytest.mark.integration
+async def test_postgres_finalize_retry_still_reports_refund_executed(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    # Running run_finalize twice for the same refund ticket mimics a finalize retry
+    # after a committed refund. The second pass hits the ON CONFLICT no-op, but must
+    # still report refund_executed=True and leave exactly one refunds row.
+    ticket = make_ticket(id=f"t-finalize-retry-{uuid.uuid4().hex}")
+    draft = refund_draft(amount=42.0)
+    result = TicketResult(
+        ticket_id=ticket.id,
+        status=TicketStatus.RESOLVED,
+        reply_text=draft.reply_text,
+    )
+    task = _finalize_task(ticket=ticket, action=draft.action, result=result)
+    activities = TicketActivities(MockAgent(), database_url=config.DATABASE_URL)
+
+    first = await side_effect_worker.run_finalize(task, activities)
+    second = await side_effect_worker.run_finalize(task, activities)
+
+    with postgres_pool.connection() as conn:
+        refund_count = conn.execute(
+            "SELECT count(*) FROM refunds WHERE ticket_id = %s", (ticket.id,)
+        ).fetchone()
+
+    assert first.refund_executed is True
+    assert second.refund_executed is True
+    assert refund_count == (1,)

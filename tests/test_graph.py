@@ -1058,10 +1058,12 @@ async def test_retargeted_workflow_refund_idempotency_on_finalizer_retry(
     assert activities.reply_calls == 2
     assert finalizer["status"] == "done"
     assert finalizer["attempts"] == 2
-    assert finalizer["result"]["refund_executed"] is False
+    # The refund moved money on attempt 1; the retry is a ledger no-op but the flag
+    # is sourced from durable refund state, so it still honestly reports True (9.3).
+    assert finalizer["result"]["refund_executed"] is True
     assert _refund_counts(postgres_pool, ticket.id) == (1, 2)
     assert snapshot.values["status"] == TicketStatus.RESOLVED
-    assert snapshot.values["result"].refund_executed is False
+    assert snapshot.values["result"].refund_executed is True
     _assert_terminal_run_clean(postgres_pool, ticket.id, TicketStatus.RESOLVED)
 
 

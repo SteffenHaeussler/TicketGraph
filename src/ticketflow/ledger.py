@@ -24,3 +24,15 @@ def record_refund(conn: Any, ticket_id: str, amount: float, attempt: int) -> boo
         (ticket_id, amount),
     ).fetchone()
     return row is not None
+
+
+def refund_recorded(conn: Any, ticket_id: str) -> bool:
+    """Return True if a refund has been recorded for the ticket.
+
+    Reflects durable at-most-once state rather than the "first time?" answer from
+    :func:`record_refund`, so a finalize retry can still tell that money moved.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM refunds WHERE ticket_id = %s", (ticket_id,)
+    ).fetchone()
+    return row is not None

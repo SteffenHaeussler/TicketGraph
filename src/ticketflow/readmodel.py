@@ -49,6 +49,18 @@ def record_refund(
     return first
 
 
+def refund_recorded(
+    ticket_id: str,
+    *,
+    database_url: str | None = None,
+    pool: Any | None = None,
+) -> bool:
+    """Return whether a refund is durably recorded for the ticket."""
+    with db.managed_pool(database_url=database_url, pool=pool) as active_pool:
+        with active_pool.connection() as conn:
+            return ledger.refund_recorded(conn, ticket_id)
+
+
 def load_result(
     ticket_id: str,
     *,

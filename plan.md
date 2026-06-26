@@ -185,10 +185,16 @@ because they shape how the rest is described.*
   `ON CONFLICT (ticket_id) DO NOTHING` so a reconcile racing a healthy `create_ticket` is a no-op.
   _Done:_ a crash injected between seed and run-row insert still yields a runnable ticket; covered
   by `test_reconcile_rebuilds_run_row_orphaned_by_a_crash`.
-- [ ] **9.3 Derive `refund_executed` from durable ledger state.** `run_finalize` reads it from
-  `record_refund`'s "first time?" return, so a finalize retry after a successful refund persists
-  `refund_executed=False` even though money moved. Source the flag from whether a `refunds` row
-  exists for the ticket. _Done:_ a forced finalize retry still reports `refund_executed=True`.
+- [x] **9.3 Derive `refund_executed` from durable ledger state.** `run_finalize` read it from
+  `record_refund`'s "first time?" return, so a finalize retry after a successful refund persisted
+  `refund_executed=False` even though money moved. Now `run_finalize` issues the refund and then
+  sources the flag from durable state via `activities.refund_recorded` →
+  `readmodel.refund_recorded` → `ledger.refund_recorded` (a `SELECT 1 FROM refunds WHERE
+  ticket_id`), so the retry no-op still reports the truth. _Done:_ a forced finalize retry still
+  reports `refund_executed=True`, covered by
+  `test_run_finalize_reports_refund_executed_on_retry`,
+  `test_postgres_finalize_retry_still_reports_refund_executed`, and the corrected
+  `test_retargeted_workflow_refund_idempotency_on_finalizer_retry`.
 - [ ] **9.4 Make every terminal side effect idempotent (or document the exceptions).** Only the
   refund is dedup'd; `send_reply` re-fires on every finalize retry. Either add a sent-reply guard
   (e.g. a ledger row) or explicitly document `send_reply` as at-least-once. _Done:_ retry behavior

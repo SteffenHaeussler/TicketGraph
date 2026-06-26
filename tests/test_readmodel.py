@@ -165,6 +165,39 @@ def test_record_refund_opens_and_closes_owned_pool(monkeypatch) -> None:
     assert pool.closed is True
 
 
+def test_refund_recorded_returns_true_when_row_exists() -> None:
+    pool = FakePool(rows=[("1",)])
+
+    assert readmodel.refund_recorded("t-1", pool=pool) is True
+    assert "FROM refunds" in pool.connection_obj.sql[0]
+    assert pool.connection_obj.params[0] == ("t-1",)
+
+
+def test_refund_recorded_returns_false_when_missing() -> None:
+    pool = FakePool(rows=[None])
+
+    assert readmodel.refund_recorded("t-1", pool=pool) is False
+
+
+def test_refund_recorded_opens_and_closes_owned_pool(monkeypatch) -> None:
+    pool = FakePool(rows=[None])
+    monkeypatch.setattr(readmodel.db, "make_pool", lambda database_url=None: pool)
+
+    readmodel.refund_recorded("t-1", database_url="postgresql://db")
+
+    assert pool.opened is True
+    assert pool.closed is True
+
+
+@pytest.mark.integration
+def test_refund_recorded_reflects_ledger_state_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    assert readmodel.refund_recorded("t-1", pool=postgres_pool) is False
+    readmodel.record_refund("t-1", 42.0, attempt=1, pool=postgres_pool)
+    assert readmodel.refund_recorded("t-1", pool=postgres_pool) is True
+
+
 @pytest.mark.integration
 def test_save_and_load_roundtrip_against_real_postgres(
     postgres_pool: db.ConnectionPool,
