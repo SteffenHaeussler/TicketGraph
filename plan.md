@@ -163,6 +163,70 @@ RETURNING *;
 - [x] **8.4 Approval edges.** Submit approval twice → second is 409; let approval lapse 24h (fast
   clock) → escalation. (durable timer + idempotent signal)
 
+## Milestone 9 — Hardening & honesty fixes (post-migration review)
+*Findings from a full-repo review. Ordered by impact; the doc-vs-guarantee gaps come first
+because they shape how the rest is described.*
+
+### Correctness & claims (do first)
+
+- [ ] **9.1 Align the outbox claim with reality.** The runner uses three independent
+  transactions (checkpoint, outbox enqueue, `workflow_run` projection), not one — `runner.py`'s
+  module docstring already admits this, but `README.md` (the runner row, ~line 25) and `plan.md`
+  M4.2 say "in one transaction." Either (a) reword both to "at-least-once dispatch made safe by
+  idempotency keys" (cheap, honest), or (b) actually share a transaction for state+outbox.
+  _Done:_ README/plan no longer claim atomic checkpoint+outbox; wording matches the code.
+- [ ] **9.2 Close the ticket-creation atomicity gap.** `api.create_ticket` runs `ainvoke`
+  (checkpoint + initial `classify` enqueue) and *then* `acreate_run` in a separate transaction; a
+  crash between strands a ticket the runner can never lease. Fix by writing the `workflow_run` row
+  in the same transaction as the seed, or add a reconciler that creates missing run rows from
+  orphaned checkpoints. _Done:_ a crash injected between seed and run-row insert still yields a
+  runnable (or reconcilable) ticket; covered by a test.
+- [ ] **9.3 Derive `refund_executed` from durable ledger state.** `run_finalize` reads it from
+  `record_refund`'s "first time?" return, so a finalize retry after a successful refund persists
+  `refund_executed=False` even though money moved. Source the flag from whether a `refunds` row
+  exists for the ticket. _Done:_ a forced finalize retry still reports `refund_executed=True`.
+- [ ] **9.4 Make every terminal side effect idempotent (or document the exceptions).** Only the
+  refund is dedup'd; `send_reply` re-fires on every finalize retry. Either add a sent-reply guard
+  (e.g. a ledger row) or explicitly document `send_reply` as at-least-once. _Done:_ retry behavior
+  of each side effect is either idempotent or documented.
+
+### Time & concurrency model
+
+- [ ] **9.5 One time source.** Timer eligibility lives in SQL (`claim_run`'s `wakeup_at <= now()`,
+  lease expiry), which the injected `Clock` can't move — tests only fire because `FrozenClock` is
+  past-dated. Drive all timer decisions from Postgres `now()` and let tests control time at the DB
+  boundary (override `now()`, or inject `available_at`/`wakeup_at`). _Done:_ timer tests no longer
+  rely on past-dating the frozen clock.
+- [ ] **9.6 Pick one async story for DB access.** The runner calls sync `claim_run`/`save_run`
+  inside `async step` and compiles the graph with the sync pool, so dispatch-node enqueues block
+  the event loop inside `await ainvoke`; the worker, by contrast, uses `to_thread`. Make it
+  consistent (async pool everywhere, or sync-behind-`to_thread` everywhere). _Done:_ no blocking
+  sync DB calls run directly on the runner's event loop.
+
+### Efficiency & hygiene
+
+- [ ] **9.7 Inject pools; stop opening a pool per call.** `TicketActivities` gets a `database_url`
+  but no pool, so every `execute_refund`/`record_result`/`save_result` opens and closes a fresh
+  pool (TCP connect + teardown per side effect). Thread the worker's open pool through activities
+  and the read model. _Done:_ side-effect paths reuse the process pool; no per-call pool churn.
+- [ ] **9.8 Reconcile pool size with concurrency.** `db.make_pool` hardcodes `max_size=10` while
+  `AGENT_MAX_CONCURRENT=20`, so half the in-flight tasks block on connection checkout under load.
+  Size the pool to the configured concurrency (or cap concurrency to the pool). _Done:_ pool size
+  ≥ effective concurrency, configurable.
+- [ ] **9.9 Add retention/GC.** `task_queue` `done` rows, terminal `workflow_run` rows, consumed
+  `pending_signal` rows, and LangGraph checkpoints accumulate forever. Add a janitor pass that
+  archives terminal runs and prunes settled tasks/signals/old checkpoints. _Done:_ a retention
+  sweep exists and is covered by a test.
+- [ ] **9.10 Tidy dead/duplicate code.** `db.add_pending_signal` (non-conditional) is only used by
+  tests — production uses `add_pending_signal_if_waiting`; and `pending_signal` carries two
+  overlapping unconsumed indexes (the unique 2-col one subsumes the non-unique 4-col one). Remove
+  or justify each. _Done:_ no app-dead helper and no redundant index, or a comment explaining why
+  each stays.
+- [ ] **9.11 Real migrations (optional).** `bootstrap()` is `CREATE TABLE IF NOT EXISTS` with
+  decorative `schema_migrations` markers — it can't `ALTER` an existing schema. If the schema is
+  expected to evolve, add a version-checked migration runner; otherwise note the limitation.
+  _Done:_ either a working migration runner or a documented "bootstrap-only" caveat.
+
 ---
 
 ## Dependency notes
