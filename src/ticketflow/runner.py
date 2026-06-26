@@ -11,7 +11,10 @@ Persistence is a pragmatic outbox: the checkpoint (owned by the
 dispatch nodes) each commit in their own transaction, while the runner's own
 ``workflow_run`` projection + lease release land atomically in ``db.save_run``.
 Crash-safety comes from idempotency keys (re-enqueue is a no-op) and lease
-re-claim re-deriving state from the durable checkpoint.
+re-claim re-deriving state from the durable checkpoint. The same split means
+``api.create_ticket`` can seed a checkpoint and then crash before inserting the
+``workflow_run`` projection; the janitor's ``reconcile_orphaned_runs`` rebuilds
+those orphaned run rows from the checkpoint so the ticket stays runnable.
 
 The runner resumes when the awaited task result or approval signal is ready, or
 when a durable timer is due and should resume with ``{"kind": "timeout"}``.
@@ -50,6 +53,9 @@ class _Interrupt(Protocol):
 class _Snapshot(Protocol):
     @property
     def interrupts(self) -> Sequence[_Interrupt]: ...
+
+    @property
+    def values(self) -> dict[str, Any]: ...
 
 
 class _Graph(Protocol):
@@ -263,6 +269,39 @@ async def step(
     return True
 
 
+async def reconcile_orphaned_runs(compiled: _Graph, pool: _Pool) -> int:
+    """Rebuild ``workflow_run`` rows for checkpoints stranded without one (M9.2).
+
+    ``api.create_ticket`` seeds the checkpoint and *then* inserts the run row in a
+    separate transaction; a crash in between leaves an orphaned checkpoint the
+    runner can never lease. This rebuilds the missing projection from the
+    checkpoint's own ``status``/``wakeup_at`` — the same values ``create_ticket``
+    would have written — so the ticket becomes runnable again.
+
+    The insert is idempotent (``db.create_run`` uses ``ON CONFLICT DO NOTHING``),
+    so racing a late-but-healthy ``create_ticket`` is harmless. Returns the number
+    of run rows created.
+    """
+    reconciled = 0
+    for ticket_id in db.list_orphaned_checkpoint_threads(pool=pool):
+        snapshot = await compiled.aget_state(_thread_config(ticket_id))
+        values = snapshot.values
+        if not values:
+            # A checkpoint with no materialized state — nothing to project yet.
+            continue
+        db.create_run(
+            ticket_id,
+            status=values["status"],
+            wakeup_at=values.get("wakeup_at"),
+            pool=pool,
+        )
+        reconciled += 1
+
+    if reconciled:
+        logger.info("reconciled orphaned runs", extra={"runs_reconciled": reconciled})
+    return reconciled
+
+
 def reclaim_expired_leases(pool: _Pool) -> JanitorResult:
     """Reclaim expired task and workflow-run leases."""
     with pool.connection() as conn:
@@ -300,6 +339,7 @@ async def run_forever(
         now = loop.time()
         if now >= next_janitor_at:
             reclaim_expired_leases(pool)
+            await reconcile_orphaned_runs(compiled, pool)
             next_janitor_at = now + janitor_interval
 
         if clock is None:

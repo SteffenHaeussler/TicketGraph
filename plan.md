@@ -176,12 +176,15 @@ because they shape how the rest is described.*
   M4.2 say "in one transaction." Either (a) reword both to "at-least-once dispatch made safe by
   idempotency keys" (cheap, honest), or (b) actually share a transaction for state+outbox.
   _Done:_ README/plan no longer claim atomic checkpoint+outbox; wording matches the code.
-- [ ] **9.2 Close the ticket-creation atomicity gap.** `api.create_ticket` runs `ainvoke`
+- [x] **9.2 Close the ticket-creation atomicity gap.** `api.create_ticket` runs `ainvoke`
   (checkpoint + initial `classify` enqueue) and *then* `acreate_run` in a separate transaction; a
-  crash between strands a ticket the runner can never lease. Fix by writing the `workflow_run` row
-  in the same transaction as the seed, or add a reconciler that creates missing run rows from
-  orphaned checkpoints. _Done:_ a crash injected between seed and run-row insert still yields a
-  runnable (or reconcilable) ticket; covered by a test.
+  crash between strands a ticket the runner can never lease. Fixed with a reconciler:
+  `runner.reconcile_orphaned_runs` finds checkpoint threads with no `workflow_run` row
+  (`db.list_orphaned_checkpoint_threads`) and rebuilds the row from the checkpoint's own
+  `status`/`wakeup_at`; it runs each janitor pass. `create_run`/`acreate_run` insert
+  `ON CONFLICT (ticket_id) DO NOTHING` so a reconcile racing a healthy `create_ticket` is a no-op.
+  _Done:_ a crash injected between seed and run-row insert still yields a runnable ticket; covered
+  by `test_reconcile_rebuilds_run_row_orphaned_by_a_crash`.
 - [ ] **9.3 Derive `refund_executed` from durable ledger state.** `run_finalize` reads it from
   `record_refund`'s "first time?" return, so a finalize retry after a successful refund persists
   `refund_executed=False` even though money moved. Source the flag from whether a `refunds` row
