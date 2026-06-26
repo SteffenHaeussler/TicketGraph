@@ -36,7 +36,6 @@ from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 from langgraph.types import Command
 
 from ticketflow import config, db, graph, taskqueue
-from ticketflow.clock import Clock, resolve_clock
 from ticketflow.db import _Pool
 from ticketflow.logging import setup_logging
 from ticketflow.signals import APPROVAL_DECISION_SIGNAL
@@ -170,8 +169,6 @@ def _resume_for_run(
     conn: Any,
     envelope: dict[str, Any],
     wakeup_at: datetime | None,
-    *,
-    clock: Clock | None = None,
 ) -> _ResumeValue | None:
     """Return a ready task/signal value, a due timer envelope, or ``None``.
 
@@ -183,16 +180,9 @@ def _resume_for_run(
     resume = _resume_value(conn, envelope)
     if resume is not None:
         return resume
-    if _timer_is_due(wakeup_at, clock=clock):
+    if wakeup_at is not None:
         return _ResumeValue({"kind": "timeout"})
     return None
-
-
-def _timer_is_due(wakeup_at: datetime | None, *, clock: Clock | None = None) -> bool:
-    """Whether a durable timer should resume the parked graph now."""
-    if wakeup_at is None:
-        return False
-    return wakeup_at <= resolve_clock(clock).now()
 
 
 def _interrupt_envelope_from_output(output: dict[str, Any]) -> dict[str, Any] | None:
@@ -222,9 +212,7 @@ def _next_wakeup_at(output: dict[str, Any], resume: _ResumeValue) -> datetime | 
     return output.get("wakeup_at")
 
 
-async def step(
-    compiled: _Graph, pool: _Pool, worker_id: str, *, clock: Clock | None = None
-) -> bool:
+async def step(compiled: _Graph, pool: _Pool, worker_id: str) -> bool:
     """Advance at most one runnable workflow run by one resume.
 
     Returns ``True`` when a run was resumed and its new state persisted, ``False``
@@ -242,7 +230,7 @@ async def step(
     resume: _ResumeValue | None = None
     if envelope is not None:
         with pool.connection() as conn:
-            resume = _resume_for_run(conn, envelope, run.wakeup_at, clock=clock)
+            resume = _resume_for_run(conn, envelope, run.wakeup_at)
 
     if envelope is None or resume is None:
         # Not actionable yet (no task result, approval signal, or due timer).
@@ -326,7 +314,6 @@ async def run_forever(
     poll_interval: float = POLL_INTERVAL_S,
     janitor_interval: float = config.JANITOR_INTERVAL_S,
     stop: Callable[[], bool] | None = None,
-    clock: Clock | None = None,
 ) -> None:
     """Poll for runnable runs, advancing them until ``stop`` (or cancellation).
 
@@ -342,10 +329,7 @@ async def run_forever(
             await reconcile_orphaned_runs(compiled, pool)
             next_janitor_at = now + janitor_interval
 
-        if clock is None:
-            advanced = await step(compiled, pool, worker_id)
-        else:
-            advanced = await step(compiled, pool, worker_id, clock=clock)
+        advanced = await step(compiled, pool, worker_id)
         if not advanced:
             await asyncio.sleep(poll_interval)
 

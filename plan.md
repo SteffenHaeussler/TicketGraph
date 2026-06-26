@@ -198,11 +198,12 @@ because they shape how the rest is described.*
 
 ### Time & concurrency model
 
-- [ ] **9.5 One time source.** Timer eligibility lives in SQL (`claim_run`'s `wakeup_at <= now()`,
+- [x] **9.5 One time source.** Timer eligibility lives in SQL (`claim_run`'s `wakeup_at <= now()`,
   lease expiry), which the injected `Clock` can't move — tests only fire because `FrozenClock` is
   past-dated. Drive all timer decisions from Postgres `now()` and let tests control time at the DB
   boundary (override `now()`, or inject `available_at`/`wakeup_at`). _Done:_ timer tests no longer
-  rely on past-dating the frozen clock.
+  rely on past-dating a frozen clock; graph deadlines are derived from Postgres `now()`, and tests
+  force due timers by updating persisted `wakeup_at` values.
 - [ ] **9.6 Pick one async story for DB access.** The runner calls sync `claim_run`/`save_run`
   inside `async step` and compiles the graph with the sync pool, so dispatch-node enqueues block
   the event loop inside `await ainvoke`; the worker, by contrast, uses `to_thread`. Make it

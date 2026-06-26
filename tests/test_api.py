@@ -7,7 +7,6 @@ from httpx import ASGITransport, AsyncClient
 from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
 
 from tests.helpers import (
-    FrozenClock,
     ScriptedAgent,
     billing_classification,
     drive_until_quiescent,
@@ -38,8 +37,6 @@ async def postgres_api(
     postgres_pool: db.ConnectionPool,
     postgres_database_url: str,
     activities: TicketActivities,
-    *,
-    clock: FrozenClock | None = None,
 ) -> AsyncIterator[None]:
     async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
         await saver.setup()
@@ -48,7 +45,7 @@ async def postgres_api(
         app.state.pool = postgres_pool
         app.state.async_pool = async_pool
         app.state.compiled = graph.compile_ticket_graph(
-            saver, postgres_pool, clock=clock, async_pool=async_pool
+            saver, postgres_pool, async_pool=async_pool
         )
         try:
             yield
@@ -632,11 +629,7 @@ async def test_api_status_tracks_live_postgres_checkpoint_states(
     activities = TicketActivities(
         ScriptedAgent(billing_classification(), refund_draft())
     )
-    clock = FrozenClock(datetime.now(UTC))
-
-    async with postgres_api(
-        postgres_pool, postgres_database_url, activities, clock=clock
-    ):
+    async with postgres_api(postgres_pool, postgres_database_url, activities):
         async with http_client() as http:
             ticket_id = await create_ticket(
                 http, subject="refund please", body="I was double charged."
@@ -674,16 +667,14 @@ async def test_api_status_tracks_live_postgres_checkpoint_states(
                     (escalation_ticket_id,),
                 ).fetchone()
             assert run_row is not None
-            clock.advance(run_row[0] - clock.now())
             with postgres_pool.connection() as conn:
                 conn.execute(
-                    "UPDATE workflow_run SET wakeup_at = now() WHERE ticket_id = %s",
+                    "UPDATE workflow_run SET wakeup_at = now(), updated_at = now() "
+                    "WHERE ticket_id = %s",
                     (escalation_ticket_id,),
                 )
                 conn.commit()
-            advanced = await runner.step(
-                app.state.compiled, postgres_pool, "runner-1", clock=clock
-            )
+            advanced = await runner.step(app.state.compiled, postgres_pool, "runner-1")
             escalated = await http.get(f"/tickets/{escalation_ticket_id}")
 
     assert classifying.status_code == 200
@@ -757,11 +748,7 @@ async def test_api_late_approval_after_timeout_returns_409(
     activities = TicketActivities(
         ScriptedAgent(billing_classification(), refund_draft())
     )
-    clock = FrozenClock(datetime.now(UTC))
-
-    async with postgres_api(
-        postgres_pool, postgres_database_url, activities, clock=clock
-    ):
+    async with postgres_api(postgres_pool, postgres_database_url, activities):
         async with http_client() as http:
             ticket_id = await create_ticket(
                 http, subject="refund please", body="I was double charged."
@@ -777,16 +764,14 @@ async def test_api_late_approval_after_timeout_returns_409(
                     (ticket_id,),
                 ).fetchone()
             assert run_row is not None
-            clock.advance(run_row[1] - clock.now())
             with postgres_pool.connection() as conn:
                 conn.execute(
-                    "UPDATE workflow_run SET wakeup_at = now() WHERE ticket_id = %s",
+                    "UPDATE workflow_run SET wakeup_at = now(), updated_at = now() "
+                    "WHERE ticket_id = %s",
                     (ticket_id,),
                 )
                 conn.commit()
-            advanced = await runner.step(
-                app.state.compiled, postgres_pool, "runner-1", clock=clock
-            )
+            advanced = await runner.step(app.state.compiled, postgres_pool, "runner-1")
             escalated = await http.get(f"/tickets/{ticket_id}")
             late_approval = await http.post(
                 f"/tickets/{ticket_id}/approval",

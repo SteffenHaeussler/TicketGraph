@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Iterator
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Any, Protocol
 
 from psycopg.types.json import Jsonb
@@ -153,6 +153,21 @@ def ping(
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute("SELECT 1")
+
+
+def timestamp_after(conn: Any, delta: timedelta) -> datetime:
+    """Return a timestamp ``delta`` after the database's current time."""
+    row = conn.execute("SELECT now() + %s::interval", (delta,)).fetchone()
+    assert row is not None
+    return row[0]
+
+
+async def atimestamp_after(conn: Any, delta: timedelta) -> datetime:
+    """Async variant of ``timestamp_after``."""
+    cursor = await conn.execute("SELECT now() + %s::interval", (delta,))
+    row = await cursor.fetchone()
+    assert row is not None
+    return row[0]
 
 
 def _task_from_row(row: tuple[Any, ...]) -> QueuedTask:

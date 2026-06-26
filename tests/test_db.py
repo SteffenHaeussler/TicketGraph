@@ -53,15 +53,27 @@ class FakeCursor:
 class FakeConnection:
     def __init__(self, row: tuple[object, ...] | None = None) -> None:
         self.sql: list[str] = []
-        self.params: list[tuple[str, ...]] = []
+        self.params: list[tuple[object, ...]] = []
         self.commits = 0
         self.row = row
         self.rows: list[tuple[object, ...] | list[tuple[object, ...]] | None] = []
 
-    def execute(self, sql: str, params: tuple[str, ...] | None = None) -> FakeCursor:
+    def execute(self, sql: str, params: tuple[object, ...] | None = None) -> FakeCursor:
         self.sql.append(sql)
         if params is not None:
             self.params.append(params)
+        if "SELECT now() + %s::interval" in sql:
+            if self.rows:
+                result = self.rows.pop(0)
+                if isinstance(result, tuple) or result is None:
+                    return FakeCursor(result)
+                return FakeCursor(None, result)
+            if self.row is not None and self.row != (1,):
+                return FakeCursor(self.row)
+            assert params is not None
+            delta = params[0]
+            assert isinstance(delta, timedelta)
+            return FakeCursor((datetime.now(UTC) + delta,))
         if self.rows:
             result = self.rows.pop(0)
             if isinstance(result, list):
@@ -114,10 +126,11 @@ class AsyncFakeCursor:
 
 
 class AsyncFakeConnection:
-    def __init__(self) -> None:
+    def __init__(self, row: tuple[object, ...] | None = None) -> None:
         self.sql: list[str] = []
         self.params: list[tuple[object, ...]] = []
         self.commits = 0
+        self.row = row
 
     async def execute(
         self, sql: str, params: tuple[object, ...] | None = None
@@ -125,7 +138,15 @@ class AsyncFakeConnection:
         self.sql.append(sql)
         if params is not None:
             self.params.append(params)
-        return AsyncFakeCursor(None)
+        if (
+            "SELECT now() + %s::interval" in sql
+            and self.row is None
+            and params is not None
+        ):
+            delta = params[0]
+            assert isinstance(delta, timedelta)
+            return AsyncFakeCursor((datetime.now(UTC) + delta,))
+        return AsyncFakeCursor(self.row)
 
     async def commit(self) -> None:
         self.commits += 1
@@ -159,6 +180,16 @@ class AsyncFakePool:
 
     async def close(self) -> None:
         self.closed = True
+
+
+async def test_atimestamp_after_uses_database_now() -> None:
+    conn = AsyncFakeConnection(row=(datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC),))
+
+    timestamp = await db.atimestamp_after(conn, timedelta(seconds=30))
+
+    assert timestamp == datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+    assert "SELECT now() + %s::interval" in conn.sql[-1]
+    assert conn.params[-1] == (timedelta(seconds=30),)
 
 
 def test_make_pool_uses_database_url_from_config(monkeypatch):
@@ -410,6 +441,16 @@ def test_dequeue_leases_due_pending_task_with_skip_locked():
     assert task.result is None
     assert task.error is None
     assert task.permanent is False
+
+
+def test_timestamp_after_uses_database_now() -> None:
+    conn = FakeConnection(row=(datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC),))
+
+    timestamp = db.timestamp_after(conn, timedelta(seconds=30))
+
+    assert timestamp == datetime(2026, 6, 16, 12, 0, 30, tzinfo=UTC)
+    assert "SELECT now() + %s::interval" in conn.sql[-1]
+    assert conn.params[-1] == (timedelta(seconds=30),)
 
 
 def test_dequeue_returns_none_when_no_task_is_available():

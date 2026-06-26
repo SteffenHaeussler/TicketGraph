@@ -34,8 +34,7 @@ from langgraph.graph import END, START, StateGraph
 from langgraph.graph.state import CompiledStateGraph
 from langgraph.types import interrupt
 
-from ticketflow import config, taskqueue
-from ticketflow.clock import Clock, resolve_clock
+from ticketflow import config, db, taskqueue
 from ticketflow.db import _AsyncPool, _Pool
 from ticketflow.models import (
     ActionType,
@@ -108,7 +107,7 @@ class TicketState(TypedDict, total=False):
 
 
 def build_ticket_graph(
-    pool: _Pool, *, clock: Clock | None = None, async_pool: _AsyncPool | None = None
+    pool: _Pool, *, async_pool: _AsyncPool | None = None
 ) -> StateGraph:
     """Build the uncompiled ticket workflow graph.
 
@@ -125,7 +124,6 @@ def build_ticket_graph(
           -> decide_approval -> execute -> record
                               |-> prepare_approval -> await_approval
     """
-    active_clock = resolve_clock(clock)
 
     async def enqueue_task(
         *,
@@ -134,7 +132,8 @@ def build_ticket_graph(
         workflow_id: str,
         payload: dict[str, Any],
         idempotency_key: str,
-    ) -> None:
+        wakeup_after: timedelta | None = None,
+    ) -> datetime | None:
         if async_pool is not None:
             async with async_pool.connection() as conn:
                 await taskqueue.aenqueue(
@@ -145,8 +144,13 @@ def build_ticket_graph(
                     payload=payload,
                     idempotency_key=idempotency_key,
                 )
+                wakeup_at = (
+                    await db.atimestamp_after(conn, wakeup_after)
+                    if wakeup_after is not None
+                    else None
+                )
                 await conn.commit()
-            return
+            return wakeup_at
 
         with pool.connection() as conn:
             taskqueue.enqueue(
@@ -157,20 +161,40 @@ def build_ticket_graph(
                 payload=payload,
                 idempotency_key=idempotency_key,
             )
+            wakeup_at = (
+                db.timestamp_after(conn, wakeup_after)
+                if wakeup_after is not None
+                else None
+            )
             conn.commit()
+        return wakeup_at
+
+    async def timestamp_after(delta: timedelta) -> datetime:
+        if async_pool is not None:
+            async with async_pool.connection() as conn:
+                timestamp = await db.atimestamp_after(conn, delta)
+                await conn.commit()
+            return timestamp
+
+        with pool.connection() as conn:
+            timestamp = db.timestamp_after(conn, delta)
+            conn.commit()
+        return timestamp
 
     async def enqueue_agent_task(
         *, task_type: str, workflow_id: str, payload: dict[str, Any]
     ) -> datetime:
         key = f"{workflow_id}:{task_type}"
-        await enqueue_task(
+        wakeup_at = await enqueue_task(
             queue_name=config.AGENT_TASK_QUEUE,
             task_type=task_type,
             workflow_id=workflow_id,
             payload=payload,
             idempotency_key=key,
+            wakeup_after=timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S),
         )
-        return active_clock.now() + timedelta(seconds=config.AGENT_SCHEDULE_TO_START_S)
+        assert wakeup_at is not None
+        return wakeup_at
 
     async def redispatch_agent_task(
         *, key: str, task_type: str, workflow_id: str, payload: dict[str, Any]
@@ -329,7 +353,7 @@ def build_ticket_graph(
         _ = state
         return {
             "status": TicketStatus.AWAITING_APPROVAL,
-            "wakeup_at": active_clock.now() + APPROVAL_TIMEOUT,
+            "wakeup_at": await timestamp_after(APPROVAL_TIMEOUT),
         }
 
     async def await_approval(state: TicketState) -> TicketState:
@@ -473,10 +497,9 @@ def compile_ticket_graph(
     checkpointer: BaseCheckpointSaver,
     pool: _Pool,
     *,
-    clock: Clock | None = None,
     async_pool: _AsyncPool | None = None,
 ) -> CompiledStateGraph:
     """Compile the ticket workflow graph with a durable ``checkpointer``."""
-    return build_ticket_graph(pool, clock=clock, async_pool=async_pool).compile(
+    return build_ticket_graph(pool, async_pool=async_pool).compile(
         checkpointer=checkpointer
     )
