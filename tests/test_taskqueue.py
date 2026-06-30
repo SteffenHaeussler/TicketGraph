@@ -201,6 +201,18 @@ def test_reclaim_expired_returns_count() -> None:
     assert "lease_owner = NULL" in conn.sql[0]
 
 
+def test_prune_settled_returns_deleted_count() -> None:
+    conn = FakeConnection(rows=[(4,)])
+
+    pruned = taskqueue.prune_settled(conn, max_age_s=604800.0)
+
+    assert pruned == 4
+    assert "DELETE FROM task_queue" in conn.sql[0]
+    assert "status IN ('done', 'failed')" in conn.sql[0]
+    assert "enqueued_at < now() - make_interval(secs => %s)" in conn.sql[0]
+    assert conn.params[0] == (604800.0,)
+
+
 def test_cancel_pending_marks_task_failed_and_permanent() -> None:
     conn = FakeConnection(rows=[(1,)])
 
@@ -542,6 +554,41 @@ def test_reclaim_expired_leaves_live_leases_alone(
 
     assert reclaimed == 0
     assert row == ("leased", "worker-1")
+
+
+@pytest.mark.integration
+def test_prune_settled_removes_old_done_and_failed_tasks_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+) -> None:
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO task_queue (
+                queue_name, task_type, workflow_id, idempotency_key,
+                payload, status, enqueued_at
+            )
+            VALUES
+              ('q', 'classify', 'old-done', 'old-done:key', '{}'::jsonb,
+               'done', now() - interval '30 days'),
+              ('q', 'classify', 'old-failed', 'old-failed:key', '{}'::jsonb,
+               'failed', now() - interval '30 days'),
+              ('q', 'classify', 'fresh-done', 'fresh-done:key', '{}'::jsonb,
+               'done', now()),
+              ('q', 'classify', 'old-pending', 'old-pending:key', '{}'::jsonb,
+               'pending', now() - interval '30 days')
+            """
+        )
+        conn.commit()
+
+    with postgres_pool.connection() as conn:
+        pruned = taskqueue.prune_settled(conn, max_age_s=604800.0)
+        remaining = {
+            row[0] for row in conn.execute("SELECT workflow_id FROM task_queue")
+        }
+        conn.commit()
+
+    assert pruned == 2
+    assert remaining == {"fresh-done", "old-pending"}
 
 
 @pytest.mark.integration

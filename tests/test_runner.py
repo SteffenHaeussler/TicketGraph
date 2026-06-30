@@ -551,11 +551,96 @@ def test_reclaim_expired_leases_does_not_log_zero_counts(monkeypatch, caplog):
     assert "reclaimed expired leases" not in caplog.text
 
 
+async def test_run_retention_archives_prunes_and_deletes_checkpoints(
+    monkeypatch, caplog
+):
+    pool = FakePool(opened=True)
+    checkpoint_threads: list[str] = []
+    calls: list[tuple[str, object]] = []
+
+    class FakeCheckpointer:
+        async def adelete_thread(self, thread_id: str) -> None:
+            checkpoint_threads.append(thread_id)
+
+    def _archive_runs(*, max_age_s, pool):
+        calls.append(("archive", pool))
+        assert max_age_s == 604800.0
+        return ["old-1", "old-2"]
+
+    def _prune_signals(*, max_age_s, pool):
+        calls.append(("signals", pool))
+        assert max_age_s == 604800.0
+        return 3
+
+    def _prune_tasks(conn, *, max_age_s):
+        calls.append(("tasks", conn))
+        assert max_age_s == 604800.0
+        return 4
+
+    async def _to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(db, "archive_terminal_runs", _archive_runs)
+    monkeypatch.setattr(db, "prune_consumed_signals", _prune_signals)
+    monkeypatch.setattr(taskqueue, "prune_settled", _prune_tasks)
+    monkeypatch.setattr(runner.asyncio, "to_thread", _to_thread)
+
+    with caplog.at_level(logging.INFO, logger="ticketflow.runner"):
+        result = await runner.run_retention(
+            FakeCheckpointer(), pool, max_age_s=604800.0
+        )
+
+    assert result == runner.RetentionResult(
+        runs=2, checkpoint_threads=2, signals=3, tasks=4
+    )
+    assert checkpoint_threads == ["old-1", "old-2"]
+    assert calls == [
+        ("archive", pool),
+        ("signals", pool),
+        ("tasks", pool.connection_obj),
+    ]
+    assert pool.connection_obj.commits == 1
+    assert "ran retention sweep" in caplog.text
+
+
+async def test_run_retention_does_not_log_zero_counts(monkeypatch, caplog):
+    pool = FakePool(opened=True)
+
+    class FakeCheckpointer:
+        async def adelete_thread(self, thread_id: str) -> None:
+            raise AssertionError(f"unexpected checkpoint delete: {thread_id}")
+
+    async def _to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(db, "archive_terminal_runs", lambda *, max_age_s, pool: [])
+    monkeypatch.setattr(db, "prune_consumed_signals", lambda *, max_age_s, pool: 0)
+    monkeypatch.setattr(taskqueue, "prune_settled", lambda conn, *, max_age_s: 0)
+    monkeypatch.setattr(runner.asyncio, "to_thread", _to_thread)
+
+    with caplog.at_level(logging.INFO, logger="ticketflow.runner"):
+        result = await runner.run_retention(
+            FakeCheckpointer(), pool, max_age_s=604800.0
+        )
+
+    assert result == runner.RetentionResult(
+        runs=0, checkpoint_threads=0, signals=0, tasks=0
+    )
+    assert "ran retention sweep" not in caplog.text
+
+
 async def test_run_forever_runs_janitor_on_startup_and_interval(monkeypatch):
     compiled = FakeCompiled(FakeSnapshot([]))
+
+    class FakeCheckpointer:
+        async def adelete_thread(self, thread_id: str) -> None:
+            raise AssertionError(f"unexpected checkpoint delete: {thread_id}")
+
+    checkpointer = FakeCheckpointer()
     pool = FakePool(opened=True)
     steps = 0
     janitor_calls = 0
+    retention_calls = 0
     threaded_calls: list[str] = []
     loop_times = iter([10.0, 14.0, 15.0, 19.0])
 
@@ -576,12 +661,21 @@ async def test_run_forever_runs_janitor_on_startup_and_interval(monkeypatch):
         janitor_calls += 1
         return runner.JanitorResult(tasks=0, runs=0)
 
+    async def _retention(checkpointer_arg, pool_arg, *, max_age_s):
+        nonlocal retention_calls
+        assert checkpointer_arg is checkpointer
+        assert pool_arg is pool
+        assert max_age_s == 604800.0
+        retention_calls += 1
+        return runner.RetentionResult(runs=0, checkpoint_threads=0, signals=0, tasks=0)
+
     async def _to_thread(func, /, *args, **kwargs):
         threaded_calls.append(func.__name__)
         return func(*args, **kwargs)
 
     monkeypatch.setattr(runner, "step", _step)
     monkeypatch.setattr(runner, "reclaim_expired_leases", _janitor)
+    monkeypatch.setattr(runner, "run_retention", _retention)
     monkeypatch.setattr(runner.asyncio, "get_running_loop", lambda: FakeLoop())
     monkeypatch.setattr(runner.asyncio, "sleep", _sleep)
     monkeypatch.setattr(runner.asyncio, "to_thread", _to_thread)
@@ -591,21 +685,94 @@ async def test_run_forever_runs_janitor_on_startup_and_interval(monkeypatch):
 
     await runner.run_forever(
         compiled,
+        checkpointer,
         pool,
         "runner-1",
         poll_interval=0.01,
         janitor_interval=5.0,
+        retention_interval=100.0,
+        retention_max_age_s=604800.0,
         stop=_stop,
     )
 
     assert steps == 3
     assert janitor_calls == 2
+    assert retention_calls == 1
     assert threaded_calls == [
         "_janitor",
         "list_orphaned_checkpoint_threads",
         "_janitor",
         "list_orphaned_checkpoint_threads",
     ]
+
+
+async def test_run_forever_runs_retention_on_separate_interval(monkeypatch):
+    compiled = FakeCompiled(FakeSnapshot([]))
+
+    class FakeCheckpointer:
+        async def adelete_thread(self, thread_id: str) -> None:
+            raise AssertionError(f"unexpected checkpoint delete: {thread_id}")
+
+    checkpointer = FakeCheckpointer()
+    pool = FakePool(opened=True)
+    steps = 0
+    janitor_calls = 0
+    retention_calls = 0
+    loop_times = iter([10.0, 14.0, 15.0, 19.0])
+
+    class FakeLoop:
+        def time(self):
+            return next(loop_times)
+
+    async def _step(compiled, pool, worker_id):
+        nonlocal steps
+        steps += 1
+        return False
+
+    async def _sleep(interval):
+        assert interval == 0.01
+
+    def _janitor(pool):
+        nonlocal janitor_calls
+        janitor_calls += 1
+        return runner.JanitorResult(tasks=0, runs=0)
+
+    async def _retention(checkpointer_arg, pool_arg, *, max_age_s):
+        nonlocal retention_calls
+        assert checkpointer_arg is checkpointer
+        assert pool_arg is pool
+        assert max_age_s == 123.0
+        retention_calls += 1
+        return runner.RetentionResult(runs=0, checkpoint_threads=0, signals=0, tasks=0)
+
+    async def _to_thread(func, /, *args, **kwargs):
+        return func(*args, **kwargs)
+
+    monkeypatch.setattr(runner, "step", _step)
+    monkeypatch.setattr(runner, "reclaim_expired_leases", _janitor)
+    monkeypatch.setattr(runner, "run_retention", _retention)
+    monkeypatch.setattr(runner.asyncio, "get_running_loop", lambda: FakeLoop())
+    monkeypatch.setattr(runner.asyncio, "sleep", _sleep)
+    monkeypatch.setattr(runner.asyncio, "to_thread", _to_thread)
+
+    def _stop():
+        return steps >= 3
+
+    await runner.run_forever(
+        compiled,
+        checkpointer,
+        pool,
+        "runner-1",
+        poll_interval=0.01,
+        janitor_interval=100.0,
+        retention_interval=5.0,
+        retention_max_age_s=123.0,
+        stop=_stop,
+    )
+
+    assert steps == 3
+    assert janitor_calls == 1
+    assert retention_calls == 2
 
 
 async def test_main_compiles_runner_graph_with_async_pool(monkeypatch):
@@ -655,7 +822,7 @@ async def test_main_compiles_runner_graph_with_async_pool(monkeypatch):
     saver = RecordingSaver()
     saver_calls: list[str] = []
     compile_calls: list[tuple[object, object, object | None]] = []
-    run_calls: list[tuple[object, object, str]] = []
+    run_calls: list[tuple[object, object, object, str]] = []
 
     async def _to_thread(func, /, *args, **kwargs):
         return func(*args, **kwargs)
@@ -664,8 +831,8 @@ async def test_main_compiles_runner_graph_with_async_pool(monkeypatch):
         compile_calls.append((checkpointer, pool_arg, async_pool))
         return "compiled"
 
-    async def _run_forever(compiled, pool_arg, worker_id):
-        run_calls.append((compiled, pool_arg, worker_id))
+    async def _run_forever(compiled, checkpointer, pool_arg, worker_id):
+        run_calls.append((compiled, checkpointer, pool_arg, worker_id))
 
     monkeypatch.setattr(runner, "setup_logging", lambda: None)
     monkeypatch.setattr(runner.asyncio, "to_thread", _to_thread)
@@ -686,7 +853,72 @@ async def test_main_compiles_runner_graph_with_async_pool(monkeypatch):
     assert saver.setup_called is True
     assert saver_calls == [config.DATABASE_URL]
     assert compile_calls == [(saver, pool, async_pool)]
-    assert run_calls == [("compiled", pool, "runner-main")]
+    assert run_calls == [("compiled", saver, pool, "runner-main")]
+
+
+@pytest.mark.integration
+async def test_run_retention_archives_terminal_run_and_deletes_checkpoint_thread(
+    postgres_pool: db.ConnectionPool, postgres_database_url: str
+):
+    from langchain_core.runnables import RunnableConfig
+    from langgraph.checkpoint.postgres.aio import AsyncPostgresSaver
+
+    from ticketflow import graph
+    from ticketflow.models import Ticket, TicketStatus
+
+    ticket = Ticket(
+        id=f"t-retention-{uuid.uuid4().hex}",
+        customer_email="customer@example.com",
+        subject="Need help",
+        body="My login keeps failing and I want it fixed.",
+    )
+    cfg: RunnableConfig = {"configurable": {"thread_id": ticket.id}}
+
+    async with AsyncPostgresSaver.from_conn_string(postgres_database_url) as saver:
+        await saver.setup()
+        compiled = graph.compile_ticket_graph(saver, postgres_pool)
+        out = await compiled.ainvoke(
+            {"ticket": ticket, "status": TicketStatus.RECEIVED}, cfg
+        )
+        assert "__interrupt__" in out
+
+        with postgres_pool.connection() as conn:
+            checkpoint_count = conn.execute(
+                "SELECT count(*) FROM checkpoints WHERE thread_id = %s",
+                (ticket.id,),
+            ).fetchone()
+            conn.execute(
+                """
+                INSERT INTO workflow_run (ticket_id, status, updated_at)
+                VALUES (%s, 'resolved', now() - interval '30 days')
+                """,
+                (ticket.id,),
+            )
+            conn.commit()
+
+        result = await runner.run_retention(saver, postgres_pool, max_age_s=604800.0)
+
+        with postgres_pool.connection() as conn:
+            live_run = conn.execute(
+                "SELECT 1 FROM workflow_run WHERE ticket_id = %s",
+                (ticket.id,),
+            ).fetchone()
+            archive_run = conn.execute(
+                "SELECT status FROM workflow_run_archive WHERE ticket_id = %s",
+                (ticket.id,),
+            ).fetchone()
+            remaining_checkpoints = conn.execute(
+                "SELECT count(*) FROM checkpoints WHERE thread_id = %s",
+                (ticket.id,),
+            ).fetchone()
+
+    assert checkpoint_count is not None
+    assert checkpoint_count[0] > 0
+    assert result.runs == 1
+    assert result.checkpoint_threads == 1
+    assert live_run is None
+    assert archive_run == ("resolved",)
+    assert remaining_checkpoints == (0,)
 
 
 @pytest.mark.integration

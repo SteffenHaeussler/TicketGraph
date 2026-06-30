@@ -23,6 +23,7 @@ SENT_REPLY_GUARD_MIGRATION = "006_sent_reply_guard"
 PENDING_SIGNAL_DROP_REDUNDANT_INDEX_MIGRATION = (
     "007_pending_signal_drop_redundant_index"
 )
+WORKFLOW_RUN_ARCHIVE_MIGRATION = "008_workflow_run_archive"
 
 
 @dataclass(frozen=True)
@@ -328,6 +329,72 @@ def reclaim_expired_runs(
                 )
                 SELECT count(*) FROM reclaimed
                 """,
+            ).fetchone()
+            conn.commit()
+
+    assert row is not None
+    return int(row[0])
+
+
+def archive_terminal_runs(
+    *,
+    max_age_s: float,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> list[str]:
+    """Move old terminal workflow runs into ``workflow_run_archive``."""
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
+        with active_pool.connection() as conn:
+            rows = conn.execute(
+                """
+                WITH moved AS (
+                    DELETE FROM workflow_run
+                    WHERE status IN ('resolved', 'rejected', 'escalated')
+                      AND updated_at < now() - make_interval(secs => %s)
+                    RETURNING ticket_id, status, wakeup_at, lease_owner,
+                              lease_expires_at, created_at, updated_at
+                )
+                INSERT INTO workflow_run_archive (
+                    ticket_id,
+                    status,
+                    wakeup_at,
+                    lease_owner,
+                    lease_expires_at,
+                    created_at,
+                    updated_at
+                )
+                SELECT ticket_id, status, wakeup_at, lease_owner,
+                       lease_expires_at, created_at, updated_at
+                FROM moved
+                RETURNING ticket_id
+                """,
+                (max_age_s,),
+            ).fetchall()
+            conn.commit()
+
+    return [str(row[0]) for row in rows]
+
+
+def prune_consumed_signals(
+    *,
+    max_age_s: float,
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+) -> int:
+    """Delete old consumed workflow signals."""
+    with managed_pool(database_url=database_url, pool=pool) as active_pool:
+        with active_pool.connection() as conn:
+            row = conn.execute(
+                """
+                WITH deleted AS (
+                    DELETE FROM pending_signal
+                    WHERE consumed = true
+                      AND consumed_at < now() - make_interval(secs => %s)
+                    RETURNING id
+                )
+                SELECT count(*) FROM deleted
+                """,
+                (max_age_s,),
             ).fetchone()
             conn.commit()
 
@@ -701,6 +768,25 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(
         PENDING_SIGNAL_DROP_REDUNDANT_INDEX_MIGRATION,
         ("DROP INDEX IF EXISTS ix_pending_signal_unconsumed",),
+    ),
+    Migration(
+        WORKFLOW_RUN_ARCHIVE_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS workflow_run_archive (
+                ticket_id        text        PRIMARY KEY,
+                status           text        NOT NULL,
+                wakeup_at        timestamptz,
+                lease_owner      text,
+                lease_expires_at timestamptz,
+                created_at       timestamptz NOT NULL,
+                updated_at       timestamptz NOT NULL,
+                archived_at      timestamptz NOT NULL DEFAULT now(),
+                CHECK (status IN ('received', 'classifying', 'drafting',
+                    'awaiting_approval', 'resolved', 'rejected', 'escalated'))
+            )
+            """,
+        ),
     ),
 )
 

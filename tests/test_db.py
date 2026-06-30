@@ -388,6 +388,8 @@ def test_bootstrap_creates_default_schema_migrations():
     assert "CREATE TABLE IF NOT EXISTS workflow_run" in sql
     assert "ticket_id        text        PRIMARY KEY" in sql
     assert "CREATE INDEX IF NOT EXISTS ix_workflow_run_status" in sql
+    assert "CREATE TABLE IF NOT EXISTS workflow_run_archive" in sql
+    assert "archived_at      timestamptz NOT NULL DEFAULT now()" in sql
     assert "CREATE TABLE IF NOT EXISTS pending_signal" in sql
     assert "CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind" in sql
     assert "DROP INDEX IF EXISTS ix_pending_signal_unconsumed" in sql
@@ -406,6 +408,7 @@ def test_bootstrap_creates_default_schema_migrations():
         ("005_pending_signal_unique_unconsumed",),
         ("006_sent_reply_guard",),
         ("007_pending_signal_drop_redundant_index",),
+        ("008_workflow_run_archive",),
     ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
@@ -448,6 +451,20 @@ def test_bootstrap_creates_workflow_run_table():
     assert "'awaiting_approval', 'resolved', 'rejected', 'escalated'))" in sql
     assert "CREATE INDEX IF NOT EXISTS ix_workflow_run_status" in sql
     assert ("003_workflow_run",) in pool.connection_obj.params
+
+
+def test_bootstrap_creates_workflow_run_archive_table():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE TABLE IF NOT EXISTS workflow_run_archive" in sql
+    assert "ticket_id        text        PRIMARY KEY" in sql
+    assert "archived_at      timestamptz NOT NULL DEFAULT now()" in sql
+    assert "CHECK (status IN ('received', 'classifying', 'drafting'," in sql
+    assert "'awaiting_approval', 'resolved', 'rejected', 'escalated'))" in sql
+    assert ("008_workflow_run_archive",) in pool.connection_obj.params
 
 
 def test_bootstrap_creates_pending_signal_table():
@@ -893,6 +910,37 @@ def test_list_orphaned_checkpoint_threads_returns_unprojected_threads():
     assert threads == ["t-orphan-1", "t-orphan-2"]
 
 
+def test_archive_terminal_runs_moves_old_terminal_rows_and_returns_ticket_ids():
+    pool = FakePool(opened=True)
+    pool.connection_obj.rows = [[("old-resolved",), ("old-escalated",)]]
+
+    archived = db.archive_terminal_runs(max_age_s=604800.0, pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "DELETE FROM workflow_run" in sql
+    assert "INSERT INTO workflow_run_archive" in sql
+    assert "status IN ('resolved', 'rejected', 'escalated')" in sql
+    assert "updated_at < now() - make_interval(secs => %s)" in sql
+    assert "RETURNING ticket_id" in sql
+    assert pool.connection_obj.params[-1] == (604800.0,)
+    assert pool.connection_obj.commits == 1
+    assert archived == ["old-resolved", "old-escalated"]
+
+
+def test_prune_consumed_signals_returns_deleted_count():
+    pool = FakePool(opened=True, row=(3,))
+
+    pruned = db.prune_consumed_signals(max_age_s=604800.0, pool=pool)
+
+    sql = pool.connection_obj.sql[-1]
+    assert "DELETE FROM pending_signal" in sql
+    assert "consumed = true" in sql
+    assert "consumed_at < now() - make_interval(secs => %s)" in sql
+    assert pool.connection_obj.params[-1] == (604800.0,)
+    assert pool.connection_obj.commits == 1
+    assert pruned == 3
+
+
 async def test_acreate_run_opens_and_closes_owned_pool(monkeypatch):
     pool = AsyncFakePool()
     monkeypatch.setattr(db, "make_async_pool", lambda database_url=None: pool)
@@ -1213,6 +1261,39 @@ def test_bootstrap_creates_workflow_run_against_real_postgres(
 
 
 @pytest.mark.integration
+def test_bootstrap_creates_workflow_run_archive_against_real_postgres(
+    postgres_pool: db.ConnectionPool,
+):
+    db.bootstrap(pool=postgres_pool)
+    expected_columns = {
+        "ticket_id",
+        "status",
+        "wakeup_at",
+        "lease_owner",
+        "lease_expires_at",
+        "created_at",
+        "updated_at",
+        "archived_at",
+    }
+
+    with postgres_pool.connection() as conn:
+        marker = conn.execute(
+            "SELECT count(*) FROM schema_migrations WHERE version = %s",
+            (db.WORKFLOW_RUN_ARCHIVE_MIGRATION,),
+        ).fetchone()
+        columns = {
+            row[0]
+            for row in conn.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_name = 'workflow_run_archive'"
+            ).fetchall()
+        }
+
+    assert marker == (1,)
+    assert expected_columns <= columns
+
+
+@pytest.mark.integration
 def test_bootstrap_applies_later_alter_migration_against_real_postgres(
     postgres_database_url: str,
 ):
@@ -1527,3 +1608,56 @@ def test_reclaim_expired_runs_clears_only_expired_leases_against_real_postgres(
     assert reclaimed == 1
     assert stale == ("classifying", True, None, None)
     assert live == ("runner-live", True)
+
+
+@pytest.mark.integration
+def test_retention_archives_terminal_runs_and_prunes_consumed_signals(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            """
+            INSERT INTO workflow_run (ticket_id, status, updated_at)
+            VALUES
+              ('old-terminal', 'resolved', now() - interval '30 days'),
+              ('fresh-terminal', 'resolved', now()),
+              ('live-old', 'classifying', now() - interval '30 days')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO pending_signal
+                (workflow_id, kind, payload, consumed, consumed_at)
+            VALUES
+              ('old-terminal', 'approval_decision', '{}'::jsonb, true,
+               now() - interval '30 days'),
+              ('fresh-terminal', 'approval_decision', '{}'::jsonb, true, now()),
+              ('live-old', 'approval_decision', '{}'::jsonb, false, NULL)
+            """
+        )
+        conn.commit()
+
+    archived = db.archive_terminal_runs(max_age_s=604800.0, pool=postgres_pool)
+    signals = db.prune_consumed_signals(max_age_s=604800.0, pool=postgres_pool)
+
+    with postgres_pool.connection() as conn:
+        live_runs = {
+            row[0]
+            for row in conn.execute("SELECT ticket_id FROM workflow_run").fetchall()
+        }
+        archive_rows = {
+            row[0]
+            for row in conn.execute(
+                "SELECT ticket_id FROM workflow_run_archive"
+            ).fetchall()
+        }
+        signal_rows = {
+            row[0]
+            for row in conn.execute("SELECT workflow_id FROM pending_signal").fetchall()
+        }
+
+    assert archived == ["old-terminal"]
+    assert signals == 1
+    assert live_runs == {"fresh-terminal", "live-old"}
+    assert archive_rows == {"old-terminal"}
+    assert signal_rows == {"fresh-terminal", "live-old"}

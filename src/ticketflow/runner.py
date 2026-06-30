@@ -67,6 +67,12 @@ class _Graph(Protocol):
     async def ainvoke(self, input: Any, config: Any) -> dict[str, Any]: ...
 
 
+class _Checkpointer(Protocol):
+    """The checkpoint saver operation retention needs."""
+
+    async def adelete_thread(self, thread_id: str) -> None: ...
+
+
 @dataclass(frozen=True)
 class _ResumeValue:
     """A graph resume payload plus the signal row to consume, if any."""
@@ -81,6 +87,16 @@ class JanitorResult:
 
     tasks: int
     runs: int
+
+
+@dataclass(frozen=True)
+class RetentionResult:
+    """Counts of rows/checkpoint threads removed by one retention pass."""
+
+    runs: int
+    checkpoint_threads: int
+    signals: int
+    tasks: int
 
 
 def _thread_config(ticket_id: str) -> RunnableConfig:
@@ -323,13 +339,65 @@ def reclaim_expired_leases(pool: _Pool) -> JanitorResult:
     return result
 
 
+def _prune_settled_tasks_from_pool(pool: _Pool, *, max_age_s: float) -> int:
+    """Open a sync DB connection and prune old settled task rows."""
+    with pool.connection() as conn:
+        tasks = taskqueue.prune_settled(conn, max_age_s=max_age_s)
+        conn.commit()
+    return tasks
+
+
+async def run_retention(
+    checkpointer: _Checkpointer,
+    pool: _Pool,
+    *,
+    max_age_s: float,
+) -> RetentionResult:
+    """Archive/prune old settled workflow data and delete archived checkpoints."""
+    archived_runs = await asyncio.to_thread(
+        db.archive_terminal_runs, max_age_s=max_age_s, pool=pool
+    )
+    checkpoint_threads = 0
+    for ticket_id in archived_runs:
+        await checkpointer.adelete_thread(ticket_id)
+        checkpoint_threads += 1
+
+    signals = await asyncio.to_thread(
+        db.prune_consumed_signals, max_age_s=max_age_s, pool=pool
+    )
+    tasks = await asyncio.to_thread(
+        _prune_settled_tasks_from_pool, pool, max_age_s=max_age_s
+    )
+
+    result = RetentionResult(
+        runs=len(archived_runs),
+        checkpoint_threads=checkpoint_threads,
+        signals=signals,
+        tasks=tasks,
+    )
+    if result.runs or result.checkpoint_threads or result.signals or result.tasks:
+        logger.info(
+            "ran retention sweep",
+            extra={
+                "runs_archived": result.runs,
+                "checkpoint_threads_deleted": result.checkpoint_threads,
+                "signals_pruned": result.signals,
+                "tasks_pruned": result.tasks,
+            },
+        )
+    return result
+
+
 async def run_forever(
     compiled: _Graph,
+    checkpointer: _Checkpointer,
     pool: _Pool,
     worker_id: str,
     *,
     poll_interval: float = POLL_INTERVAL_S,
     janitor_interval: float = config.JANITOR_INTERVAL_S,
+    retention_interval: float = config.RETENTION_INTERVAL_S,
+    retention_max_age_s: float = config.RETENTION_MAX_AGE_S,
     stop: Callable[[], bool] | None = None,
 ) -> None:
     """Poll for runnable runs, advancing them until ``stop`` (or cancellation).
@@ -339,12 +407,21 @@ async def run_forever(
     """
     loop = asyncio.get_running_loop()
     next_janitor_at = 0.0
+    next_retention_at = 0.0
     while stop is None or not stop():
         now = loop.time()
         if now >= next_janitor_at:
             await asyncio.to_thread(reclaim_expired_leases, pool)
             await reconcile_orphaned_runs(compiled, pool)
             next_janitor_at = now + janitor_interval
+
+        if now >= next_retention_at:
+            await run_retention(
+                checkpointer,
+                pool,
+                max_age_s=retention_max_age_s,
+            )
+            next_retention_at = now + retention_interval
 
         advanced = await step(compiled, pool, worker_id)
         if not advanced:
@@ -370,7 +447,7 @@ async def main() -> None:
         async with AsyncPostgresSaver.from_conn_string(config.DATABASE_URL) as saver:
             await saver.setup()
             compiled = graph.compile_ticket_graph(saver, pool, async_pool=async_pool)
-            await run_forever(compiled, pool, worker_id)
+            await run_forever(compiled, saver, pool, worker_id)
     finally:
         await async_pool.close()
         await asyncio.to_thread(pool.close)
