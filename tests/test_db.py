@@ -201,6 +201,7 @@ def test_make_pool_uses_database_url_from_config(monkeypatch):
 
     monkeypatch.setattr(db, "ConnectionPool", RecordingPool)
     monkeypatch.setattr(db.config, "DATABASE_URL", "postgresql://example/tickets")
+    monkeypatch.setattr(db.config, "DB_POOL_MAX_SIZE", 24)
 
     assert isinstance(db.make_pool(), RecordingPool)
 
@@ -208,7 +209,30 @@ def test_make_pool_uses_database_url_from_config(monkeypatch):
         {
             "conninfo": "postgresql://example/tickets",
             "min_size": 1,
-            "max_size": 10,
+            "max_size": 24,
+            "open": False,
+        }
+    ]
+
+
+def test_make_pool_accepts_explicit_max_size(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class RecordingPool:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(db, "ConnectionPool", RecordingPool)
+
+    assert isinstance(
+        db.make_pool("postgresql://override/tickets", max_size=31), RecordingPool
+    )
+
+    assert calls == [
+        {
+            "conninfo": "postgresql://override/tickets",
+            "min_size": 1,
+            "max_size": 31,
             "open": False,
         }
     ]
@@ -223,6 +247,7 @@ def test_make_async_pool_uses_database_url_from_config(monkeypatch):
 
     monkeypatch.setattr(db, "AsyncConnectionPool", RecordingAsyncPool)
     monkeypatch.setattr(db.config, "DATABASE_URL", "postgresql://example/tickets")
+    monkeypatch.setattr(db.config, "DB_POOL_MAX_SIZE", 24)
 
     assert isinstance(db.make_async_pool(), RecordingAsyncPool)
 
@@ -230,7 +255,31 @@ def test_make_async_pool_uses_database_url_from_config(monkeypatch):
         {
             "conninfo": "postgresql://example/tickets",
             "min_size": 1,
-            "max_size": 10,
+            "max_size": 24,
+            "open": False,
+        }
+    ]
+
+
+def test_make_async_pool_accepts_explicit_max_size(monkeypatch):
+    calls: list[dict[str, object]] = []
+
+    class RecordingAsyncPool:
+        def __init__(self, **kwargs: object) -> None:
+            calls.append(kwargs)
+
+    monkeypatch.setattr(db, "AsyncConnectionPool", RecordingAsyncPool)
+
+    assert isinstance(
+        db.make_async_pool("postgresql://override/tickets", max_size=31),
+        RecordingAsyncPool,
+    )
+
+    assert calls == [
+        {
+            "conninfo": "postgresql://override/tickets",
+            "min_size": 1,
+            "max_size": 31,
             "open": False,
         }
     ]

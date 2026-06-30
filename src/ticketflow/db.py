@@ -85,22 +85,26 @@ class _AsyncPool(Protocol):
     async def close(self) -> None: ...
 
 
-def make_pool(database_url: str | None = None) -> ConnectionPool:
+def make_pool(
+    database_url: str | None = None, *, max_size: int | None = None
+) -> ConnectionPool:
     """Create a Postgres connection pool for the configured database."""
     return ConnectionPool(
         conninfo=database_url or config.DATABASE_URL,
         min_size=1,
-        max_size=10,
+        max_size=max_size if max_size is not None else config.DB_POOL_MAX_SIZE,
         open=False,
     )
 
 
-def make_async_pool(database_url: str | None = None) -> AsyncConnectionPool:
+def make_async_pool(
+    database_url: str | None = None, *, max_size: int | None = None
+) -> AsyncConnectionPool:
     """Create an async Postgres connection pool for the configured database."""
     return AsyncConnectionPool(
         conninfo=database_url or config.DATABASE_URL,
         min_size=1,
-        max_size=10,
+        max_size=max_size if max_size is not None else config.DB_POOL_MAX_SIZE,
         open=False,
     )
 

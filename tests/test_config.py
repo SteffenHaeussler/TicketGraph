@@ -42,6 +42,7 @@ def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
     monkeypatch.setenv("TICKETFLOW_FALLBACK_TASK_QUEUE", "agents-fallback-prod")
     monkeypatch.setenv("AGENT_MAX_PER_SECOND", "1.5")
     monkeypatch.setenv("AGENT_MAX_CONCURRENT", "7")
+    monkeypatch.setenv("TICKETFLOW_DB_POOL_MAX_SIZE", "12")
     monkeypatch.setenv("AGENT_SCHEDULE_TO_START_S", "4.5")
     monkeypatch.setenv("MOCK_AGENT_LATENCY_MAX_S", "3.25")
     monkeypatch.setenv("TICKETFLOW_JANITOR_INTERVAL_S", "2.5")
@@ -59,6 +60,7 @@ def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
     assert reloaded.FALLBACK_TASK_QUEUE == "agents-fallback-prod"
     assert reloaded.AGENT_MAX_PER_SECOND == 1.5
     assert reloaded.AGENT_MAX_CONCURRENT == 7
+    assert reloaded.DB_POOL_MAX_SIZE == 12
     assert reloaded.AGENT_SCHEDULE_TO_START_S == 4.5
     assert reloaded.MOCK_AGENT_LATENCY_MAX_S == 3.25
     assert reloaded.JANITOR_INTERVAL_S == 2.5
@@ -74,6 +76,7 @@ def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
     monkeypatch.delenv("TICKETFLOW_FALLBACK_TASK_QUEUE")
     monkeypatch.delenv("AGENT_MAX_PER_SECOND")
     monkeypatch.delenv("AGENT_MAX_CONCURRENT")
+    monkeypatch.delenv("TICKETFLOW_DB_POOL_MAX_SIZE")
     monkeypatch.delenv("AGENT_SCHEDULE_TO_START_S")
     monkeypatch.delenv("MOCK_AGENT_LATENCY_MAX_S")
     monkeypatch.delenv("TICKETFLOW_JANITOR_INTERVAL_S")
@@ -102,8 +105,27 @@ def test_config_agent_settings_default_to_local_demo_values():
     assert config.FALLBACK_TASK_QUEUE == "ticketflow-agent-fallback"
     assert config.AGENT_MAX_PER_SECOND == 10.0
     assert config.AGENT_MAX_CONCURRENT == 20
+    assert config.DB_POOL_MAX_SIZE == 20
     assert config.AGENT_SCHEDULE_TO_START_S == 30.0
     assert config.MOCK_AGENT_LATENCY_MAX_S == 0.0
+
+
+def test_config_default_pool_size_tracks_agent_concurrency(monkeypatch):
+    monkeypatch.delenv("TICKETFLOW_DB_POOL_MAX_SIZE", raising=False)
+    monkeypatch.setenv("AGENT_MAX_CONCURRENT", "7")
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.DB_POOL_MAX_SIZE == 10
+
+    monkeypatch.setenv("AGENT_MAX_CONCURRENT", "23")
+
+    reloaded = importlib.reload(config)
+
+    assert reloaded.DB_POOL_MAX_SIZE == 23
+
+    monkeypatch.delenv("AGENT_MAX_CONCURRENT")
+    importlib.reload(config)
 
 
 def test_config_janitor_interval_defaults_to_five_seconds():
