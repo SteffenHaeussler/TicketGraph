@@ -232,11 +232,11 @@ because they shape how the rest is described.*
   `pending_signal` rows, and LangGraph checkpoints accumulate forever. Add a janitor pass that
   archives terminal runs and prunes settled tasks/signals/old checkpoints. _Done:_ a retention
   sweep exists and is covered by a test.
-- [ ] **9.10 Tidy dead/duplicate code.** `db.add_pending_signal` (non-conditional) is only used by
+- [x] **9.10 Tidy dead/duplicate code.** `db.add_pending_signal` (non-conditional) is only used by
   tests — production uses `add_pending_signal_if_waiting`; and `pending_signal` carries two
   overlapping unconsumed indexes (the unique 2-col one subsumes the non-unique 4-col one). Remove
-  or justify each. _Done:_ no app-dead helper and no redundant index, or a comment explaining why
-  each stays.
+  or justify each. _Done:_ removed the app-dead helper, converted tests to the guarded signal API,
+  and made `bootstrap()` stop creating and actively drop the redundant pending-signal index.
 - [ ] **9.11 Real migrations (optional).** `bootstrap()` is `CREATE TABLE IF NOT EXISTS` with
   decorative `schema_migrations` markers — it can't `ALTER` an existing schema. If the schema is
   expected to evolve, add a version-checked migration runner; otherwise note the limitation.

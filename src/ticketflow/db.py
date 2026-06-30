@@ -454,44 +454,6 @@ def wake_run(
             conn.commit()
 
 
-def add_pending_signal(
-    workflow_id: str,
-    kind: str,
-    payload: dict[str, Any],
-    *,
-    database_url: str | None = None,
-    pool: _Pool | None = None,
-) -> int:
-    """Persist an unconsumed workflow signal and wake the target run.
-
-    The insert and wake happen in one transaction so a caller cannot commit a
-    signal without making its workflow run claimable.
-    """
-    with managed_pool(database_url=database_url, pool=pool) as active_pool:
-        with active_pool.connection() as conn:
-            row = conn.execute(
-                """
-                INSERT INTO pending_signal (workflow_id, kind, payload)
-                VALUES (%s, %s, %s)
-                RETURNING id
-                """,
-                (workflow_id, kind, Jsonb(payload)),
-            ).fetchone()
-            assert row is not None
-            conn.execute(
-                """
-                UPDATE workflow_run
-                SET wakeup_at = now(),
-                    updated_at = now()
-                WHERE ticket_id = %s
-                """,
-                (workflow_id,),
-            )
-            conn.commit()
-
-    return int(row[0])
-
-
 def list_runs_by_status(
     status: str,
     *,
@@ -737,13 +699,6 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
             )
             conn.execute(
                 """
-                CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed
-                ON pending_signal (workflow_id, kind, created_at, id)
-                WHERE consumed = false
-                """
-            )
-            conn.execute(
-                """
                 INSERT INTO schema_migrations (version)
                 VALUES (%s)
                 ON CONFLICT (version) DO NOTHING
@@ -757,6 +712,7 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 WHERE consumed = false
                 """
             )
+            conn.execute("DROP INDEX IF EXISTS ix_pending_signal_unconsumed")
             conn.execute(
                 """
                 INSERT INTO schema_migrations (version)

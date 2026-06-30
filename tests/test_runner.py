@@ -895,12 +895,14 @@ async def test_runner_delivers_approval_signal_through_postgres(
         awaiting = await compiled.aget_state(cfg)
         assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
 
-        signal_id = db.add_pending_signal(
+        signal_id = db.add_pending_signal_if_waiting(
             ticket.id,
             "approval_decision",
             decision.model_dump(mode="json"),
+            waiting_status="awaiting_approval",
             pool=postgres_pool,
         )
+        assert signal_id is not None
         await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
         final = await compiled.aget_state(cfg)
 
@@ -1249,12 +1251,14 @@ async def test_duplicate_refund_delivery_is_at_most_once_in_ledger(
         await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
         awaiting = await compiled.aget_state(cfg)
         assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
-        db.add_pending_signal(
+        signal_id = db.add_pending_signal_if_waiting(
             ticket.id,
             "approval_decision",
             decision.model_dump(mode="json"),
+            waiting_status="awaiting_approval",
             pool=postgres_pool,
         )
+        assert signal_id is not None
 
         # Resume past approval so execute enqueues the finalize task and the run
         # parks at the terminal interrupt -- but stop before the task is acked: a
