@@ -25,9 +25,7 @@ async def main() -> None:
     db.bootstrap()
     pool = db.make_pool()
     pool.open()
-    activities = TicketActivities(
-        MockAgent.fallback(), database_url=config.DATABASE_URL
-    )
+    activities = TicketActivities(MockAgent.fallback(), pool=pool)
     try:
         logger.info(
             "fallback worker starting",

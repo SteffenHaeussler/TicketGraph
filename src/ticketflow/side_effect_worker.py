@@ -74,7 +74,7 @@ async def main() -> None:
     db.bootstrap()
     pool = db.make_pool()
     pool.open()
-    activities = TicketActivities(MockAgent(), database_url=config.DATABASE_URL)
+    activities = TicketActivities(MockAgent(), pool=pool)
     try:
         logger.info(
             "side-effect worker starting",

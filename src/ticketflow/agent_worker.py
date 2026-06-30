@@ -230,7 +230,7 @@ async def main() -> None:
     pool.open()
     latency_max = config.MOCK_AGENT_LATENCY_MAX_S
     activities = TicketActivities(
-        MockAgent(latency_range=(0.0, latency_max)), database_url=config.DATABASE_URL
+        MockAgent(latency_range=(0.0, latency_max)), pool=pool
     )
     try:
         logger.info(

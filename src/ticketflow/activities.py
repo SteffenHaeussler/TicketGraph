@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from typing import Any
 
 from ticketflow import readmodel
 from ticketflow.agent.base import Agent
@@ -17,10 +18,18 @@ class TicketActivities:
         self,
         agent: Agent,
         database_url: str | None = None,
+        pool: Any | None = None,
     ):
-        """Create operations backed by an agent and optional persistence settings."""
+        """Create operations backed by an agent and optional persistence settings.
+
+        ``pool`` is the worker's already-open connection pool. When supplied it
+        is threaded into every read-model side effect so they reuse the process
+        pool instead of opening and closing a fresh pool per call; ``database_url``
+        remains the fallback when no pool is injected.
+        """
         self._agent = agent
         self._database_url = database_url
+        self._pool = pool
 
     async def classify_ticket(self, ticket: Ticket) -> Classification:
         """Classify a ticket through the configured agent."""
@@ -43,6 +52,7 @@ class TicketActivities:
             reply_text,
             attempt,
             database_url=self._database_url,
+            pool=self._pool,
         )
         if first:
             logger.info("Sending reply to %s: %s", ticket.customer_email, reply_text)
@@ -64,6 +74,7 @@ class TicketActivities:
             amount,
             attempt,
             database_url=self._database_url,
+            pool=self._pool,
         )
         if first:
             logger.info(
@@ -80,11 +91,17 @@ class TicketActivities:
     async def refund_recorded(self, ticket_id: str) -> bool:
         """Return whether a refund is durably recorded for the ticket."""
         return await asyncio.to_thread(
-            readmodel.refund_recorded, ticket_id, database_url=self._database_url
+            readmodel.refund_recorded,
+            ticket_id,
+            database_url=self._database_url,
+            pool=self._pool,
         )
 
     async def record_result(self, result: TicketResult) -> None:
         """Persist the terminal workflow result to the read model."""
         await asyncio.to_thread(
-            readmodel.save_result, result, database_url=self._database_url
+            readmodel.save_result,
+            result,
+            database_url=self._database_url,
+            pool=self._pool,
         )

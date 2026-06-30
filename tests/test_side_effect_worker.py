@@ -215,7 +215,7 @@ async def test_postgres_finalize_runs_side_effects_and_wakes_run(
         status=TicketStatus.RESOLVED,
         reply_text=draft.reply_text,
     )
-    activities = TicketActivities(MockAgent(), database_url=config.DATABASE_URL)
+    activities = TicketActivities(MockAgent(), pool=postgres_pool)
     future = datetime.now(UTC) + timedelta(hours=1)
 
     with postgres_pool.connection() as conn:
@@ -253,7 +253,7 @@ async def test_postgres_finalize_runs_side_effects_and_wakes_run(
         refund_row = conn.execute(
             "SELECT amount FROM refunds WHERE ticket_id = %s", (ticket.id,)
         ).fetchone()
-    stored = readmodel.load_result(ticket.id, database_url=config.DATABASE_URL)
+    stored = readmodel.load_result(ticket.id, pool=postgres_pool)
     claimed = db.claim_run("runner-assert", pool=postgres_pool)
 
     assert processed is True
@@ -282,7 +282,7 @@ async def test_postgres_finalize_retry_still_reports_refund_executed(
         reply_text=draft.reply_text,
     )
     task = _finalize_task(ticket=ticket, action=draft.action, result=result)
-    activities = TicketActivities(MockAgent(), database_url=config.DATABASE_URL)
+    activities = TicketActivities(MockAgent(), pool=postgres_pool)
 
     first = await side_effect_worker.run_finalize(task, activities)
     second = await side_effect_worker.run_finalize(task, activities)
@@ -308,7 +308,7 @@ async def test_postgres_duplicate_finalize_sends_reply_at_most_once(
         status=TicketStatus.RESOLVED,
         reply_text=draft.reply_text,
     )
-    activities = TicketActivities(MockAgent(), database_url=config.DATABASE_URL)
+    activities = TicketActivities(MockAgent(), pool=postgres_pool)
 
     await side_effect_worker.run_finalize(
         _finalize_task(ticket=ticket, action=draft.action, result=result, attempts=1),
@@ -329,7 +329,7 @@ async def test_postgres_duplicate_finalize_sends_reply_at_most_once(
             (ticket.id,),
         ).fetchall()
 
-    stored = readmodel.load_result(ticket.id, database_url=config.DATABASE_URL)
+    stored = readmodel.load_result(ticket.id, pool=postgres_pool)
 
     assert sent == [(ticket.customer_email, draft.reply_text)]
     assert attempts == [(1,), (2,)]
