@@ -224,7 +224,7 @@ because they shape how the rest is described.*
   but no pool, so every `execute_refund`/`record_result`/`save_result` opens and closes a fresh
   pool (TCP connect + teardown per side effect). Thread the worker's open pool through activities
   and the read model. _Done:_ side-effect paths reuse the process pool; no per-call pool churn.
-- [ ] **9.8 Reconcile pool size with concurrency.** `db.make_pool` hardcodes `max_size=10` while
+- [x] **9.8 Reconcile pool size with concurrency.** `db.make_pool` hardcodes `max_size=10` while
   `AGENT_MAX_CONCURRENT=20`, so half the in-flight tasks block on connection checkout under load.
   Size the pool to the configured concurrency (or cap concurrency to the pool). _Done:_ pool size
   ≥ effective concurrency, configurable.
