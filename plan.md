@@ -233,15 +233,17 @@ because they shape how the rest is described.*
   archives terminal runs and prunes settled tasks/signals/old checkpoints. _Done:_ retention now
   archives terminal runs, prunes old settled tasks/signals, deletes archived checkpoint threads via
   the checkpointer, and is covered by unit tests plus `pytest -m integration -k retention`.
-- [ ] **9.10 Tidy dead/duplicate code.** `db.add_pending_signal` (non-conditional) is only used by
+- [x] **9.10 Tidy dead/duplicate code.** `db.add_pending_signal` (non-conditional) is only used by
   tests — production uses `add_pending_signal_if_waiting`; and `pending_signal` carries two
   overlapping unconsumed indexes (the unique 2-col one subsumes the non-unique 4-col one). Remove
-  or justify each. _Done:_ no app-dead helper and no redundant index, or a comment explaining why
-  each stays.
-- [ ] **9.11 Real migrations (optional).** `bootstrap()` is `CREATE TABLE IF NOT EXISTS` with
+  or justify each. _Done:_ removed the app-dead helper, converted tests to the guarded signal API,
+  stopped creating the redundant index, and added a migration to drop it from existing schemas.
+- [x] **9.11 Real migrations (optional).** `bootstrap()` is `CREATE TABLE IF NOT EXISTS` with
   decorative `schema_migrations` markers — it can't `ALTER` an existing schema. If the schema is
   expected to evolve, add a version-checked migration runner; otherwise note the limitation.
-  _Done:_ either a working migration runner or a documented "bootstrap-only" caveat.
+  _Done:_ `bootstrap()` now runs ordered `Migration` entries under a Postgres advisory lock,
+  skips applied versions, rejects unknown future versions, records markers only after each
+  migration succeeds, and supports later `ALTER` migrations against existing schemas.
 
 ---
 

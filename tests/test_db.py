@@ -285,85 +285,130 @@ def test_make_async_pool_accepts_explicit_max_size(monkeypatch):
     ]
 
 
-def test_bootstrap_creates_idempotent_migration_marker():
+def test_bootstrap_runs_pending_migrations_in_order_with_markers():
     pool = FakePool(opened=True)
+    pool.connection_obj.rows = [None, None, []]
 
-    db.bootstrap(pool=pool)
-    db.bootstrap(pool=pool)
+    migrations = (
+        db.Migration(
+            "001_create_probe", ("CREATE TABLE migration_probe (id integer)",)
+        ),
+        db.Migration(
+            "002_alter_probe", ("ALTER TABLE migration_probe ADD COLUMN name text",)
+        ),
+    )
 
-    # Each call issues 23 statements: schema_migrations create + 000 marker,
-    # task_queue create, dispatch index, 001 marker, refunds create,
-    # refund_attempts create, ticket_results create, 002 marker,
-    # workflow_run create, status index, 003 marker, workflow_run_archive
-    # create, 007 marker, pending_signal create,
-    # signal lookup index, 004 marker, unique signal index, 005 marker,
-    # sent_replies create, reply_attempts create, reply_attempts index,
-    # 006 marker.
-    assert pool.connection_obj.commits == 2
-    assert len(pool.connection_obj.sql) == 46
+    db.bootstrap(pool=pool, migrations=migrations)
+
+    sql = pool.connection_obj.sql
+    assert pool.connection_obj.commits == 1
     assert "CREATE TABLE IF NOT EXISTS schema_migrations" in pool.connection_obj.sql[0]
-    assert "ON CONFLICT (version) DO NOTHING" in pool.connection_obj.sql[1]
-    assert "CREATE TABLE IF NOT EXISTS task_queue" in pool.connection_obj.sql[2]
-    assert "idempotency_key text        NOT NULL UNIQUE" in pool.connection_obj.sql[2]
-    assert "payload         jsonb       NOT NULL" in pool.connection_obj.sql[2]
-    assert (
-        "CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch"
-        in pool.connection_obj.sql[3]
+    assert "pg_advisory_xact_lock(hashtext" in pool.connection_obj.sql[1]
+    assert "SELECT version FROM schema_migrations" in pool.connection_obj.sql[2]
+    assert "CREATE TABLE migration_probe" in sql[3]
+    assert "INSERT INTO schema_migrations" in sql[4]
+    assert "ALTER TABLE migration_probe ADD COLUMN name text" in sql[5]
+    assert "INSERT INTO schema_migrations" in sql[6]
+    assert pool.connection_obj.params == [
+        ("001_create_probe",),
+        ("002_alter_probe",),
+    ]
+    assert pool.closed is False
+
+
+def test_bootstrap_skips_already_applied_migrations():
+    pool = FakePool(opened=True)
+    pool.connection_obj.rows = [None, None, [("001_create_probe",)]]
+
+    migrations = (
+        db.Migration(
+            "001_create_probe", ("CREATE TABLE migration_probe (id integer)",)
+        ),
     )
-    assert "CREATE TABLE IF NOT EXISTS refunds" in pool.connection_obj.sql[5]
-    assert "ticket_id   text             PRIMARY KEY" in pool.connection_obj.sql[5]
-    assert "CREATE TABLE IF NOT EXISTS refund_attempts" in pool.connection_obj.sql[6]
-    assert "CREATE TABLE IF NOT EXISTS ticket_results" in pool.connection_obj.sql[7]
-    assert "ticket_id text PRIMARY KEY" in pool.connection_obj.sql[7]
-    assert "data      jsonb NOT NULL" in pool.connection_obj.sql[7]
-    assert "CREATE TABLE IF NOT EXISTS workflow_run" in pool.connection_obj.sql[9]
-    assert "ticket_id        text        PRIMARY KEY" in pool.connection_obj.sql[9]
-    assert (
-        "CREATE INDEX IF NOT EXISTS ix_workflow_run_status"
-        in pool.connection_obj.sql[10]
+
+    db.bootstrap(pool=pool, migrations=migrations)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE TABLE migration_probe" not in sql
+    assert pool.connection_obj.params == []
+    assert pool.connection_obj.commits == 1
+
+
+def test_bootstrap_rejects_duplicate_migration_versions():
+    pool = FakePool(opened=True)
+    migrations = (
+        db.Migration("001_same", ("SELECT 1",)),
+        db.Migration("001_same", ("SELECT 2",)),
     )
-    assert (
-        "CREATE TABLE IF NOT EXISTS workflow_run_archive" in pool.connection_obj.sql[12]
+
+    with pytest.raises(ValueError, match="unique"):
+        db.bootstrap(pool=pool, migrations=migrations)
+
+
+def test_bootstrap_rejects_out_of_order_migration_versions():
+    pool = FakePool(opened=True)
+    migrations = (
+        db.Migration("002_second", ("SELECT 2",)),
+        db.Migration("001_first", ("SELECT 1",)),
     )
+
+    with pytest.raises(ValueError, match="ordered"):
+        db.bootstrap(pool=pool, migrations=migrations)
+
+
+def test_bootstrap_rejects_unknown_applied_migrations():
+    pool = FakePool(opened=True)
+    pool.connection_obj.rows = [None, None, [("999_future",)]]
+
+    with pytest.raises(RuntimeError, match="newer schema"):
+        db.bootstrap(pool=pool, migrations=())
+
+
+def test_bootstrap_creates_default_schema_migrations():
+    pool = FakePool(opened=True)
+    pool.connection_obj.rows = [None, None, []]
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "CREATE TABLE IF NOT EXISTS schema_migrations" in sql
     assert (
-        "archived_at      timestamptz NOT NULL DEFAULT now()"
-        in (pool.connection_obj.sql[12])
+        "SELECT pg_advisory_xact_lock(hashtext('ticketflow:schema_migrations'))" in sql
     )
-    assert "CREATE TABLE IF NOT EXISTS pending_signal" in pool.connection_obj.sql[14]
-    assert (
-        "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed"
-        in pool.connection_obj.sql[15]
-    )
-    assert (
-        "CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind"
-        in pool.connection_obj.sql[17]
-    )
-    assert "CREATE TABLE IF NOT EXISTS sent_replies" in pool.connection_obj.sql[19]
-    assert "ticket_id      text        PRIMARY KEY" in pool.connection_obj.sql[19]
-    assert "customer_email text        NOT NULL" in pool.connection_obj.sql[19]
-    assert "reply_text     text        NOT NULL" in pool.connection_obj.sql[19]
-    assert "CREATE TABLE IF NOT EXISTS reply_attempts" in pool.connection_obj.sql[20]
-    assert (
-        "CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket"
-        in pool.connection_obj.sql[21]
-    )
+    assert "CREATE TABLE IF NOT EXISTS task_queue" in sql
+    assert "idempotency_key text        NOT NULL UNIQUE" in sql
+    assert "payload         jsonb       NOT NULL" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch" in sql
+    assert "CREATE TABLE IF NOT EXISTS refunds" in sql
+    assert "ticket_id   text             PRIMARY KEY" in sql
+    assert "CREATE TABLE IF NOT EXISTS refund_attempts" in sql
+    assert "CREATE TABLE IF NOT EXISTS ticket_results" in sql
+    assert "ticket_id text PRIMARY KEY" in sql
+    assert "data      jsonb NOT NULL" in sql
+    assert "CREATE TABLE IF NOT EXISTS workflow_run" in sql
+    assert "ticket_id        text        PRIMARY KEY" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_workflow_run_status" in sql
+    assert "CREATE TABLE IF NOT EXISTS workflow_run_archive" in sql
+    assert "archived_at      timestamptz NOT NULL DEFAULT now()" in sql
+    assert "CREATE TABLE IF NOT EXISTS pending_signal" in sql
+    assert "CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind" in sql
+    assert "DROP INDEX IF EXISTS ix_pending_signal_unconsumed" in sql
+    assert "CREATE TABLE IF NOT EXISTS sent_replies" in sql
+    assert "ticket_id      text        PRIMARY KEY" in sql
+    assert "customer_email text        NOT NULL" in sql
+    assert "reply_text     text        NOT NULL" in sql
+    assert "CREATE TABLE IF NOT EXISTS reply_attempts" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket" in sql
     assert pool.connection_obj.params == [
         ("000_bootstrap",),
         ("001_task_queue",),
         ("002_read_model",),
         ("003_workflow_run",),
-        ("007_workflow_run_archive",),
         ("004_pending_signal",),
         ("005_pending_signal_unique_unconsumed",),
         ("006_sent_reply_guard",),
-        ("000_bootstrap",),
-        ("001_task_queue",),
-        ("002_read_model",),
-        ("003_workflow_run",),
-        ("007_workflow_run_archive",),
-        ("004_pending_signal",),
-        ("005_pending_signal_unique_unconsumed",),
-        ("006_sent_reply_guard",),
+        ("007_pending_signal_drop_redundant_index",),
+        ("008_workflow_run_archive",),
     ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
@@ -419,7 +464,7 @@ def test_bootstrap_creates_workflow_run_archive_table():
     assert "archived_at      timestamptz NOT NULL DEFAULT now()" in sql
     assert "CHECK (status IN ('received', 'classifying', 'drafting'," in sql
     assert "'awaiting_approval', 'resolved', 'rejected', 'escalated'))" in sql
-    assert ("007_workflow_run_archive",) in pool.connection_obj.params
+    assert ("008_workflow_run_archive",) in pool.connection_obj.params
 
 
 def test_bootstrap_creates_pending_signal_table():
@@ -433,8 +478,7 @@ def test_bootstrap_creates_pending_signal_table():
     assert "kind        text        NOT NULL" in sql
     assert "payload     jsonb       NOT NULL" in sql
     assert "consumed    boolean     NOT NULL DEFAULT false" in sql
-    assert "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed" in sql
-    assert "WHERE consumed = false" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed" not in sql
     assert ("004_pending_signal",) in pool.connection_obj.params
 
 
@@ -448,6 +492,48 @@ def test_bootstrap_creates_unique_unconsumed_pending_signal_index():
     assert "ON pending_signal (workflow_id, kind)" in sql
     assert "WHERE consumed = false" in sql
     assert ("005_pending_signal_unique_unconsumed",) in pool.connection_obj.params
+
+
+def test_bootstrap_drops_redundant_pending_signal_lookup_index():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "DROP INDEX IF EXISTS ix_pending_signal_unconsumed" in sql
+    assert ("007_pending_signal_drop_redundant_index",) in pool.connection_obj.params
+
+
+@pytest.mark.integration
+def test_bootstrap_drops_obsolete_pending_signal_lookup_index(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed
+            ON pending_signal (workflow_id, kind, created_at, id)
+            WHERE consumed = false
+            """
+        )
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version = %s",
+            (db.PENDING_SIGNAL_DROP_REDUNDANT_INDEX_MIGRATION,),
+        )
+        created = conn.execute(
+            "SELECT to_regclass('ix_pending_signal_unconsumed')"
+        ).fetchone()
+        conn.commit()
+
+    db.bootstrap(pool=postgres_pool)
+
+    with postgres_pool.connection() as conn:
+        dropped = conn.execute(
+            "SELECT to_regclass('ix_pending_signal_unconsumed')"
+        ).fetchone()
+
+    assert created == ("ix_pending_signal_unconsumed",)
+    assert dropped == (None,)
 
 
 def test_bootstrap_creates_sent_reply_guard_tables():
@@ -892,38 +978,6 @@ async def test_acreate_run_inserts_real_postgres_workflow_run(
     assert row == ("classifying", wakeup_at)
 
 
-def test_add_pending_signal_inserts_signal_and_wakes_run():
-    pool = FakePool(opened=True, row=(42,))
-
-    signal_id = db.add_pending_signal(
-        "ticket-1",
-        "approval_decision",
-        {"approved": True, "approver": "sam@example.com"},
-        pool=pool,
-    )
-
-    sql = "\n".join(pool.connection_obj.sql)
-    assert signal_id == 42
-    assert "INSERT INTO pending_signal" in sql
-    assert "UPDATE workflow_run" in sql
-    assert "wakeup_at = now()" in sql
-    assert "updated_at = now()" in sql
-    assert pool.connection_obj.params[0][0:2] == ("ticket-1", "approval_decision")
-    wake_params = pool.connection_obj.params[1]
-    assert wake_params == ("ticket-1",)
-    assert pool.connection_obj.commits == 1
-
-
-def test_add_pending_signal_opens_and_closes_owned_pool(monkeypatch):
-    pool = FakePool(row=(42,))
-    monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
-
-    db.add_pending_signal("ticket-1", "approval_decision", {"approved": True})
-
-    assert pool.opened is True
-    assert pool.closed is True
-
-
 def test_list_runs_by_status_returns_ticket_ids_in_creation_order():
     pool = FakePool(opened=True)
     pool.connection_obj.rows = [[("ticket-1",), ("ticket-2",)]]
@@ -1237,6 +1291,87 @@ def test_bootstrap_creates_workflow_run_archive_against_real_postgres(
 
     assert marker == (1,)
     assert expected_columns <= columns
+
+
+@pytest.mark.integration
+def test_bootstrap_applies_later_alter_migration_against_real_postgres(
+    postgres_database_url: str,
+):
+    first_migration = db.Migration(
+        "001_create_probe",
+        ("CREATE TABLE migration_probe (id integer PRIMARY KEY)",),
+    )
+    second_migration = db.Migration(
+        "002_alter_probe",
+        ("ALTER TABLE migration_probe ADD COLUMN name text NOT NULL DEFAULT 'unset'",),
+    )
+
+    db.bootstrap(database_url=postgres_database_url, migrations=(first_migration,))
+
+    pool = db.make_pool(postgres_database_url)
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            conn.execute("INSERT INTO migration_probe (id) VALUES (1)")
+            conn.commit()
+    finally:
+        pool.close()
+
+    db.bootstrap(
+        database_url=postgres_database_url,
+        migrations=(first_migration, second_migration),
+    )
+
+    pool = db.make_pool(postgres_database_url)
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            row = conn.execute(
+                "SELECT id, name FROM migration_probe WHERE id = 1"
+            ).fetchone()
+            markers = conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+    finally:
+        pool.close()
+
+    assert row == (1, "unset")
+    assert markers == [("001_create_probe",), ("002_alter_probe",)]
+
+
+@pytest.mark.integration
+def test_bootstrap_does_not_mark_failed_migration_against_real_postgres(
+    postgres_database_url: str,
+):
+    migrations = (
+        db.Migration(
+            "001_create_probe",
+            ("CREATE TABLE migration_probe (id integer PRIMARY KEY)",),
+        ),
+        db.Migration(
+            "002_duplicate_probe",
+            ("CREATE TABLE migration_probe (id integer PRIMARY KEY)",),
+        ),
+    )
+
+    with pytest.raises(Exception):
+        db.bootstrap(database_url=postgres_database_url, migrations=migrations)
+
+    pool = db.make_pool(postgres_database_url)
+    pool.open()
+    try:
+        with pool.connection() as conn:
+            schema_table = conn.execute(
+                "SELECT to_regclass('schema_migrations')"
+            ).fetchone()
+            probe_table = conn.execute(
+                "SELECT to_regclass('migration_probe')"
+            ).fetchone()
+    finally:
+        pool.close()
+
+    assert schema_table == (None,)
+    assert probe_table == (None,)
 
 
 @pytest.mark.integration

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Iterator, Sequence
 from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
@@ -20,7 +20,18 @@ WORKFLOW_RUN_MIGRATION = "003_workflow_run"
 PENDING_SIGNAL_MIGRATION = "004_pending_signal"
 PENDING_SIGNAL_UNIQUE_MIGRATION = "005_pending_signal_unique_unconsumed"
 SENT_REPLY_GUARD_MIGRATION = "006_sent_reply_guard"
-WORKFLOW_RUN_ARCHIVE_MIGRATION = "007_workflow_run_archive"
+PENDING_SIGNAL_DROP_REDUNDANT_INDEX_MIGRATION = (
+    "007_pending_signal_drop_redundant_index"
+)
+WORKFLOW_RUN_ARCHIVE_MIGRATION = "008_workflow_run_archive"
+
+
+@dataclass(frozen=True)
+class Migration:
+    """A one-time schema migration applied by ``bootstrap``."""
+
+    version: str
+    statements: tuple[str, ...]
 
 
 @dataclass(frozen=True)
@@ -521,44 +532,6 @@ def wake_run(
             conn.commit()
 
 
-def add_pending_signal(
-    workflow_id: str,
-    kind: str,
-    payload: dict[str, Any],
-    *,
-    database_url: str | None = None,
-    pool: _Pool | None = None,
-) -> int:
-    """Persist an unconsumed workflow signal and wake the target run.
-
-    The insert and wake happen in one transaction so a caller cannot commit a
-    signal without making its workflow run claimable.
-    """
-    with managed_pool(database_url=database_url, pool=pool) as active_pool:
-        with active_pool.connection() as conn:
-            row = conn.execute(
-                """
-                INSERT INTO pending_signal (workflow_id, kind, payload)
-                VALUES (%s, %s, %s)
-                RETURNING id
-                """,
-                (workflow_id, kind, Jsonb(payload)),
-            ).fetchone()
-            assert row is not None
-            conn.execute(
-                """
-                UPDATE workflow_run
-                SET wakeup_at = now(),
-                    updated_at = now()
-                WHERE ticket_id = %s
-                """,
-                (workflow_id,),
-            )
-            conn.commit()
-
-    return int(row[0])
-
-
 def list_runs_by_status(
     status: str,
     *,
@@ -660,15 +633,189 @@ def add_pending_signal_if_waiting(
     return int(row[0]) if row is not None else None
 
 
-def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> None:
-    """Create the migration marker and durable workflow support tables.
+MIGRATIONS: tuple[Migration, ...] = (
+    Migration(BOOTSTRAP_MIGRATION, ()),
+    Migration(
+        TASK_QUEUE_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS task_queue (
+                id              bigserial PRIMARY KEY,
+                queue_name      text        NOT NULL,
+                task_type       text        NOT NULL,
+                workflow_id     text        NOT NULL,
+                payload         jsonb       NOT NULL DEFAULT '{}'::jsonb,
+                idempotency_key text        NOT NULL UNIQUE,
+                status          text        NOT NULL DEFAULT 'pending',
+                attempts        integer     NOT NULL DEFAULT 0,
+                max_attempts    integer     NOT NULL DEFAULT 5,
+                available_at    timestamptz NOT NULL DEFAULT now(),
+                enqueued_at     timestamptz NOT NULL DEFAULT now(),
+                lease_owner     text,
+                lease_expires_at timestamptz,
+                result          jsonb,
+                error           text,
+                permanent       boolean     NOT NULL DEFAULT false,
+                CHECK (status IN ('pending', 'leased', 'done', 'failed'))
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch
+            ON task_queue (queue_name, available_at)
+            WHERE status = 'pending'
+            """,
+        ),
+    ),
+    Migration(
+        READ_MODEL_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS refunds (
+                ticket_id   text             PRIMARY KEY,
+                amount      double precision NOT NULL,
+                recorded_at timestamptz      NOT NULL DEFAULT now()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS refund_attempts (
+                id           bigserial   PRIMARY KEY,
+                ticket_id    text        NOT NULL,
+                attempt      integer     NOT NULL,
+                attempted_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS ticket_results (
+                ticket_id text PRIMARY KEY,
+                data      jsonb NOT NULL
+            )
+            """,
+        ),
+    ),
+    Migration(
+        WORKFLOW_RUN_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS workflow_run (
+                ticket_id        text        PRIMARY KEY,
+                status           text        NOT NULL DEFAULT 'received',
+                wakeup_at        timestamptz,
+                lease_owner      text,
+                lease_expires_at timestamptz,
+                created_at       timestamptz NOT NULL DEFAULT now(),
+                updated_at       timestamptz NOT NULL DEFAULT now(),
+                CHECK (status IN ('received', 'classifying', 'drafting',
+                    'awaiting_approval', 'resolved', 'rejected', 'escalated'))
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_workflow_run_status
+            ON workflow_run (status)
+            """,
+        ),
+    ),
+    Migration(
+        PENDING_SIGNAL_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS pending_signal (
+                id          bigserial   PRIMARY KEY,
+                workflow_id text        NOT NULL,
+                kind        text        NOT NULL,
+                payload     jsonb       NOT NULL,
+                consumed    boolean     NOT NULL DEFAULT false,
+                created_at  timestamptz NOT NULL DEFAULT now(),
+                consumed_at timestamptz
+            )
+            """,
+        ),
+    ),
+    Migration(
+        PENDING_SIGNAL_UNIQUE_MIGRATION,
+        (
+            """
+            CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind
+            ON pending_signal (workflow_id, kind)
+            WHERE consumed = false
+            """,
+        ),
+    ),
+    Migration(
+        SENT_REPLY_GUARD_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS sent_replies (
+                ticket_id      text        PRIMARY KEY,
+                customer_email text        NOT NULL,
+                reply_text     text        NOT NULL,
+                recorded_at    timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            """
+            CREATE TABLE IF NOT EXISTS reply_attempts (
+                id           bigserial   PRIMARY KEY,
+                ticket_id    text        NOT NULL,
+                attempt      integer     NOT NULL,
+                attempted_at timestamptz NOT NULL DEFAULT now()
+            )
+            """,
+            """
+            CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket
+            ON reply_attempts (ticket_id, attempted_at, id)
+            """,
+        ),
+    ),
+    Migration(
+        PENDING_SIGNAL_DROP_REDUNDANT_INDEX_MIGRATION,
+        ("DROP INDEX IF EXISTS ix_pending_signal_unconsumed",),
+    ),
+    Migration(
+        WORKFLOW_RUN_ARCHIVE_MIGRATION,
+        (
+            """
+            CREATE TABLE IF NOT EXISTS workflow_run_archive (
+                ticket_id        text        PRIMARY KEY,
+                status           text        NOT NULL,
+                wakeup_at        timestamptz,
+                lease_owner      text,
+                lease_expires_at timestamptz,
+                created_at       timestamptz NOT NULL,
+                updated_at       timestamptz NOT NULL,
+                archived_at      timestamptz NOT NULL DEFAULT now(),
+                CHECK (status IN ('received', 'classifying', 'drafting',
+                    'awaiting_approval', 'resolved', 'rejected', 'escalated'))
+            )
+            """,
+        ),
+    ),
+)
+
+
+def _validate_migrations(migrations: Sequence[Migration]) -> None:
+    versions = [migration.version for migration in migrations]
+    if len(set(versions)) != len(versions):
+        raise ValueError("Migration versions must be unique")
+    if versions != sorted(versions):
+        raise ValueError("Migration versions must be ordered")
+
+
+def bootstrap(
+    database_url: str | None = None,
+    pool: _Pool | None = None,
+    migrations: Sequence[Migration] = MIGRATIONS,
+) -> None:
+    """Apply pending schema migrations for durable workflow support tables.
 
     This function is intentionally idempotent so startup can call it safely.
+    Migration markers are written only after a migration's DDL statements
+    succeed, and existing markers gate whether a migration is re-run.
 
     When no ``pool`` is supplied this owns the pool's lifecycle: it opens it
     before use and closes it afterwards. An injected ``pool`` is assumed to be
     already open and is left open for the caller to manage.
     """
+    _validate_migrations(migrations)
+
     with managed_pool(database_url=database_url, pool=pool) as active_pool:
         with active_pool.connection() as conn:
             conn.execute(
@@ -680,214 +827,30 @@ def bootstrap(database_url: str | None = None, pool: _Pool | None = None) -> Non
                 """
             )
             conn.execute(
-                """
-                INSERT INTO schema_migrations (version)
-                VALUES (%s)
-                ON CONFLICT (version) DO NOTHING
-                """,
-                (BOOTSTRAP_MIGRATION,),
+                "SELECT pg_advisory_xact_lock(hashtext('ticketflow:schema_migrations'))"
             )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS task_queue (
-                    id              bigserial PRIMARY KEY,
-                    queue_name      text        NOT NULL,
-                    task_type       text        NOT NULL,
-                    workflow_id     text        NOT NULL,
-                    payload         jsonb       NOT NULL DEFAULT '{}'::jsonb,
-                    idempotency_key text        NOT NULL UNIQUE,
-                    status          text        NOT NULL DEFAULT 'pending',
-                    attempts        integer     NOT NULL DEFAULT 0,
-                    max_attempts    integer     NOT NULL DEFAULT 5,
-                    available_at    timestamptz NOT NULL DEFAULT now(),
-                    enqueued_at     timestamptz NOT NULL DEFAULT now(),
-                    lease_owner     text,
-                    lease_expires_at timestamptz,
-                    result          jsonb,
-                    error           text,
-                    permanent       boolean     NOT NULL DEFAULT false,
-                    CHECK (status IN ('pending', 'leased', 'done', 'failed'))
+            rows = conn.execute(
+                "SELECT version FROM schema_migrations ORDER BY version"
+            ).fetchall()
+            applied_versions = {str(row[0]) for row in rows}
+            known_versions = {migration.version for migration in migrations}
+            unknown_versions = sorted(applied_versions - known_versions)
+            if unknown_versions:
+                raise RuntimeError(
+                    "Database has newer schema migrations unknown to this code: "
+                    + ", ".join(unknown_versions)
                 )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS ix_task_queue_dispatch
-                ON task_queue (queue_name, available_at)
-                WHERE status = 'pending'
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO schema_migrations (version)
-                VALUES (%s)
-                ON CONFLICT (version) DO NOTHING
-                """,
-                (TASK_QUEUE_MIGRATION,),
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS refunds (
-                    ticket_id   text             PRIMARY KEY,
-                    amount      double precision NOT NULL,
-                    recorded_at timestamptz      NOT NULL DEFAULT now()
+
+            for migration in migrations:
+                if migration.version in applied_versions:
+                    continue
+                for statement in migration.statements:
+                    conn.execute(statement)
+                conn.execute(
+                    """
+                    INSERT INTO schema_migrations (version)
+                    VALUES (%s)
+                    """,
+                    (migration.version,),
                 )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS refund_attempts (
-                    id           bigserial   PRIMARY KEY,
-                    ticket_id    text        NOT NULL,
-                    attempt      integer     NOT NULL,
-                    attempted_at timestamptz NOT NULL DEFAULT now()
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS ticket_results (
-                    ticket_id text PRIMARY KEY,
-                    data      jsonb NOT NULL
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO schema_migrations (version)
-                VALUES (%s)
-                ON CONFLICT (version) DO NOTHING
-                """,
-                (READ_MODEL_MIGRATION,),
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS workflow_run (
-                    ticket_id        text        PRIMARY KEY,
-                    status           text        NOT NULL DEFAULT 'received',
-                    wakeup_at        timestamptz,
-                    lease_owner      text,
-                    lease_expires_at timestamptz,
-                    created_at       timestamptz NOT NULL DEFAULT now(),
-                    updated_at       timestamptz NOT NULL DEFAULT now(),
-                    CHECK (status IN ('received', 'classifying', 'drafting',
-                        'awaiting_approval', 'resolved', 'rejected', 'escalated'))
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS ix_workflow_run_status
-                ON workflow_run (status)
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO schema_migrations (version)
-                VALUES (%s)
-                ON CONFLICT (version) DO NOTHING
-                """,
-                (WORKFLOW_RUN_MIGRATION,),
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS workflow_run_archive (
-                    ticket_id        text        PRIMARY KEY,
-                    status           text        NOT NULL,
-                    wakeup_at        timestamptz,
-                    lease_owner      text,
-                    lease_expires_at timestamptz,
-                    created_at       timestamptz NOT NULL,
-                    updated_at       timestamptz NOT NULL,
-                    archived_at      timestamptz NOT NULL DEFAULT now(),
-                    CHECK (status IN ('received', 'classifying', 'drafting',
-                        'awaiting_approval', 'resolved', 'rejected', 'escalated'))
-                )
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO schema_migrations (version)
-                VALUES (%s)
-                ON CONFLICT (version) DO NOTHING
-                """,
-                (WORKFLOW_RUN_ARCHIVE_MIGRATION,),
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS pending_signal (
-                    id          bigserial   PRIMARY KEY,
-                    workflow_id text        NOT NULL,
-                    kind        text        NOT NULL,
-                    payload     jsonb       NOT NULL,
-                    consumed    boolean     NOT NULL DEFAULT false,
-                    created_at  timestamptz NOT NULL DEFAULT now(),
-                    consumed_at timestamptz
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed
-                ON pending_signal (workflow_id, kind, created_at, id)
-                WHERE consumed = false
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO schema_migrations (version)
-                VALUES (%s)
-                ON CONFLICT (version) DO NOTHING
-                """,
-                (PENDING_SIGNAL_MIGRATION,),
-            )
-            conn.execute(
-                """
-                CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind
-                ON pending_signal (workflow_id, kind)
-                WHERE consumed = false
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO schema_migrations (version)
-                VALUES (%s)
-                ON CONFLICT (version) DO NOTHING
-                """,
-                (PENDING_SIGNAL_UNIQUE_MIGRATION,),
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS sent_replies (
-                    ticket_id      text        PRIMARY KEY,
-                    customer_email text        NOT NULL,
-                    reply_text     text        NOT NULL,
-                    recorded_at    timestamptz NOT NULL DEFAULT now()
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE TABLE IF NOT EXISTS reply_attempts (
-                    id           bigserial   PRIMARY KEY,
-                    ticket_id    text        NOT NULL,
-                    attempt      integer     NOT NULL,
-                    attempted_at timestamptz NOT NULL DEFAULT now()
-                )
-                """
-            )
-            conn.execute(
-                """
-                CREATE INDEX IF NOT EXISTS ix_reply_attempts_ticket
-                ON reply_attempts (ticket_id, attempted_at, id)
-                """
-            )
-            conn.execute(
-                """
-                INSERT INTO schema_migrations (version)
-                VALUES (%s)
-                ON CONFLICT (version) DO NOTHING
-                """,
-                (SENT_REPLY_GUARD_MIGRATION,),
-            )
             conn.commit()
