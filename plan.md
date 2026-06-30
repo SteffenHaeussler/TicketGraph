@@ -237,10 +237,12 @@ because they shape how the rest is described.*
   overlapping unconsumed indexes (the unique 2-col one subsumes the non-unique 4-col one). Remove
   or justify each. _Done:_ no app-dead helper and no redundant index, or a comment explaining why
   each stays.
-- [ ] **9.11 Real migrations (optional).** `bootstrap()` is `CREATE TABLE IF NOT EXISTS` with
+- [x] **9.11 Real migrations (optional).** `bootstrap()` is `CREATE TABLE IF NOT EXISTS` with
   decorative `schema_migrations` markers — it can't `ALTER` an existing schema. If the schema is
   expected to evolve, add a version-checked migration runner; otherwise note the limitation.
-  _Done:_ either a working migration runner or a documented "bootstrap-only" caveat.
+  _Done:_ `bootstrap()` now runs ordered `Migration` entries under a Postgres advisory lock,
+  skips applied versions, rejects unknown future versions, records markers only after each
+  migration succeeds, and supports later `ALTER` migrations against existing schemas.
 
 ---
 

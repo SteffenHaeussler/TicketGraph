@@ -180,6 +180,14 @@ at `http://localhost:16686`):
 TICKETFLOW_TRACE_EXPORTER=otlp docker compose --profile tracing up --build
 ```
 
+## Schema Migrations
+
+Every process calls `db.bootstrap()` at startup. That applies versioned Postgres
+migrations under an advisory lock, records each version only after its DDL
+succeeds, and skips versions already present in `schema_migrations`. Future
+schema changes should add a new `Migration` entry in `ticketflow.db` rather
+than editing an existing migration.
+
 ## Tests
 
 ```bash
