@@ -46,6 +46,8 @@ def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
     monkeypatch.setenv("AGENT_SCHEDULE_TO_START_S", "4.5")
     monkeypatch.setenv("MOCK_AGENT_LATENCY_MAX_S", "3.25")
     monkeypatch.setenv("TICKETFLOW_JANITOR_INTERVAL_S", "2.5")
+    monkeypatch.setenv("TICKETFLOW_RETENTION_INTERVAL_S", "120.0")
+    monkeypatch.setenv("TICKETFLOW_RETENTION_MAX_AGE_S", "86400.0")
     monkeypatch.setenv("TICKETFLOW_LOG_FORMAT", "json")
     monkeypatch.setenv("TICKETFLOW_LOG_LEVEL", "DEBUG")
     monkeypatch.setenv("TICKETFLOW_LOG_FIELDS", "level,message,task_queue")
@@ -64,6 +66,8 @@ def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
     assert reloaded.AGENT_SCHEDULE_TO_START_S == 4.5
     assert reloaded.MOCK_AGENT_LATENCY_MAX_S == 3.25
     assert reloaded.JANITOR_INTERVAL_S == 2.5
+    assert reloaded.RETENTION_INTERVAL_S == 120.0
+    assert reloaded.RETENTION_MAX_AGE_S == 86400.0
     assert reloaded.LOG_FORMAT == "json"
     assert reloaded.LOG_LEVEL == "DEBUG"
     assert reloaded.LOG_FIELDS == ["level", "message", "task_queue"]
@@ -80,6 +84,8 @@ def test_config_reads_postgres_and_queue_settings_from_environment(monkeypatch):
     monkeypatch.delenv("AGENT_SCHEDULE_TO_START_S")
     monkeypatch.delenv("MOCK_AGENT_LATENCY_MAX_S")
     monkeypatch.delenv("TICKETFLOW_JANITOR_INTERVAL_S")
+    monkeypatch.delenv("TICKETFLOW_RETENTION_INTERVAL_S")
+    monkeypatch.delenv("TICKETFLOW_RETENTION_MAX_AGE_S")
     monkeypatch.delenv("TICKETFLOW_LOG_FORMAT")
     monkeypatch.delenv("TICKETFLOW_LOG_LEVEL")
     monkeypatch.delenv("TICKETFLOW_LOG_FIELDS")
@@ -130,6 +136,11 @@ def test_config_default_pool_size_tracks_agent_concurrency(monkeypatch):
 
 def test_config_janitor_interval_defaults_to_five_seconds():
     assert config.JANITOR_INTERVAL_S == 5.0
+
+
+def test_config_retention_settings_default_to_hourly_sweep_and_weekly_age():
+    assert config.RETENTION_INTERVAL_S == 3600.0
+    assert config.RETENTION_MAX_AGE_S == 604800.0
 
 
 def test_config_reads_postgres_settings_from_dotenv(tmp_path, monkeypatch):

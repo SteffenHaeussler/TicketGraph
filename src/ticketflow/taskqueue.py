@@ -218,3 +218,24 @@ def reclaim_expired(conn: Any) -> int:
         (),
     ).fetchone()
     return int(row[0])
+
+
+def prune_settled(conn: Any, *, max_age_s: float) -> int:
+    """Delete old settled task rows.
+
+    ``task_queue`` does not yet track a settled-at timestamp, so retention uses
+    ``enqueued_at`` until a real migration can add one.
+    """
+    row = conn.execute(
+        """
+        WITH deleted AS (
+            DELETE FROM task_queue
+            WHERE status IN ('done', 'failed')
+              AND enqueued_at < now() - make_interval(secs => %s)
+            RETURNING id
+        )
+        SELECT count(*) FROM deleted
+        """,
+        (max_age_s,),
+    ).fetchone()
+    return int(row[0])

@@ -22,6 +22,12 @@ DB_POOL_MAX_SIZE = max(
 AGENT_SCHEDULE_TO_START_S = float(os.environ.get("AGENT_SCHEDULE_TO_START_S", "30"))
 MOCK_AGENT_LATENCY_MAX_S = float(os.environ.get("MOCK_AGENT_LATENCY_MAX_S", "0"))
 JANITOR_INTERVAL_S = float(os.environ.get("TICKETFLOW_JANITOR_INTERVAL_S", "5.0"))
+RETENTION_INTERVAL_S = float(
+    os.environ.get("TICKETFLOW_RETENTION_INTERVAL_S", "3600.0")
+)
+RETENTION_MAX_AGE_S = float(
+    os.environ.get("TICKETFLOW_RETENTION_MAX_AGE_S", "604800.0")
+)
 LOG_FORMAT = os.environ.get("TICKETFLOW_LOG_FORMAT", "text")
 LOG_LEVEL = os.environ.get("TICKETFLOW_LOG_LEVEL", "INFO")
 TRACE_EXPORTER = os.environ.get("TICKETFLOW_TRACE_EXPORTER", "none")

@@ -228,10 +228,11 @@ because they shape how the rest is described.*
   `AGENT_MAX_CONCURRENT=20`, so half the in-flight tasks block on connection checkout under load.
   Size the pool to the configured concurrency (or cap concurrency to the pool). _Done:_ pool size
   ≥ effective concurrency, configurable.
-- [ ] **9.9 Add retention/GC.** `task_queue` `done` rows, terminal `workflow_run` rows, consumed
+- [x] **9.9 Add retention/GC.** `task_queue` `done` rows, terminal `workflow_run` rows, consumed
   `pending_signal` rows, and LangGraph checkpoints accumulate forever. Add a janitor pass that
-  archives terminal runs and prunes settled tasks/signals/old checkpoints. _Done:_ a retention
-  sweep exists and is covered by a test.
+  archives terminal runs and prunes settled tasks/signals/old checkpoints. _Done:_ retention now
+  archives terminal runs, prunes old settled tasks/signals, deletes archived checkpoint threads via
+  the checkpointer, and is covered by unit tests plus `pytest -m integration -k retention`.
 - [ ] **9.10 Tidy dead/duplicate code.** `db.add_pending_signal` (non-conditional) is only used by
   tests — production uses `add_pending_signal_if_waiting`; and `pending_signal` carries two
   overlapping unconsumed indexes (the unique 2-col one subsumes the non-unique 4-col one). Remove
