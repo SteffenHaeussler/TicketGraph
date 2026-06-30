@@ -389,8 +389,8 @@ def test_bootstrap_creates_default_schema_migrations():
     assert "ticket_id        text        PRIMARY KEY" in sql
     assert "CREATE INDEX IF NOT EXISTS ix_workflow_run_status" in sql
     assert "CREATE TABLE IF NOT EXISTS pending_signal" in sql
-    assert "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed" in sql
     assert "CREATE UNIQUE INDEX IF NOT EXISTS ux_pending_signal_unconsumed_kind" in sql
+    assert "DROP INDEX IF EXISTS ix_pending_signal_unconsumed" in sql
     assert "CREATE TABLE IF NOT EXISTS sent_replies" in sql
     assert "ticket_id      text        PRIMARY KEY" in sql
     assert "customer_email text        NOT NULL" in sql
@@ -405,6 +405,7 @@ def test_bootstrap_creates_default_schema_migrations():
         ("004_pending_signal",),
         ("005_pending_signal_unique_unconsumed",),
         ("006_sent_reply_guard",),
+        ("007_pending_signal_drop_redundant_index",),
     ]
     # An injected pool is the caller's to manage: bootstrap must not close it.
     assert pool.closed is False
@@ -460,8 +461,7 @@ def test_bootstrap_creates_pending_signal_table():
     assert "kind        text        NOT NULL" in sql
     assert "payload     jsonb       NOT NULL" in sql
     assert "consumed    boolean     NOT NULL DEFAULT false" in sql
-    assert "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed" in sql
-    assert "WHERE consumed = false" in sql
+    assert "CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed" not in sql
     assert ("004_pending_signal",) in pool.connection_obj.params
 
 
@@ -475,6 +475,48 @@ def test_bootstrap_creates_unique_unconsumed_pending_signal_index():
     assert "ON pending_signal (workflow_id, kind)" in sql
     assert "WHERE consumed = false" in sql
     assert ("005_pending_signal_unique_unconsumed",) in pool.connection_obj.params
+
+
+def test_bootstrap_drops_redundant_pending_signal_lookup_index():
+    pool = FakePool(opened=True)
+
+    db.bootstrap(pool=pool)
+
+    sql = "\n".join(pool.connection_obj.sql)
+    assert "DROP INDEX IF EXISTS ix_pending_signal_unconsumed" in sql
+    assert ("007_pending_signal_drop_redundant_index",) in pool.connection_obj.params
+
+
+@pytest.mark.integration
+def test_bootstrap_drops_obsolete_pending_signal_lookup_index(
+    postgres_pool: db.ConnectionPool,
+):
+    with postgres_pool.connection() as conn:
+        conn.execute(
+            """
+            CREATE INDEX IF NOT EXISTS ix_pending_signal_unconsumed
+            ON pending_signal (workflow_id, kind, created_at, id)
+            WHERE consumed = false
+            """
+        )
+        conn.execute(
+            "DELETE FROM schema_migrations WHERE version = %s",
+            (db.PENDING_SIGNAL_DROP_REDUNDANT_INDEX_MIGRATION,),
+        )
+        created = conn.execute(
+            "SELECT to_regclass('ix_pending_signal_unconsumed')"
+        ).fetchone()
+        conn.commit()
+
+    db.bootstrap(pool=postgres_pool)
+
+    with postgres_pool.connection() as conn:
+        dropped = conn.execute(
+            "SELECT to_regclass('ix_pending_signal_unconsumed')"
+        ).fetchone()
+
+    assert created == ("ix_pending_signal_unconsumed",)
+    assert dropped == (None,)
 
 
 def test_bootstrap_creates_sent_reply_guard_tables():
@@ -886,38 +928,6 @@ async def test_acreate_run_inserts_real_postgres_workflow_run(
         await async_pool.close()
 
     assert row == ("classifying", wakeup_at)
-
-
-def test_add_pending_signal_inserts_signal_and_wakes_run():
-    pool = FakePool(opened=True, row=(42,))
-
-    signal_id = db.add_pending_signal(
-        "ticket-1",
-        "approval_decision",
-        {"approved": True, "approver": "sam@example.com"},
-        pool=pool,
-    )
-
-    sql = "\n".join(pool.connection_obj.sql)
-    assert signal_id == 42
-    assert "INSERT INTO pending_signal" in sql
-    assert "UPDATE workflow_run" in sql
-    assert "wakeup_at = now()" in sql
-    assert "updated_at = now()" in sql
-    assert pool.connection_obj.params[0][0:2] == ("ticket-1", "approval_decision")
-    wake_params = pool.connection_obj.params[1]
-    assert wake_params == ("ticket-1",)
-    assert pool.connection_obj.commits == 1
-
-
-def test_add_pending_signal_opens_and_closes_owned_pool(monkeypatch):
-    pool = FakePool(row=(42,))
-    monkeypatch.setattr(db, "make_pool", lambda database_url=None: pool)
-
-    db.add_pending_signal("ticket-1", "approval_decision", {"approved": True})
-
-    assert pool.opened is True
-    assert pool.closed is True
 
 
 def test_list_runs_by_status_returns_ticket_ids_in_creation_order():

@@ -1053,12 +1053,14 @@ async def test_retargeted_workflow_refund_idempotency_on_finalizer_retry(
         awaiting = await compiled.aget_state(cfg)
         assert awaiting.values["status"] == TicketStatus.AWAITING_APPROVAL
 
-        db.add_pending_signal(
+        signal_id = db.add_pending_signal_if_waiting(
             ticket.id,
             APPROVAL_DECISION_SIGNAL,
             decision.model_dump(mode="json"),
+            waiting_status=TicketStatus.AWAITING_APPROVAL,
             pool=postgres_pool,
         )
+        assert signal_id is not None
         await drive_until_quiescent(compiled, postgres_pool, activities, ticket.id)
         first_finalize = _require_task_row(postgres_pool, finalize_key)
         assert first_finalize["status"] == "pending"
